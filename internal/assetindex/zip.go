@@ -7,6 +7,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 // safeEntry rejects archive entry names that are absolute or escape their archive
@@ -60,40 +61,128 @@ func zipAssets(archivePath, displayRel, vendor, pack, variant string) ([]Asset, 
 
 // openZipEntry streams one entry's bytes by exact-name match. The name comes from
 // an indexed asset (never raw client input), and is re-validated defensively.
-func openZipEntry(archivePath, entry string) (io.ReadCloser, int64, error) {
+func (ix *Index) openZipEntry(archivePath, entry string) (io.ReadCloser, int64, error) {
 	if !safeEntry(entry) {
 		return nil, 0, fmt.Errorf("unsafe zip entry %q", entry)
 	}
-	zr, err := zip.OpenReader(archivePath)
+	ref, err := ix.zips.acquire(archivePath)
 	if err != nil {
 		return nil, 0, err
 	}
-	for _, f := range zr.File {
-		if f.Name == entry {
-			rc, err := f.Open()
-			if err != nil {
-				zr.Close()
-				return nil, 0, err
-			}
-			return &zipEntryReader{rc: rc, zr: zr}, int64(f.UncompressedSize64), nil
-		}
+	f := ref.byName[entry]
+	if f == nil {
+		ix.zips.release(ref)
+		return nil, 0, fmt.Errorf("entry %q not found in %s", entry, filepath.Base(archivePath))
 	}
-	zr.Close()
-	return nil, 0, fmt.Errorf("entry %q not found in %s", entry, filepath.Base(archivePath))
+	rc, err := f.Open()
+	if err != nil {
+		ix.zips.release(ref)
+		return nil, 0, err
+	}
+	return &zipEntryReader{rc: rc, ref: ref, cache: &ix.zips}, int64(f.UncompressedSize64), nil
 }
 
-// zipEntryReader keeps the zip.ReadCloser alive for the entry's lifetime, closing
-// both together.
+// zipEntryReader holds the archive open for the entry's lifetime, releasing the
+// cache's reference when the stream closes.
 type zipEntryReader struct {
-	rc io.ReadCloser
-	zr *zip.ReadCloser
+	rc    io.ReadCloser
+	ref   *zipRef
+	cache *zipReaders
 }
 
 func (r *zipEntryReader) Read(p []byte) (int, error) { return r.rc.Read(p) }
 func (r *zipEntryReader) Close() error {
 	err := r.rc.Close()
-	if zerr := r.zr.Close(); err == nil {
-		err = zerr
-	}
+	r.cache.release(r.ref)
 	return err
+}
+
+// zipCacheSize is how many archives stay open. A grid page draws from a handful of
+// packs at a time, so a small window covers it; the cost of each slot is one file
+// descriptor plus that archive's parsed central directory.
+const zipCacheSize = 8
+
+// zipReaders keeps the parsed central directory of recently-served archives. A Synty
+// pack zip holds tens of thousands of entries and a grid page fetches a content
+// request per card, so re-reading the whole directory to stream a few kilobytes out
+// of it is the dominant cost of serving from a zip.
+//
+// Readers are handed out under a reference count: eviction unpublishes an archive
+// immediately but closes the file only once the last stream over it has finished, so
+// a reader is never closed out from under a response in flight.
+type zipReaders struct {
+	mu    sync.Mutex
+	open  map[string]*zipRef
+	order []string // least recently acquired first
+}
+
+type zipRef struct {
+	rc      *zip.ReadCloser
+	byName  map[string]*zip.File
+	refs    int
+	evicted bool
+}
+
+func (c *zipReaders) acquire(path string) (*zipRef, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if ref := c.open[path]; ref != nil {
+		ref.refs++
+		c.touchLocked(path)
+		return ref, nil
+	}
+
+	zr, err := zip.OpenReader(path)
+	if err != nil {
+		return nil, err
+	}
+	byName := make(map[string]*zip.File, len(zr.File))
+	for _, f := range zr.File {
+		// First wins, matching the order a scan of zr.File would have found them in.
+		if _, dup := byName[f.Name]; !dup {
+			byName[f.Name] = f
+		}
+	}
+	ref := &zipRef{rc: zr, byName: byName, refs: 1}
+	if c.open == nil {
+		c.open = map[string]*zipRef{}
+	}
+	c.open[path] = ref
+	c.order = append(c.order, path)
+	c.evictLocked()
+	return ref, nil
+}
+
+func (c *zipReaders) release(ref *zipRef) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ref.refs--
+	if ref.refs == 0 && ref.evicted {
+		ref.rc.Close()
+	}
+}
+
+func (c *zipReaders) touchLocked(path string) {
+	for i, p := range c.order {
+		if p == path {
+			c.order = append(append(c.order[:i:i], c.order[i+1:]...), path)
+			return
+		}
+	}
+}
+
+func (c *zipReaders) evictLocked() {
+	for len(c.order) > zipCacheSize {
+		oldest := c.order[0]
+		c.order = c.order[1:]
+		ref := c.open[oldest]
+		delete(c.open, oldest)
+		if ref == nil {
+			continue
+		}
+		ref.evicted = true
+		if ref.refs == 0 {
+			ref.rc.Close()
+		}
+	}
 }

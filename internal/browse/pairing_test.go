@@ -65,3 +65,37 @@ func TestBuildRootMotionPairs(t *testing.T) {
 		t.Error("non-RM cards must never be suppressed")
 	}
 }
+
+// The RM sibling has to be the same container. A pack that ships the in-place clip
+// as one format and the root-motion file as another offers no sibling: pairing them
+// would point the toggle at a file the viewer cannot load, and suppressing the RM
+// would drop a card for a file that is right there on disk.
+func TestRootMotionPairingRequiresTheSameContainer(t *testing.T) {
+	clip := assetindex.Asset{ID: "g1", Ext: "glb", Vendor: "quaternius", Pack: "UAL", Category: assetindex.CategoryAnimation,
+		Source: assetindex.Source{Kind: assetindex.SourceLoose, FilePath: "/lib/UAL1.glb", Clip: "Walk"}}
+	otherFormatRM := assetindex.Asset{ID: "rmf", Ext: "fbx", Vendor: "quaternius", Pack: "UAL", Category: assetindex.CategoryModel,
+		Source: assetindex.Source{Kind: assetindex.SourceLoose, FilePath: "/lib/UAL1_RM.fbx"}}
+
+	sibling, suppressed := buildRootMotionPairs([]assetindex.Asset{clip, otherFormatRM})
+	if got, ok := sibling["g1"]; ok {
+		t.Errorf("a .glb clip was paired to %q, an RM in another container", got)
+	}
+	if suppressed["rmf"] {
+		t.Error("the unmatched RM was hidden from the grid")
+	}
+}
+
+// The visible side of a group has to include an animation. Two unrelated files that
+// merely share a Foo / Foo_RM name — "_RM" is also how a roughness-metallic texture
+// is labelled — must not collapse into one card with the second hidden behind it.
+func TestRootMotionPairingIgnoresGroupsWithNoAnimation(t *testing.T) {
+	base := assetindex.Asset{ID: "m1", Ext: "png", Vendor: "synty", Pack: "Kit", Category: assetindex.CategoryTexture,
+		Source: assetindex.Source{Kind: assetindex.SourceLoose, FilePath: "/lib/T_Sword.png"}}
+	rm := assetindex.Asset{ID: "m2", Ext: "png", Vendor: "synty", Pack: "Kit", Category: assetindex.CategoryTexture,
+		Source: assetindex.Source{Kind: assetindex.SourceLoose, FilePath: "/lib/T_Sword_RM.png"}}
+
+	sibling, suppressed := buildRootMotionPairs([]assetindex.Asset{base, rm})
+	if len(sibling) != 0 || len(suppressed) != 0 {
+		t.Errorf("non-animation files paired on their names alone: sibling=%v suppressed=%v", sibling, suppressed)
+	}
+}

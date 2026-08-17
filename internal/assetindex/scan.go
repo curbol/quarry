@@ -59,14 +59,33 @@ type libEntry struct {
 	size    int64  // loose only
 }
 
+// relTo renders p relative to the library root in slash form, for display.
+func relTo(absRoot, p string) string {
+	return filepath.ToSlash(strings.TrimPrefix(p, absRoot+string(filepath.Separator)))
+}
+
 // walkLibrary enumerates the browseable files under absRoot without opening any
 // archive, so callers can decide per archive whether to re-enumerate or reuse a
 // cached result. Dot-dirs (Synty working dirs) and engine sidecars are skipped.
-func walkLibrary(absRoot string) ([]libEntry, error) {
+//
+// A directory or file the walk cannot read is reported as a skip and the walk goes
+// on: one unreadable corner of a large library must not cost the whole index, the
+// same bargain archiveAssets strikes for a damaged archive. An unreadable root is
+// the exception — that is not a partial library, it is no library — so it still
+// fails, rather than quietly indexing nothing.
+func walkLibrary(absRoot string) ([]libEntry, []SkippedFile, error) {
 	var entries []libEntry
+	var skipped []SkippedFile
+	note := func(p string, err error) {
+		skipped = append(skipped, SkippedFile{RelPath: relTo(absRoot, p), Reason: err.Error()})
+	}
 	err := filepath.WalkDir(absRoot, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
-			return err
+			if p == absRoot {
+				return err
+			}
+			note(p, err)
+			return nil
 		}
 		name := d.Name()
 		if d.IsDir() {
@@ -82,7 +101,7 @@ func walkLibrary(absRoot string) ([]libEntry, error) {
 		if isSidecar(ext) {
 			return nil
 		}
-		rel := filepath.ToSlash(strings.TrimPrefix(p, absRoot+string(filepath.Separator)))
+		rel := relTo(absRoot, p)
 		vendor, pack := vendorPack(rel)
 		e := libEntry{path: p, rel: rel, vendor: vendor, pack: pack, name: name}
 		switch ext {
@@ -93,14 +112,15 @@ func walkLibrary(absRoot string) ([]libEntry, error) {
 		default:
 			info, err := d.Info()
 			if err != nil {
-				return err
+				note(p, err)
+				return nil
 			}
 			e.kind, e.size = SourceLoose, info.Size()
 		}
 		entries = append(entries, e)
 		return nil
 	})
-	return entries, err
+	return entries, skipped, err
 }
 
 // enumerateArchive opens one archive entry and returns its assets.
@@ -283,7 +303,14 @@ func dedupKey(vendor, pack, subpath string, size int64) string {
 }
 
 func looseDedupKey(a Asset) string {
-	within := strings.TrimPrefix(a.RelPath, a.Vendor+"/"+a.Pack+"/")
+	// A file directly under a vendor dir has no pack, so the prefix is built rather
+	// than formatted: "vendor" + "/" + "" + "/" would be a doubled separator that
+	// matches nothing, silently disabling dedup for that layout.
+	prefix := a.Vendor + "/"
+	if a.Pack != "" {
+		prefix += a.Pack + "/"
+	}
+	within := strings.TrimPrefix(a.RelPath, prefix)
 	return dedupKey(a.Vendor, a.Pack, within, a.Size)
 }
 

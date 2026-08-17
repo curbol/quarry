@@ -1,6 +1,7 @@
 package assetindex
 
 import (
+	"bufio"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -12,8 +13,11 @@ import (
 )
 
 // indexVersion is bumped whenever the scan logic changes (what's indexed, how it's
-// classified), so a cached index from older logic is rebuilt rather than reused.
-const indexVersion = 14
+// classified), so a cached index from older logic is rebuilt rather than reused. It
+// also keys the unpacked-archive tree, so a change to what extraction writes belongs
+// here too: an archive whose bytes never changed keeps its fingerprint, and only the
+// version tells the old extraction apart from what the current code would produce.
+const indexVersion = 15
 
 // SkippedFile records a library file the scan could not read. A damaged archive
 // costs its own contents, not the rest of the library, so the failure is carried
@@ -39,8 +43,9 @@ type Index struct {
 	byID     map[string]*Asset
 
 	extractMu   sync.Mutex
-	extractOnce map[string]*sync.Once
-	extractErr  map[string]error
+	extractions map[string]*extraction
+
+	zips zipReaders
 }
 
 // fingerprint identifies a file by path, size, and mtime, so a re-download or edit
@@ -55,37 +60,17 @@ func fingerprint(path string) (string, error) {
 	return hex.EncodeToString(sum[:12]), nil
 }
 
-// Build scans a library from scratch into a fresh index.
+// Build scans a library from scratch into a fresh index. It is Refresh over an
+// empty index: with nothing cached to reuse, every entry takes the re-derive path.
 func Build(root, cacheDir string) (*Index, error) {
 	absRoot, err := filepath.Abs(root)
 	if err != nil {
 		return nil, err
 	}
-	entries, err := walkLibrary(absRoot)
-	if err != nil {
+	ix := &Index{Version: indexVersion, Root: absRoot, cacheDir: cacheDir, ArchivePrint: map[string]string{}, LoosePrint: map[string]string{}}
+	if err := ix.Refresh(); err != nil {
 		return nil, err
 	}
-	ix := &Index{Version: indexVersion, Root: absRoot, cacheDir: cacheDir, ArchivePrint: map[string]string{}, LoosePrint: map[string]string{}}
-	var assets []Asset
-	for _, e := range entries {
-		if e.kind == SourceLoose {
-			if fp, err := fingerprint(e.path); err == nil {
-				ix.LoosePrint[e.path] = fp
-			}
-			assets = append(assets, looseAssets(e)...)
-			continue
-		}
-		a, skip := archiveAssets(e)
-		if skip != nil {
-			ix.Skipped = append(ix.Skipped, *skip)
-			continue
-		}
-		if fp, err := fingerprint(e.path); err == nil {
-			ix.ArchivePrint[e.path] = fp
-		}
-		assets = append(assets, a...)
-	}
-	ix.setAssets(dedup(assets))
 	return ix, nil
 }
 
@@ -94,7 +79,7 @@ func Build(root, cacheDir string) (*Index, error) {
 // unchanged, re-deriving only changed or new files. This avoids re-decompressing
 // every unitypackage and re-reading every loose file's bytes on each run.
 func (ix *Index) Refresh() error {
-	entries, err := walkLibrary(ix.Root)
+	entries, skipped, err := walkLibrary(ix.Root)
 	if err != nil {
 		return err
 	}
@@ -110,7 +95,6 @@ func (ix *Index) Refresh() error {
 	newPrint := map[string]string{}
 	newLoose := map[string]string{}
 	var assets []Asset
-	var skipped []SkippedFile
 	for _, e := range entries {
 		if e.kind == SourceLoose {
 			if fp, err := fingerprint(e.path); err == nil {
@@ -148,14 +132,17 @@ func (ix *Index) Refresh() error {
 	return nil
 }
 
-// Load reads a cached index from disk and rebuilds its id lookup.
+// Load reads a cached index from disk and rebuilds its id lookup. The JSON is
+// decoded as a stream: a full-library cache runs past 100MB, and reading it whole
+// first would hold those bytes alongside the index they decode into.
 func Load(cachePath, cacheDir string) (*Index, error) {
-	b, err := os.ReadFile(cachePath)
+	f, err := os.Open(cachePath)
 	if err != nil {
 		return nil, err
 	}
+	defer f.Close()
 	var ix Index
-	if err := json.Unmarshal(b, &ix); err != nil {
+	if err := json.NewDecoder(bufio.NewReader(f)).Decode(&ix); err != nil {
 		return nil, err
 	}
 	ix.cacheDir = cacheDir
@@ -171,14 +158,12 @@ func Load(cachePath, cacheDir string) (*Index, error) {
 
 // Save writes the index JSON, creating parent dirs. The write goes to a temp file
 // in the destination dir and is renamed into place: an interrupted in-place write
-// would leave a truncated cache, and rebuilding one costs a full library scan.
+// would leave a truncated cache, and rebuilding one costs a full library scan. The
+// JSON is encoded as a stream, so a 100MB-plus cache is never also held whole in
+// memory beside the index it came from.
 func (ix *Index) Save(cachePath string) error {
 	dir := filepath.Dir(cachePath)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
-	b, err := json.Marshal(ix)
-	if err != nil {
 		return err
 	}
 	tmp, err := os.CreateTemp(dir, ".browse-index-*")
@@ -186,10 +171,17 @@ func (ix *Index) Save(cachePath string) error {
 		return err
 	}
 	tmpName := tmp.Name()
-	if _, err := tmp.Write(b); err != nil {
+	fail := func(err error) error {
 		tmp.Close()
 		os.Remove(tmpName)
 		return err
+	}
+	buf := bufio.NewWriter(tmp)
+	if err := json.NewEncoder(buf).Encode(ix); err != nil {
+		return fail(err)
+	}
+	if err := buf.Flush(); err != nil {
+		return fail(err)
 	}
 	if err := tmp.Close(); err != nil {
 		os.Remove(tmpName)

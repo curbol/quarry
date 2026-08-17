@@ -49,11 +49,20 @@ nothing.
 
 The scan result is cached as JSON under the XDG cache dir and refreshed incrementally, so
 only the first run pays the full walk. Archive contents are extracted lazily into a
-fingerprint-keyed directory beside it. Both are expendable: `--reindex` rebuilds from
-scratch, and `assetindex.indexVersion` is bumped whenever the fingerprint scheme or an
-indexed field changes so stale caches rebuild themselves rather than serving wrong data.
-Each pack update extracts under a new fingerprint, so a prune on startup drops the
-extractions the current index no longer references.
+fingerprint-keyed directory beside it, under a tree named for the index version. Both are
+expendable: `--reindex` rebuilds from scratch, and `assetindex.indexVersion` is bumped
+whenever the fingerprint scheme, an indexed field, or what extraction writes changes, so
+stale caches rebuild themselves rather than serving wrong data. An archive whose bytes
+never changed keeps its fingerprint, so the version is the only thing that can tell an
+extraction made by older code from what the current code would write. Each pack update
+extracts under a new fingerprint, so a prune on startup drops both the extractions the
+current index no longer references and every tree from another version.
+
+One unreadable file or directory costs itself, not the run: a damaged archive, a
+directory the user cannot read, a file that disappears mid-walk are all recorded as
+skips and reported, because browse treats a build failure as fatal and would otherwise
+refuse to start over one bad corner of a large library. An unreadable root is still an
+error — that is not a partial library, it is no library.
 
 ## Tag store
 

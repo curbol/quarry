@@ -69,8 +69,9 @@ packages, each with a package doc comment stating its contract:
   `<file-fp>#<clip>` for a split GLB clip) is the tag and link identity; it is
   portable and stable across updates, unlike `Asset.ID` (a machine-absolute,
   version-bearing locator hash used only to serve bytes). Bump
-  `assetindex.indexVersion` when the fingerprint scheme or any indexed field changes
-  so stale caches rebuild.
+  `assetindex.indexVersion` when the fingerprint scheme, any indexed field, or what
+  archive extraction writes changes: it keys both the cached index and the unpacked
+  tree, so stale state on either side rebuilds.
 - **The library is read-only.** The tag store is the only thing quarry writes inside
   a user's tree; everything else it writes is regenerable state under the cache dir.
 - **Tagging is never silently off.** With no project store discoverable, the

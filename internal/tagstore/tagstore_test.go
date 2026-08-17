@@ -298,3 +298,30 @@ func TestDiscoverStopsAtFilesystemRoot(t *testing.T) {
 		t.Errorf("Discover found %q, want no hit", got)
 	}
 }
+
+// A project store sits inside the user's own repo, so a failed save must not strand
+// a temp file there: .gitignore covers the store's name, not the temp pattern.
+func TestFailedSaveLeavesNoTempFile(t *testing.T) {
+	dir := t.TempDir()
+	// A directory where the store should go: the write and encode succeed, the rename
+	// onto it does not.
+	blocked := filepath.Join(dir, FileName)
+	if err := os.MkdirAll(blocked, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s := New()
+	s.Assign("crc32:aa:1", "hero")
+
+	if err := Save(blocked, s); err == nil {
+		t.Fatal("Save reported success renaming onto a directory")
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".quarry-tags-") {
+			t.Errorf("failed save left %s behind", e.Name())
+		}
+	}
+}

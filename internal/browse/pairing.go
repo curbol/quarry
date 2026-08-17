@@ -84,18 +84,21 @@ func buildRootMotionPairs(assets []assetindex.Asset) (sibling map[string]string,
 	return sibling, suppressed
 }
 
-// pickRM chooses the RM sibling for an in-place asset. It prefers a sibling with the
-// same file extension (a glb clip's travel is the glb RM, not the fbx RM of the same
-// library shipped in the same pack — loading the wrong container fails), then the same
-// clip (a per-clip RM over a whole-file one).
+// pickRM chooses the RM sibling for an in-place asset. The sibling has to be the same
+// container: a glb clip's travel is the glb RM, not the fbx RM of the same library
+// shipped in the same pack, and loading the wrong one fails. That is a requirement
+// rather than a preference — a pack that ships only the other format has no sibling
+// to offer, and pairing it anyway would both break the toggle and hide a file the
+// grid should still show. Among same-container candidates the same clip wins (a
+// per-clip RM over a whole-file one).
 func pickRM(assets []assetindex.Asset, rm []int, nonRM assetindex.Asset) string {
 	best, bestScore := "", -1
 	for _, ri := range rm {
 		r := assets[ri]
-		score := 0
-		if r.Ext == nonRM.Ext {
-			score += 2
+		if r.Ext != nonRM.Ext {
+			continue
 		}
+		score := 0
 		if r.Source.Clip == nonRM.Source.Clip {
 			score++
 		}

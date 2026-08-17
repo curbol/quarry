@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -31,7 +32,7 @@ func (ix *Index) Open(a Asset) (io.ReadCloser, int64, error) {
 		if !ix.underRoot(a.Source.ArchivePath) {
 			return nil, 0, ErrOutsideRoot
 		}
-		return openZipEntry(a.Source.ArchivePath, a.Source.Entry)
+		return ix.openZipEntry(a.Source.ArchivePath, a.Source.Entry)
 	case SourceUnityPackage:
 		if !ix.underRoot(a.Source.ArchivePath) {
 			return nil, 0, ErrOutsideRoot
@@ -73,23 +74,57 @@ func openFile(p string) (io.ReadCloser, int64, error) {
 	return f, fi.Size(), nil
 }
 
-// ensureExtracted decompresses a unitypackage once into the cache and returns its
-// unpacked dir. Extraction is single-flighted per archive fingerprint (concurrent
-// grid fetches of the same package wait rather than each decompressing hundreds of
-// MB), and is written to a temp dir renamed atomically into place so no reader ever
-// sees a half-written entry.
-// PruneUnpacked removes extraction directories whose archive fingerprint is no
-// longer in the index. The fingerprint includes the archive's mtime, so every pack
-// update writes to a new directory and would otherwise strand the previous
-// extraction (hundreds of MB per Synty pack) in the cache forever.
+// ErrNoCacheDir is returned when an index built without a cache dir is asked for
+// content that has to be extracted. Falling back to a relative path would write an
+// "unpacked" tree into the working directory, which may sit inside the library.
+var ErrNoCacheDir = errors.New("index has no cache dir to extract into")
+
+// unpackedDir is the root of this index version's extraction tree. The version is
+// part of the path because an archive that never changed keeps its fingerprint: only
+// the version distinguishes an extraction made by older code from what the current
+// code would write.
+func (ix *Index) unpackedDir() string {
+	return filepath.Join(ix.cacheDir, "unpacked", strconv.Itoa(indexVersion))
+}
+
+// PruneUnpacked removes extraction directories the current index no longer
+// references: every other index version's tree, plus, within this version's, every
+// archive fingerprint absent from the index. The fingerprint includes the archive's
+// mtime, so every pack update writes to a new directory and would otherwise strand
+// the previous extraction (hundreds of MB per Synty pack) in the cache forever.
+//
+// It deletes whatever it does not recognize, including an in-flight "unpack-*" temp
+// dir, so it must run before the server starts serving rather than alongside it.
 func (ix *Index) PruneUnpacked() error {
 	if ix.cacheDir == "" {
 		return nil
 	}
-	dir := filepath.Join(ix.cacheDir, "unpacked")
-	entries, err := os.ReadDir(dir)
+	var firstErr error
+	remove := func(p string) {
+		if err := os.RemoveAll(p); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+
+	root := filepath.Join(ix.cacheDir, "unpacked")
+	versions, err := os.ReadDir(root)
 	if os.IsNotExist(err) {
 		return nil
+	}
+	if err != nil {
+		return err
+	}
+	current := strconv.Itoa(indexVersion)
+	for _, v := range versions {
+		if v.Name() != current {
+			remove(filepath.Join(root, v.Name()))
+		}
+	}
+
+	dir := ix.unpackedDir()
+	entries, err := os.ReadDir(dir)
+	if os.IsNotExist(err) {
+		return firstErr
 	}
 	if err != nil {
 		return err
@@ -98,83 +133,90 @@ func (ix *Index) PruneUnpacked() error {
 	for _, fp := range ix.ArchivePrint {
 		live[fp] = true
 	}
-	var firstErr error
 	for _, e := range entries {
 		if !e.IsDir() || live[e.Name()] {
 			continue
 		}
-		if err := os.RemoveAll(filepath.Join(dir, e.Name())); err != nil && firstErr == nil {
-			firstErr = err
-		}
+		remove(filepath.Join(dir, e.Name()))
 	}
 	return firstErr
 }
 
+// extraction is one archive's single-flighted unpack. Every waiter holds the same
+// pointer, so all of them read the same outcome — looking the result back up in a
+// shared map would hand a nil error to whoever arrived after the first waiter
+// cleared the entry to re-arm the retry.
+type extraction struct {
+	once sync.Once
+	err  error
+}
+
+// ensureExtracted decompresses a unitypackage once into the cache and returns its
+// unpacked dir. Extraction is single-flighted per archive fingerprint (concurrent
+// grid fetches of the same package wait rather than each decompressing hundreds of
+// MB), and is written to a temp dir renamed atomically into place so no reader ever
+// sees a half-written entry.
 func (ix *Index) ensureExtracted(archivePath string) (string, error) {
+	if ix.cacheDir == "" {
+		return "", ErrNoCacheDir
+	}
 	fp, err := fingerprint(archivePath)
 	if err != nil {
 		return "", err
 	}
-	dest := filepath.Join(ix.cacheDir, "unpacked", fp)
+	dest := filepath.Join(ix.unpackedDir(), fp)
 	if _, err := os.Stat(dest); err == nil {
 		return dest, nil
 	}
 
 	ix.extractMu.Lock()
-	if ix.extractOnce == nil {
-		ix.extractOnce = map[string]*sync.Once{}
-		ix.extractErr = map[string]error{}
+	if ix.extractions == nil {
+		ix.extractions = map[string]*extraction{}
 	}
-	once := ix.extractOnce[fp]
-	if once == nil {
-		once = &sync.Once{}
-		ix.extractOnce[fp] = once
+	ex := ix.extractions[fp]
+	if ex == nil {
+		ex = &extraction{}
+		ix.extractions[fp] = ex
 	}
 	ix.extractMu.Unlock()
 
-	once.Do(func() {
+	ex.once.Do(func() {
 		if _, err := os.Stat(dest); err == nil {
 			return
 		}
 		if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
-			ix.setExtractErr(fp, err)
+			ex.err = err
 			return
 		}
 		tmp, err := os.MkdirTemp(filepath.Dir(dest), "unpack-*")
 		if err != nil {
-			ix.setExtractErr(fp, err)
+			ex.err = err
 			return
 		}
 		if err := extractUnityPackage(archivePath, tmp); err != nil {
 			os.RemoveAll(tmp)
-			ix.setExtractErr(fp, err)
+			ex.err = err
 			return
 		}
 		if err := os.Rename(tmp, dest); err != nil {
 			os.RemoveAll(tmp)
 			// A racing run may have created dest first; that is success.
 			if _, statErr := os.Stat(dest); statErr != nil {
-				ix.setExtractErr(fp, err)
+				ex.err = err
 			}
 		}
 	})
 
-	ix.extractMu.Lock()
-	err = ix.extractErr[fp]
-	if err != nil {
+	if ex.err != nil {
 		// Re-arm so a later request retries: a failure (e.g. transient disk-full)
 		// shouldn't poison this package for the whole process lifetime.
-		delete(ix.extractOnce, fp)
-		delete(ix.extractErr, fp)
+		ix.extractMu.Lock()
+		if ix.extractions[fp] == ex {
+			delete(ix.extractions, fp)
+		}
+		ix.extractMu.Unlock()
 	}
-	ix.extractMu.Unlock()
-	return dest, err
-}
-
-func (ix *Index) setExtractErr(fp string, err error) {
-	ix.extractMu.Lock()
-	ix.extractErr[fp] = err
-	ix.extractMu.Unlock()
+	return dest, ex.err
 }
 
 // underRoot reports whether p resolves to a location inside the library root,

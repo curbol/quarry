@@ -98,14 +98,11 @@ func (s *server) handleTags(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleTagCreate(w http.ResponseWriter, r *http.Request) {
-	if !s.requireEnabled(w) {
-		return
-	}
 	var req struct {
 		ID    string `json:"id"`
 		Color string `json:"color"`
 	}
-	if !decodeJSON(w, r, &req) {
+	if !s.requireEnabled(w) || !decodeJSON(w, r, &req) {
 		return
 	}
 	if req.ID == "" {
@@ -116,77 +113,71 @@ func (s *server) handleTagCreate(w http.ResponseWriter, r *http.Request) {
 	if color == "" {
 		color = tagstore.DefaultColor(req.ID)
 	}
-	s.tagsMu.Lock()
-	defer s.tagsMu.Unlock()
-	if err := s.store.Define(req.ID, color); err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	if !s.persistLocked(w) {
-		return
-	}
-	writeJSON(w, s.paletteLocked())
+	s.writeUnderLock(w, func() (any, error) {
+		if err := s.store.Define(req.ID, color); err != nil {
+			return nil, err
+		}
+		return s.paletteLocked(), nil
+	})
 }
 
 func (s *server) handleTagPatch(w http.ResponseWriter, r *http.Request) {
-	if !s.requireEnabled(w) {
-		return
-	}
 	var req struct {
 		ID    string `json:"id"`
 		NewID string `json:"newId"`
 		Color string `json:"color"`
 	}
-	if !decodeJSON(w, r, &req) {
+	if !s.requireEnabled(w) || !decodeJSON(w, r, &req) {
 		return
 	}
 	if req.ID == "" {
 		writeErr(w, http.StatusBadRequest, "missing tag id")
 		return
 	}
-	s.tagsMu.Lock()
-	defer s.tagsMu.Unlock()
-	target := req.ID
-	if req.NewID != "" && req.NewID != req.ID {
-		if err := s.store.Rename(req.ID, req.NewID); err != nil {
-			writeErr(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		target = req.NewID
-	}
+	// The color is validated up front because a patch is two edits: a rename that
+	// lands followed by a color that fails would answer "rejected" while the palette
+	// keeps the new name.
+	color := ""
 	if req.Color != "" {
-		if err := s.store.Define(target, req.Color); err != nil {
+		c, err := tagstore.NormalizeColor(req.Color)
+		if err != nil {
 			writeErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		color = c
 	}
-	if !s.persistLocked(w) {
-		return
-	}
-	writeJSON(w, s.paletteLocked())
+	s.writeUnderLock(w, func() (any, error) {
+		target := req.ID
+		if req.NewID != "" && req.NewID != req.ID {
+			if err := s.store.Rename(req.ID, req.NewID); err != nil {
+				return nil, err
+			}
+			target = req.NewID
+		}
+		if color != "" {
+			if err := s.store.Define(target, color); err != nil {
+				return nil, err
+			}
+		}
+		return s.paletteLocked(), nil
+	})
 }
 
 func (s *server) handleTagDelete(w http.ResponseWriter, r *http.Request) {
-	if !s.requireEnabled(w) {
-		return
-	}
 	var req struct {
 		ID string `json:"id"`
 	}
-	if !decodeJSON(w, r, &req) {
+	if !s.requireEnabled(w) || !decodeJSON(w, r, &req) {
 		return
 	}
 	if req.ID == "" {
 		writeErr(w, http.StatusBadRequest, "missing tag id")
 		return
 	}
-	s.tagsMu.Lock()
-	defer s.tagsMu.Unlock()
-	s.store.Delete(req.ID)
-	if !s.persistLocked(w) {
-		return
-	}
-	writeJSON(w, s.paletteLocked())
+	s.writeUnderLock(w, func() (any, error) {
+		s.store.Delete(req.ID)
+		return s.paletteLocked(), nil
+	})
 }
 
 // handleAssign toggles a tag across a set of fingerprints (a card's whole group),
@@ -194,15 +185,12 @@ func (s *server) handleTagDelete(w http.ResponseWriter, r *http.Request) {
 // resulting union tags plus the full palette (so a just-created tag's color is
 // known to the client without a second request).
 func (s *server) handleAssign(w http.ResponseWriter, r *http.Request) {
-	if !s.requireEnabled(w) {
-		return
-	}
 	var req struct {
 		Fingerprints []string `json:"fingerprints"`
 		Tag          string   `json:"tag"`
 		On           bool     `json:"on"`
 	}
-	if !decodeJSON(w, r, &req) {
+	if !s.requireEnabled(w) || !decodeJSON(w, r, &req) {
 		return
 	}
 	if req.Tag == "" {
@@ -213,21 +201,18 @@ func (s *server) handleAssign(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "missing fingerprints")
 		return
 	}
-	s.tagsMu.Lock()
-	defer s.tagsMu.Unlock()
-	for _, fp := range req.Fingerprints {
-		if req.On {
-			s.store.Assign(fp, req.Tag)
-		} else {
-			s.store.Unassign(fp, req.Tag)
+	s.writeUnderLock(w, func() (any, error) {
+		for _, fp := range req.Fingerprints {
+			if req.On {
+				s.store.Assign(fp, req.Tag)
+			} else {
+				s.store.Unassign(fp, req.Tag)
+			}
 		}
-	}
-	if !s.persistLocked(w) {
-		return
-	}
-	writeJSON(w, map[string]any{
-		"tags":    s.unionTagsLocked(req.Fingerprints),
-		"palette": s.paletteLocked(),
+		return map[string]any{
+			"tags":    s.unionTagsLocked(req.Fingerprints),
+			"palette": s.paletteLocked(),
+		}, nil
 	})
 }
 
@@ -294,14 +279,11 @@ func expandRelated(filtered, preTag []assetDTO) []assetDTO {
 // handleLink links or unlinks a set of fingerprints as one travel-together group,
 // mirroring handleAssign's shape. Linking needs at least two fingerprints.
 func (s *server) handleLink(w http.ResponseWriter, r *http.Request) {
-	if !s.requireEnabled(w) {
-		return
-	}
 	var req struct {
 		Fingerprints []string `json:"fingerprints"`
 		On           bool     `json:"on"`
 	}
-	if !decodeJSON(w, r, &req) {
+	if !s.requireEnabled(w) || !decodeJSON(w, r, &req) {
 		return
 	}
 	if len(req.Fingerprints) == 0 {
@@ -312,17 +294,14 @@ func (s *server) handleLink(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "need at least two fingerprints to link")
 		return
 	}
-	s.tagsMu.Lock()
-	defer s.tagsMu.Unlock()
-	if req.On {
-		s.store.Link(req.Fingerprints)
-	} else {
-		s.store.Unlink(req.Fingerprints)
-	}
-	if !s.persistLocked(w) {
-		return
-	}
-	writeJSON(w, map[string]any{"ok": true})
+	s.writeUnderLock(w, func() (any, error) {
+		if req.On {
+			s.store.Link(req.Fingerprints)
+		} else {
+			s.store.Unlink(req.Fingerprints)
+		}
+		return map[string]any{"ok": true}, nil
+	})
 }
 
 // handleRelated returns the cards linked to the given fingerprints (a card's whole
@@ -371,15 +350,43 @@ func (s *server) requireEnabled(w http.ResponseWriter) bool {
 	return true
 }
 
+// writeUnderLock applies one edit to the store and persists it, holding the write
+// lock across the whole sequence. mutate returns the response body, which it must
+// build while still under the lock (the palette and a card's union tags are read from
+// the store). Every write endpoint goes through here so that mutating without
+// persisting, or answering an error while memory keeps the change, is not a shape a
+// handler can express.
+func (s *server) writeUnderLock(w http.ResponseWriter, mutate func() (any, error)) {
+	s.tagsMu.Lock()
+	defer s.tagsMu.Unlock()
+	resp, err := mutate()
+	if err != nil {
+		s.reloadLocked()
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !s.persistLocked(w) {
+		return
+	}
+	writeJSON(w, resp)
+}
+
+// reloadLocked drops the in-memory store for what is on disk, so a write the file
+// never received cannot survive in memory. The caller must hold the write lock. A
+// reload that itself fails leaves the store alone: there is nothing better to use.
+func (s *server) reloadLocked() {
+	if reloaded, err := tagstore.Load(s.tagsPath); err == nil {
+		s.store = reloaded
+	}
+}
+
 // persistLocked writes the store; the caller must hold the write lock.
 func (s *server) persistLocked(w http.ResponseWriter) bool {
 	if err := tagstore.Save(s.tagsPath, s.store); err != nil {
 		// Handlers mutate the store and then persist, so a failed save would otherwise
 		// leave memory claiming more than disk holds: the UI keeps reporting the tag
 		// until a restart silently takes it away again.
-		if reloaded, lerr := tagstore.Load(s.tagsPath); lerr == nil {
-			s.store = reloaded
-		}
+		s.reloadLocked()
 		writeErr(w, http.StatusInternalServerError, "could not save tags: "+err.Error())
 		return false
 	}

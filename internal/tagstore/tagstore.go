@@ -79,6 +79,9 @@ type fileTOML struct {
 // Store is an in-memory tag store. The palette (colors), assignments, and link
 // groups are the source of truth; Load/Save convert to and from the TOML
 // representation.
+//
+// A Store is not safe for concurrent use: callers sharing one across goroutines
+// must synchronize externally, around reads as well as writes.
 type Store struct {
 	colors map[string]string          // tag id -> color
 	assign map[string]map[string]bool // fingerprint -> set of tag ids
@@ -99,8 +102,10 @@ func New() *Store {
 
 var colorRe = regexp.MustCompile(`^#[0-9a-f]{6}$`)
 
-// normalizeColor lower-cases and validates a #rrggbb color.
-func normalizeColor(c string) (string, error) {
+// NormalizeColor lower-cases and validates a #rrggbb color. It is exported so a
+// caller can reject a bad color before mutating the store, rather than discovering
+// it partway through a multi-step edit.
+func NormalizeColor(c string) (string, error) {
 	c = strings.ToLower(strings.TrimSpace(c))
 	if !colorRe.MatchString(c) {
 		return "", fmt.Errorf("invalid color %q: want #rrggbb", c)
@@ -121,7 +126,7 @@ func (s *Store) Define(id, color string) error {
 	if id == "" {
 		return fmt.Errorf("empty tag id")
 	}
-	c, err := normalizeColor(color)
+	c, err := NormalizeColor(color)
 	if err != nil {
 		return err
 	}
@@ -328,7 +333,7 @@ func Load(path string) (*Store, error) {
 		if t.ID == "" {
 			continue
 		}
-		if c, err := normalizeColor(t.Color); err == nil {
+		if c, err := NormalizeColor(t.Color); err == nil {
 			s.colors[t.ID] = c
 		} else {
 			s.colors[t.ID] = DefaultColor(t.ID)
@@ -381,7 +386,11 @@ func Save(path string, s *Store) error {
 		os.Remove(tmpName)
 		return err
 	}
-	return os.Rename(tmpName, path)
+	if err := os.Rename(tmpName, path); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	return nil
 }
 
 func sortedKeys(set map[string]bool) []string {

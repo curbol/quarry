@@ -1,13 +1,15 @@
 package selfupdate
 
 import (
-	"runtime"
 	"strings"
 	"testing"
 )
 
-func TestPlatformAssetSelectsCurrentOS(t *testing.T) {
-	rel := &release{Assets: []struct {
+// releaseAssets are the labels the release workflow builds (see
+// .github/workflows/release.yml). Every one has to be reachable: CI runs on a single
+// platform, so a mapping that drifts from these labels is only caught here.
+func releaseAssets() *release {
+	return &release{Assets: []struct {
 		Name string `json:"name"`
 		URL  string `json:"url"`
 	}{
@@ -17,24 +19,35 @@ func TestPlatformAssetSelectsCurrentOS(t *testing.T) {
 		{Name: "quarry-1.0.0-linux-arm64.zip", URL: "u/linux-arm64"},
 		{Name: "quarry-1.0.0-win.zip", URL: "u/win"},
 	}}
+}
 
-	url, err := platformAsset(rel)
-	if err != nil {
-		t.Fatalf("platformAsset: %v", err)
+func TestPlatformAssetPerPlatform(t *testing.T) {
+	cases := []struct {
+		goos, goarch, want string
+	}{
+		{"darwin", "amd64", "u/mac-intel"},
+		{"darwin", "arm64", "u/mac-apple"},
+		{"linux", "amd64", "u/linux-intel"},
+		{"linux", "arm64", "u/linux-arm64"},
+		{"windows", "amd64", "u/win"},
+		{"windows", "arm64", "u/win"},
 	}
+	for _, c := range cases {
+		got, err := platformAsset(releaseAssets(), c.goos, c.goarch)
+		if err != nil {
+			t.Errorf("platformAsset(%s/%s): %v", c.goos, c.goarch, err)
+			continue
+		}
+		if got != c.want {
+			t.Errorf("platformAsset(%s/%s) = %q, want %q", c.goos, c.goarch, got, c.want)
+		}
+	}
+}
 
-	want := map[string]string{
-		"darwin":  map[string]string{"amd64": "u/mac-intel", "arm64": "u/mac-apple"}[runtime.GOARCH],
-		"linux":   map[string]string{"amd64": "u/linux-intel", "arm64": "u/linux-arm64"}[runtime.GOARCH],
-		"windows": "u/win",
-	}[runtime.GOOS]
-	// Skip rather than pass silently: an unmapped GOOS/GOARCH means this test asserts
-	// nothing, and a quiet no-op is worse than a visible gap.
-	if want == "" {
-		t.Skipf("no expected asset mapped for %s/%s", runtime.GOOS, runtime.GOARCH)
-	}
-	if url != want {
-		t.Errorf("platformAsset = %q, want %q for %s/%s", url, want, runtime.GOOS, runtime.GOARCH)
+func TestPlatformAssetUnsupportedOS(t *testing.T) {
+	_, err := platformAsset(releaseAssets(), "plan9", "amd64")
+	if err == nil || !strings.Contains(err.Error(), "unsupported platform") {
+		t.Errorf("expected an unsupported-platform error, got %v", err)
 	}
 }
 
@@ -45,7 +58,7 @@ func TestPlatformAssetMissing(t *testing.T) {
 	}{
 		{Name: "quarry-1.0.0-solaris-sparc.zip", URL: "u/nope"},
 	}}
-	if _, err := platformAsset(rel); err == nil || !strings.Contains(err.Error(), "no asset matching") {
+	if _, err := platformAsset(rel, "linux", "amd64"); err == nil || !strings.Contains(err.Error(), "no asset matching") {
 		t.Errorf("expected no-asset error, got %v", err)
 	}
 }

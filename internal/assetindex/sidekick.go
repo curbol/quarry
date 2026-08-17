@@ -2,9 +2,7 @@ package assetindex
 
 import (
 	"archive/tar"
-	"compress/gzip"
 	"io"
-	"os"
 	"path"
 	"strings"
 )
@@ -49,12 +47,17 @@ func parseSidekick(data []byte) (name string, parts []string) {
 // so the frontend can load and merge them. Its own id and fingerprint stay tied to the
 // .sk guid, so tags survive. Packages with no .sk entry are returned untouched (the
 // common case, so the extra decompress pass only runs for Sidekick packs).
+// maxSidekickBytes bounds a .sk read. A character definition is a name and a short
+// list of part names; anything approaching this is not one, and the .sk here was
+// picked out by extension alone from an archive this tool did not produce.
+const maxSidekickBytes = 256 << 10
+
 func applySidekick(archivePath string, entries map[string]*unityEntry, order []string, assets []Asset) ([]Asset, error) {
 	skGuids := map[string]bool{}
 	fbxByBase := map[string]string{}
 	for _, g := range order {
 		p := entries[g].pathname
-		switch strings.ToLower(strings.TrimPrefix(path.Ext(p), ".")) {
+		switch extOf(p) {
 		case "sk":
 			skGuids[g] = true
 		case "fbx":
@@ -64,7 +67,7 @@ func applySidekick(archivePath string, entries map[string]*unityEntry, order []s
 	if len(skGuids) == 0 {
 		return assets, nil
 	}
-	skBytes, err := readUnityAssetBytes(archivePath, skGuids)
+	skBytes, err := readUnityAssetBytes(archivePath, skGuids, maxSidekickBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -134,39 +137,27 @@ func sidekickByproduct(a Asset, assembledTrees []string) bool {
 	return false
 }
 
-// readUnityAssetBytes streams a .unitypackage once and returns the full `asset` payload
-// of each requested GUID. Used for the few small .sk files a Sidekick package holds,
-// whose full bytes the enumeration pass (which buffers only a head) doesn't retain.
-func readUnityAssetBytes(archivePath string, want map[string]bool) (map[string][]byte, error) {
-	f, err := os.Open(archivePath)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	gz, err := gzip.NewReader(f)
-	if err != nil {
-		return nil, err
-	}
-	defer gz.Close()
-
-	tr := tar.NewReader(gz)
+// readUnityAssetBytes streams a .unitypackage once and returns the `asset` payload of
+// each requested GUID, truncated at limit bytes. Used for the few small .sk files a
+// Sidekick package holds, whose full bytes the enumeration pass (which buffers only a
+// head) doesn't retain. The limit is the caller's contract with an untrusted archive:
+// a member is selected by extension, so an unrelated large file that happens to carry
+// one must not be read into memory whole.
+func readUnityAssetBytes(archivePath string, want map[string]bool, limit int64) (map[string][]byte, error) {
 	out := make(map[string][]byte, len(want))
-	for {
-		hdr, err := tr.Next()
-		if err == io.EOF {
-			return out, nil
+	err := walkUnityTar(archivePath, func(guid, member string, _ *tar.Header, tr *tar.Reader) error {
+		if member != "asset" || !want[guid] {
+			return nil
 		}
+		b, err := io.ReadAll(io.LimitReader(tr, limit))
 		if err != nil {
-			return nil, err
-		}
-		guid, member, ok := splitUnityName(hdr.Name)
-		if !ok || member != "asset" || !want[guid] {
-			continue
-		}
-		b, err := io.ReadAll(tr)
-		if err != nil {
-			return nil, err
+			return err
 		}
 		out[guid] = b
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
+	return out, nil
 }

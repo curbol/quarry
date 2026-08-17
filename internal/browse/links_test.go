@@ -4,10 +4,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"path/filepath"
 	"testing"
 
-	"github.com/curbol/quarry/internal/assetindex"
 	"github.com/curbol/quarry/internal/tagstore"
 )
 
@@ -83,16 +81,9 @@ func TestLinkRequiresTwoFingerprints(t *testing.T) {
 }
 
 func TestLinkDisabled(t *testing.T) {
-	root := t.TempDir()
-	cache := t.TempDir()
-	writeZip(t, filepath.Join(root, "synty", "P", "P_SourceFiles_v3.zip"), map[string]string{"SourceFiles/A.fbx": "AAA"})
-	ix, err := assetindex.Build(root, cache)
-	if err != nil {
-		t.Fatal(err)
-	}
-	s, _ := newServer(ix, nil, "") // no tags path -> tagging disabled
-	srv := httptest.NewServer(s.handler())
-	t.Cleanup(srv.Close)
+	srv := serverWith(t, func(mk func(...string) string) { // no tags path -> tagging disabled
+		writeZip(t, mk("synty", "P", "P_SourceFiles_v3.zip"), map[string]string{"SourceFiles/A.fbx": "AAA"})
+	})
 
 	resp := doJSON(t, "POST", srv.URL+"/api/link", map[string]any{"fingerprints": []string{"a", "b"}, "on": true})
 	resp.Body.Close()

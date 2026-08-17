@@ -57,7 +57,7 @@ func Run(current, target string) error {
 		return nil
 	}
 
-	assetURL, err := platformAsset(rel)
+	assetURL, err := platformAsset(rel, runtime.GOOS, runtime.GOARCH)
 	if err != nil {
 		return err
 	}
@@ -141,25 +141,28 @@ func fetchRelease(token, target string) (*release, error) {
 	return &r, nil
 }
 
-// platformAsset returns the asset API URL for the current OS/arch, matching the
-// label suffix the release workflow uses.
-func platformAsset(rel *release) (string, error) {
+// platformAsset returns the asset API URL for the given OS/arch, matching the label
+// suffix the release workflow uses. The platform is a parameter rather than read from
+// runtime so every branch is assertable: the release builds five of them and CI runs
+// on one, so a mapping that drifts from the workflow's labels would otherwise surface
+// only when a user on that platform ran `quarry update`.
+func platformAsset(rel *release, goos, goarch string) (string, error) {
 	var suffix string
-	switch runtime.GOOS {
+	switch goos {
 	case "darwin":
 		suffix = "mac-intel.zip"
-		if runtime.GOARCH == "arm64" {
+		if goarch == "arm64" {
 			suffix = "mac-apple.zip"
 		}
 	case "linux":
 		suffix = "linux-intel.zip"
-		if runtime.GOARCH == "arm64" {
+		if goarch == "arm64" {
 			suffix = "linux-arm64.zip"
 		}
 	case "windows":
 		suffix = "win.zip"
 	default:
-		return "", fmt.Errorf("unsupported platform %s/%s", runtime.GOOS, runtime.GOARCH)
+		return "", fmt.Errorf("unsupported platform %s/%s", goos, goarch)
 	}
 	for _, a := range rel.Assets {
 		if strings.HasSuffix(a.Name, suffix) {

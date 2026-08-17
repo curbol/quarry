@@ -2,9 +2,14 @@ package assetindex
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -186,6 +191,9 @@ func TestUnassembledSidekickKeepsItsByproducts(t *testing.T) {
 	byExt := map[string]bool{}
 	for _, a := range assets {
 		byExt[a.Ext] = true
+		if a.Ext == "sk" && a.Thumb == ThumbSidekick {
+			t.Error("a character with no resolvable part was still upgraded to an assembled one")
+		}
 	}
 	if !byExt["prefab"] {
 		t.Errorf("the unassembled character lost its prefab; kept only %v", byExt)
@@ -293,8 +301,9 @@ func TestBuildSkipsMalformedUnityPackage(t *testing.T) {
 	}
 }
 
-// Every pack update writes a new extraction dir keyed on the archive's mtime.
-// Nothing removed the old one, so each update stranded hundreds of MB.
+// Every pack update writes a new extraction dir keyed on the archive's mtime, and
+// every index version writes under its own tree. Nothing removed either, so updates
+// stranded hundreds of MB apiece and a version bump stranded the whole previous tree.
 func TestPruneUnpackedDropsStaleExtractions(t *testing.T) {
 	root, mk := libRoot(t)
 	os.WriteFile(mk("v", "Pack", "Sword.glb"), []byte("GLBBYTES"), 0o644)
@@ -304,20 +313,26 @@ func TestPruneUnpackedDropsStaleExtractions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	unpacked := filepath.Join(cacheDir, "unpacked")
-	stale := filepath.Join(unpacked, "deadbeefdeadbeef")
-	if err := os.MkdirAll(stale, 0o755); err != nil {
-		t.Fatal(err)
+	seed := func(parts ...string) string {
+		dir := filepath.Join(append([]string{cacheDir, "unpacked"}, parts...)...)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "asset"), []byte("old"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return dir
 	}
-	if err := os.WriteFile(filepath.Join(stale, "asset"), []byte("old"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	staleFingerprint := seed(strconv.Itoa(indexVersion), "deadbeefdeadbeef")
+	staleVersion := seed(strconv.Itoa(indexVersion-1), "cafebabecafebabe")
 
 	if err := ix.PruneUnpacked(); err != nil {
 		t.Fatalf("PruneUnpacked: %v", err)
 	}
-	if _, err := os.Stat(stale); !os.IsNotExist(err) {
-		t.Errorf("stale extraction %s survived the prune (err=%v)", stale, err)
+	for _, p := range []string{staleFingerprint, staleVersion} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("stale extraction %s survived the prune (err=%v)", p, err)
+		}
 	}
 }
 
@@ -346,5 +361,188 @@ func TestOpenRejectsSymlinkEscapingRoot(t *testing.T) {
 	bad := Asset{Source: Source{Kind: SourceLoose, FilePath: link}}
 	if _, _, err := ix.Open(bad); err != ErrOutsideRoot {
 		t.Errorf("Open through a symlink out of the root err = %v, want ErrOutsideRoot", err)
+	}
+}
+
+// A big library accumulates the odd corner the user cannot read — a restrictive
+// mode, a half-synced network mount. Failing the walk there costs the whole index
+// and browse refuses to start, which is the same bargain a damaged archive already
+// avoids.
+func TestUnreadableDirectoryIsSkippedNotFatal(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores permission bits")
+	}
+	root, mk := libRoot(t)
+	os.WriteFile(mk("v", "Pack", "Sword.glb"), []byte("GLBBYTES"), 0o644)
+	locked := mk("v", "Locked", "x.png")
+	os.WriteFile(locked, []byte("x"), 0o644)
+	lockedDir := filepath.Dir(locked)
+	if err := os.Chmod(lockedDir, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(lockedDir, 0o755) })
+
+	ix, err := Build(root, t.TempDir())
+	if err != nil {
+		t.Fatalf("one unreadable directory aborted the whole scan: %v", err)
+	}
+	if len(ix.Assets) != 1 || ix.Assets[0].Name != "Sword.glb" {
+		t.Errorf("readable assets = %+v, want just Sword.glb", ix.Assets)
+	}
+	if len(ix.Skipped) != 1 || !strings.Contains(ix.Skipped[0].RelPath, "Locked") {
+		t.Errorf("skipped = %+v, want the unreadable dir reported", ix.Skipped)
+	}
+}
+
+// Tolerating an unreadable subtree must not extend to the root: a mistyped --root
+// that silently indexed nothing would look like an empty library.
+func TestUnreadableRootIsFatal(t *testing.T) {
+	if _, err := Build(filepath.Join(t.TempDir(), "does-not-exist"), t.TempDir()); err == nil {
+		t.Error("a missing root built an empty index instead of failing")
+	}
+}
+
+// Dedup keys a loose file on its path within the pack. A file sitting directly under
+// a vendor dir has no pack, and building that prefix by formatting left a doubled
+// separator that matched nothing, so the copy never collapsed.
+func TestDedupWithAndWithoutAPackDir(t *testing.T) {
+	cards := func(layout ...string) int {
+		root, mk := libRoot(t)
+		dir := append(layout, "Heart.fbx")
+		os.WriteFile(mk(dir...), []byte("FBXHEART"), 0o644)
+		writeZip(t, mk(append(layout, "bundle.zip")...), map[string]string{"Heart.fbx": "FBXHEART"})
+		assets, err := Scan(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		n := 0
+		for _, a := range assets {
+			if a.Name == "Heart.fbx" {
+				n++
+			}
+		}
+		return n
+	}
+	if withPack, noPack := cards("synty", "Foo_Pack"), cards("synty"); withPack != 1 || noPack != 1 {
+		t.Errorf("Heart.fbx cards: vendor/pack/ = %d, vendor/ = %d, want 1 each", withPack, noPack)
+	}
+}
+
+// Extraction is single-flighted, so a failure has many callers waiting on it. Each
+// has to be told what went wrong: re-reading the outcome from a shared map handed a
+// nil error — indistinguishable from success — to everyone who arrived after the
+// first waiter cleared the entry to re-arm the retry.
+func TestFailedExtractionReachesEveryWaiter(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores permission bits")
+	}
+	root, mk := libRoot(t)
+	pkg := mk("synty", "Pack", "Pack_Unity_v1.unitypackage")
+	writeUnityPackage(t, pkg, []unityGUID{{guid: "abc123", pathname: "Assets/Heart.fbx", asset: "FBXBYTES"}})
+
+	cacheDir := t.TempDir()
+	ix, err := Build(root, cacheDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(cacheDir, 0o500); err != nil { // no writes: the unpack dir cannot be made
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(cacheDir, 0o755) })
+
+	const waiters = 24
+	errs := make([]error, waiters)
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := range errs {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			_, errs[i] = ix.ensureExtracted(pkg)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err == nil {
+			t.Fatalf("waiter %d was told a failed extraction succeeded", i)
+		}
+	}
+}
+
+// An index built without a cache dir has nowhere to extract to. Joining onto an empty
+// dir yields a relative path, so the unpack tree would land in the working directory
+// — which may sit inside the library this tool never writes to.
+func TestExtractWithoutACacheDirIsRefused(t *testing.T) {
+	root, mk := libRoot(t)
+	pkg := mk("synty", "Pack", "Pack_Unity_v1.unitypackage")
+	writeUnityPackage(t, pkg, []unityGUID{{guid: "abc123", pathname: "Assets/Heart.fbx", asset: "FBXBYTES"}})
+
+	ix, err := Build(root, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cwd := t.TempDir()
+	t.Chdir(cwd)
+
+	var unity Asset
+	for _, a := range ix.Assets {
+		if a.Source.Kind == SourceUnityPackage {
+			unity = a
+		}
+	}
+	if _, _, err := ix.Open(unity); !errors.Is(err, ErrNoCacheDir) {
+		t.Errorf("Open err = %v, want ErrNoCacheDir", err)
+	}
+	entries, err := os.ReadDir(cwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("Open wrote %v into the working directory", entries)
+	}
+}
+
+// A pack ships tens of thousands of entries and the grid fetches one asset per card,
+// so archives stay open and shared. An eviction must not close a reader a response is
+// still streaming through.
+func TestZipReaderSurvivesEvictionMidStream(t *testing.T) {
+	root, mk := libRoot(t)
+	writeZip(t, mk("v", "Pack", "Pack_SourceFiles_v1.zip"), map[string]string{"Heart.fbx": "FBXHEART"})
+	for i := 0; i <= zipCacheSize; i++ {
+		writeZip(t, mk("v", "Pack", fmt.Sprintf("Pack_Other%d_v1.zip", i)), map[string]string{"X.fbx": "XBYTES"})
+	}
+	ix, err := Build(root, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string][]Asset{}
+	for _, a := range ix.Assets {
+		byName[a.Name] = append(byName[a.Name], a)
+	}
+	rc, _, err := ix.Open(byName["Heart.fbx"][0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.Close()
+
+	// Push the held archive out of the cache by touching more than it can hold.
+	for _, a := range byName["X.fbx"] {
+		other, _, err := ix.Open(a)
+		if err != nil {
+			t.Fatal(err)
+		}
+		io.Copy(io.Discard, other)
+		other.Close()
+	}
+
+	b, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("reading an entry whose archive was evicted mid-stream: %v", err)
+	}
+	if string(b) != "FBXHEART" {
+		t.Errorf("entry bytes = %q, want FBXHEART", b)
 	}
 }

@@ -18,6 +18,7 @@ import (
 	"testing"
 
 	"github.com/curbol/quarry/internal/assetindex"
+	"github.com/curbol/quarry/internal/tagstore"
 )
 
 func writeZip(t *testing.T, path string, entries map[string]string) {
@@ -33,10 +34,13 @@ func writeZip(t *testing.T, path string, entries map[string]string) {
 	os.WriteFile(path, buf.Bytes(), 0o644)
 }
 
-func writeUnity(t *testing.T, path string, guids []struct {
+// unityMember is one GUID's worth of a fake .unitypackage.
+type unityMember struct {
 	guid, pathname, asset string
 	preview               bool
-}) {
+}
+
+func writeUnity(t *testing.T, path string, guids []unityMember) {
 	t.Helper()
 	os.MkdirAll(filepath.Dir(path), 0o755)
 	var buf bytes.Buffer
@@ -59,10 +63,11 @@ func writeUnity(t *testing.T, path string, guids []struct {
 	os.WriteFile(path, buf.Bytes(), 0o644)
 }
 
-// serverWith builds a library from the files seed writes and serves it read-only,
-// replacing the root/cache/mk/Build/newServer/httptest block these tests would
-// otherwise each repeat.
-func serverWith(t *testing.T, seed func(mk func(...string) string)) *httptest.Server {
+// serveLibrary indexes the files seed writes and serves them. An empty tagsPath
+// serves read-only, matching how the CLI would run without a tag store. It replaces
+// the root/mk/Build/newServer/httptest block every test in this package would
+// otherwise repeat.
+func serveLibrary(t *testing.T, tagsPath string, seed func(mk func(...string) string)) *httptest.Server {
 	t.Helper()
 	root := t.TempDir()
 	mk := func(p ...string) string {
@@ -77,7 +82,13 @@ func serverWith(t *testing.T, seed func(mk func(...string) string)) *httptest.Se
 	if err != nil {
 		t.Fatal(err)
 	}
-	s, err := newServer(ix, nil, "")
+	var store *tagstore.Store
+	if tagsPath != "" {
+		if store, err = tagstore.Load(tagsPath); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s, err := newServer(ix, store, tagsPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,40 +97,39 @@ func serverWith(t *testing.T, seed func(mk func(...string) string)) *httptest.Se
 	return srv
 }
 
+// serverWith serves seed's library with tagging off.
+func serverWith(t *testing.T, seed func(mk func(...string) string)) *httptest.Server {
+	t.Helper()
+	return serveLibrary(t, "", seed)
+}
+
+// taggedLibrary serves seed's library with tagging on, returning the tag-store path
+// too so a test can read what was actually written to disk.
+func taggedLibrary(t *testing.T, seed func(mk func(...string) string)) (*httptest.Server, string) {
+	t.Helper()
+	tagsPath := filepath.Join(t.TempDir(), tagstore.FileName)
+	return serveLibrary(t, tagsPath, seed), tagsPath
+}
+
+// fixtureLibrary seeds the shared fixture: Heart.fbx/png in a zip, a Unity prefab
+// with a preview plus Rock.fbx, and a loose Sword.glb.
+func fixtureLibrary(t *testing.T) func(mk func(...string) string) {
+	return func(mk func(...string) string) {
+		writeZip(t, mk("synty", "Foo_Pack", "Foo_Pack_SourceFiles_v3.zip"), map[string]string{
+			"SourceFiles/Heart.fbx": "FBXHEART",
+			"SourceFiles/Heart.png": "PNGHEART",
+		})
+		writeUnity(t, mk("synty", "Foo_Pack", "Foo_Pack_Unity_2022_3_v1_0_0.unitypackage"), []unityMember{
+			{guid: "aaa", pathname: "Assets/Foo/Heart.prefab", asset: "PREFABBYTES", preview: true},
+			{guid: "ccc", pathname: "Assets/Foo/Rock.fbx", asset: "ROCKBYTES"},
+		})
+		os.WriteFile(mk("explosive", "RPG", "Sword.glb"), []byte("GLBBYTES"), 0o644)
+	}
+}
+
 func testServer(t *testing.T) *httptest.Server {
 	t.Helper()
-	root := t.TempDir()
-	cache := t.TempDir()
-	mk := func(p ...string) string {
-		full := filepath.Join(append([]string{root}, p...)...)
-		os.MkdirAll(filepath.Dir(full), 0o755)
-		return full
-	}
-
-	writeZip(t, mk("synty", "Foo_Pack", "Foo_Pack_SourceFiles_v3.zip"), map[string]string{
-		"SourceFiles/Heart.fbx": "FBXHEART",
-		"SourceFiles/Heart.png": "PNGHEART",
-	})
-	writeUnity(t, mk("synty", "Foo_Pack", "Foo_Pack_Unity_2022_3_v1_0_0.unitypackage"), []struct {
-		guid, pathname, asset string
-		preview               bool
-	}{
-		{"aaa", "Assets/Foo/Heart.prefab", "PREFABBYTES", true},
-		{"ccc", "Assets/Foo/Rock.fbx", "ROCKBYTES", false},
-	})
-	os.WriteFile(mk("explosive", "RPG", "Sword.glb"), []byte("GLBBYTES"), 0o644)
-
-	ix, err := assetindex.Build(root, cache)
-	if err != nil {
-		t.Fatal(err)
-	}
-	s, err := newServer(ix, nil, "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	srv := httptest.NewServer(s.handler())
-	t.Cleanup(srv.Close)
-	return srv
+	return serverWith(t, fixtureLibrary(t))
 }
 
 type sourceJSON struct {
@@ -317,11 +327,8 @@ func TestGroupDuplicates(t *testing.T) {
 		writeZip(t, mk("synty", "Dup_Pack", "Dup_Pack_SourceFiles_v3.zip"), map[string]string{
 			"SourceFiles/Coin.fbx": "COINDATA",
 		})
-		writeUnity(t, mk("synty", "Dup_Pack", "Dup_Pack_Unity_2022_3_v1_0_0.unitypackage"), []struct {
-			guid, pathname, asset string
-			preview               bool
-		}{
-			{"g1", "Assets/Dup/Coin.fbx", "COINDATA", false}, // same name + bytes -> same size
+		writeUnity(t, mk("synty", "Dup_Pack", "Dup_Pack_Unity_2022_3_v1_0_0.unitypackage"), []unityMember{
+			{guid: "g1", pathname: "Assets/Dup/Coin.fbx", asset: "COINDATA"}, // same name + bytes -> same size
 		})
 	})
 
@@ -358,11 +365,8 @@ func TestGroupNameVariants(t *testing.T) {
 		writeZip(t, mk("synty", "HUD", "HUD_SourceSprites_v3.zip"), map[string]string{
 			"Source_Sprites/SPR_Gem09.png": "SAMEPNGBYTES",
 		})
-		writeUnity(t, mk("synty", "HUD", "HUD_Unity_2022_1_v1_0_0.unitypackage"), []struct {
-			guid, pathname, asset string
-			preview               bool
-		}{
-			{"g1", "Assets/Synty/HUD/SPR_Gem_09.png", "SAMEPNGBYTES", false},
+		writeUnity(t, mk("synty", "HUD", "HUD_Unity_2022_1_v1_0_0.unitypackage"), []unityMember{
+			{guid: "g1", pathname: "Assets/Synty/HUD/SPR_Gem_09.png", asset: "SAMEPNGBYTES"},
 		})
 	})
 

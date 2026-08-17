@@ -44,37 +44,60 @@ func splitUnityName(name string) (guid, member string, ok bool) {
 	return guid, member, true
 }
 
-// unityAssets enumerates the payload-bearing entries of a .unitypackage. It streams
-// the gzip+tar once, resolving each GUID's real path from its `pathname` member and
-// noting an optional `preview.png`. GUIDs with no `asset` payload (Unity directory
-// placeholders) are dropped so they never become phantom index rows.
-func unityAssets(archivePath, displayRel, vendor, pack, variant string) ([]Asset, error) {
+// extOf is the lower-case, dotless extension of a unity pathname.
+func extOf(p string) string {
+	return strings.ToLower(strings.TrimPrefix(path.Ext(p), "."))
+}
+
+// walkUnityTar streams a .unitypackage's gzip+tar once, calling visit for each member
+// whose name parses as <guid>/<member>. tr is positioned at that member's bytes and
+// is only valid for the duration of the call. A visit error stops the walk. Every
+// pass over a unitypackage goes through here: enumeration, extraction, and the
+// Sidekick definition read all need the same setup and the same name handling.
+func walkUnityTar(archivePath string, visit func(guid, member string, hdr *tar.Header, tr *tar.Reader) error) error {
 	f, err := os.Open(archivePath)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer f.Close()
 	gz, err := gzip.NewReader(f)
 	if err != nil {
-		return nil, fmt.Errorf("gzip %s: %w", filepath.Base(archivePath), err)
+		return fmt.Errorf("gzip %s: %w", filepath.Base(archivePath), err)
 	}
 	defer gz.Close()
 
 	tr := tar.NewReader(gz)
-	entries := map[string]*unityEntry{}
-	var order []string
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
-			break
+			return nil
 		}
 		if err != nil {
-			return nil, fmt.Errorf("tar %s: %w", filepath.Base(archivePath), err)
+			return fmt.Errorf("tar %s: %w", filepath.Base(archivePath), err)
 		}
 		guid, member, ok := splitUnityName(hdr.Name)
 		if !ok {
 			continue
 		}
+		if err := visit(guid, member, hdr, tr); err != nil {
+			return err
+		}
+	}
+}
+
+// unityAssets enumerates the payload-bearing entries of a .unitypackage. It streams
+// the gzip+tar once, resolving each GUID's real path from its `pathname` member and
+// noting an optional `preview.png`. GUIDs with no `asset` payload (Unity directory
+// placeholders) are dropped so they never become phantom index rows.
+func unityAssets(archivePath, displayRel, vendor, pack, variant string) ([]Asset, error) {
+	entries := map[string]*unityEntry{}
+	var order []string
+	// Only images consume the head buffer, and the two members arrive in either order
+	// across Unity versions: buffer while the extension is still unknown, and drop the
+	// buffer as soon as either member proves the entry is not an image. A large pack
+	// holds thousands of non-image entries, whose buffers would otherwise be retained
+	// for the whole archive pass.
+	err := walkUnityTar(archivePath, func(guid, member string, hdr *tar.Header, tr *tar.Reader) error {
 		e := entries[guid]
 		if e == nil {
 			e = &unityEntry{}
@@ -85,23 +108,25 @@ func unityAssets(archivePath, displayRel, vendor, pack, variant string) ([]Asset
 		case "asset":
 			e.hasAsset = true
 			e.assetSize = hdr.Size
-			e.head = readHead(tr)
+			if e.pathname == "" || isDimExt(extOf(e.pathname)) {
+				e.head = readHead(tr)
+			}
 		case "pathname":
 			b, err := io.ReadAll(io.LimitReader(tr, maxPathnameBytes))
 			if err != nil {
-				return nil, err
+				return err
 			}
 			e.pathname = strings.TrimSpace(firstLine(string(b)))
-			// Only images consume the head buffer. Unity writes `asset` before
-			// `pathname`, so the read cannot be skipped up front, but a large pack has
-			// thousands of non-image entries whose buffers would otherwise be held for
-			// the whole archive pass.
-			if !isDimExt(strings.ToLower(strings.TrimPrefix(path.Ext(e.pathname), "."))) {
+			if !isDimExt(extOf(e.pathname)) {
 				e.head = nil
 			}
 		case "preview.png":
 			e.hasPreview = true
 		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 
 	var assets []Asset
@@ -131,29 +156,9 @@ func unityAssets(archivePath, displayRel, vendor, pack, variant string) ([]Asset
 // (asset.meta, pathname) are not written. destDir is expected to be a temp dir the
 // caller renames into place atomically.
 func extractUnityPackage(archivePath, destDir string) error {
-	f, err := os.Open(archivePath)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	gz, err := gzip.NewReader(f)
-	if err != nil {
-		return err
-	}
-	defer gz.Close()
-
-	tr := tar.NewReader(gz)
-	for {
-		hdr, err := tr.Next()
-		if err == io.EOF {
+	return walkUnityTar(archivePath, func(guid, member string, _ *tar.Header, tr *tar.Reader) error {
+		if member != "asset" && member != "preview.png" {
 			return nil
-		}
-		if err != nil {
-			return err
-		}
-		guid, member, ok := splitUnityName(hdr.Name)
-		if !ok || (member != "asset" && member != "preview.png") {
-			continue
 		}
 		dir := filepath.Join(destDir, guid)
 		if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -167,10 +172,10 @@ func extractUnityPackage(archivePath, destDir string) error {
 			out.Close()
 			return err
 		}
-		if err := out.Close(); err != nil {
-			return err
-		}
-	}
+		// Checked, not deferred: a flush failure would leave a silently truncated
+		// payload that later reads treat as the asset's real bytes.
+		return out.Close()
+	})
 }
 
 func firstLine(s string) string {

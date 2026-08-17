@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -90,5 +91,38 @@ func TestResolveTagsPath(t *testing.T) {
 	t.Chdir(sub)
 	if got, want := resolveTagsPath("", cfgDir), filepath.Join(dir, tagstore.FileName); got != want {
 		t.Errorf("discovered tags path = %q, want %q", got, want)
+	}
+}
+
+// The documented precedence is config.toml, then QUARRY_ROOT, then --root. config
+// covers the first two hops; the last one lives here, so only a run through the CLI
+// proves the flag actually wins.
+func TestRootFlagBeatsEnvironment(t *testing.T) {
+	cfgDir := t.TempDir()
+	envRoot := t.TempDir()
+	flagRoot := t.TempDir()
+	os.WriteFile(filepath.Join(cfgDir, "config.toml"), []byte("root = "+strconv.Quote(t.TempDir())+"\n"), 0o644)
+	t.Setenv("QUARRY_ROOT", envRoot)
+
+	var got string
+	served = func(root, _, _ string, _ bool, _ string) error {
+		got = root
+		return nil
+	}
+	t.Cleanup(func() { served = serve })
+
+	if err := run([]string{"--config", cfgDir, "--root", flagRoot}); err != nil {
+		t.Fatal(err)
+	}
+	if got != flagRoot {
+		t.Errorf("resolved root = %q, want the --root value %q", got, flagRoot)
+	}
+
+	got = ""
+	if err := run([]string{"--config", cfgDir}); err != nil {
+		t.Fatal(err)
+	}
+	if got != envRoot {
+		t.Errorf("with no --root, resolved root = %q, want QUARRY_ROOT %q", got, envRoot)
 	}
 }

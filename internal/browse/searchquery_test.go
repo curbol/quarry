@@ -46,6 +46,14 @@ func TestSearchQueryMatch(t *testing.T) {
 		{"jump OR walk", anim, false},
 		{"jump | loop", anim, true},
 
+		// OR binds looser than the implicit AND. Both of these separate that from a
+		// reading where OR binds tighter: "walk turn OR loop" is (walk AND turn) OR
+		// loop, which the asset satisfies through "loop" alone, where walk AND (turn
+		// OR loop) would fail on "walk"; the second pins the same rule on the right
+		// of the OR.
+		{"walk turn OR loop", anim, true},
+		{"walk turn OR loop jump", anim, false},
+
 		{"turn -idle", anim, true},
 		{"turn -loop", anim, false},
 

@@ -11,7 +11,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/curbol/quarry/internal/assetindex"
 	"github.com/curbol/quarry/internal/tagstore"
 )
 
@@ -44,34 +43,12 @@ type taggedAssetsResp struct {
 // store, returning the httptest server and the tag-store path on disk.
 func enabledServer(t *testing.T) (*httptest.Server, string) {
 	t.Helper()
-	root := t.TempDir()
-	cache := t.TempDir()
-	mk := func(p ...string) string {
-		full := filepath.Join(append([]string{root}, p...)...)
-		os.MkdirAll(filepath.Dir(full), 0o755)
-		return full
-	}
-	writeZip(t, mk("synty", "Foo_Pack", "Foo_Pack_SourceFiles_v3.zip"), map[string]string{
-		"SourceFiles/Heart.fbx": "FBXHEART",
+	return taggedLibrary(t, func(mk func(...string) string) {
+		writeZip(t, mk("synty", "Foo_Pack", "Foo_Pack_SourceFiles_v3.zip"), map[string]string{
+			"SourceFiles/Heart.fbx": "FBXHEART",
+		})
+		os.WriteFile(mk("explosive", "RPG", "Sword.glb"), []byte("GLBBYTES"), 0o644)
 	})
-	os.WriteFile(mk("explosive", "RPG", "Sword.glb"), []byte("GLBBYTES"), 0o644)
-
-	ix, err := assetindex.Build(root, cache)
-	if err != nil {
-		t.Fatal(err)
-	}
-	tagsPath := filepath.Join(t.TempDir(), tagstore.FileName)
-	store, err := tagstore.Load(tagsPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	s, err := newServer(ix, store, tagsPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	srv := httptest.NewServer(s.handler())
-	t.Cleanup(srv.Close)
-	return srv, tagsPath
 }
 
 func doJSON(t *testing.T, method, url string, body any) *http.Response {
@@ -123,16 +100,9 @@ func itemByName(t *testing.T, srv *httptest.Server, qs, name string) taggedItem 
 }
 
 func TestTagsDisabled(t *testing.T) {
-	root := t.TempDir()
-	cache := t.TempDir()
-	writeZip(t, filepath.Join(root, "synty", "P", "P_SourceFiles_v3.zip"), map[string]string{"SourceFiles/A.fbx": "AAA"})
-	ix, err := assetindex.Build(root, cache)
-	if err != nil {
-		t.Fatal(err)
-	}
-	s, _ := newServer(ix, nil, "")
-	srv := httptest.NewServer(s.handler())
-	t.Cleanup(srv.Close)
+	srv := serverWith(t, func(mk func(...string) string) {
+		writeZip(t, mk("synty", "P", "P_SourceFiles_v3.zip"), map[string]string{"SourceFiles/A.fbx": "AAA"})
+	})
 
 	var p paletteResp
 	decode(t, doJSON(t, "GET", srv.URL+"/api/tags", nil), &p)
@@ -262,26 +232,12 @@ func TestTagFilterAndOr(t *testing.T) {
 // different bytes) is a single tag unit: its Tags is the union over both, so an AND
 // filter matches on the union even though no single file carries both tags.
 func TestCardUnionAndFilter(t *testing.T) {
-	root := t.TempDir()
-	cache := t.TempDir()
-	mk := func(p ...string) string {
-		full := filepath.Join(append([]string{root}, p...)...)
-		os.MkdirAll(filepath.Dir(full), 0o755)
-		return full
-	}
-	// Two "Coin.fbx" of equal byte length but different content in different packs:
-	// same group key (name+size), different fingerprints (crc differs).
-	writeZip(t, mk("synty", "A", "A_SourceFiles_v3.zip"), map[string]string{"SourceFiles/Coin.fbx": "COINDAT1"})
-	writeZip(t, mk("synty", "B", "B_SourceFiles_v3.zip"), map[string]string{"SourceFiles/Coin.fbx": "COINDAT2"})
-	ix, err := assetindex.Build(root, cache)
-	if err != nil {
-		t.Fatal(err)
-	}
-	tagsPath := filepath.Join(t.TempDir(), tagstore.FileName)
-	store, _ := tagstore.Load(tagsPath)
-	s, _ := newServer(ix, store, tagsPath)
-	srv := httptest.NewServer(s.handler())
-	t.Cleanup(srv.Close)
+	srv, _ := taggedLibrary(t, func(mk func(...string) string) {
+		// Two "Coin.fbx" of equal byte length but different content in different packs:
+		// same group key (name+size), different fingerprints (crc differs).
+		writeZip(t, mk("synty", "A", "A_SourceFiles_v3.zip"), map[string]string{"SourceFiles/Coin.fbx": "COINDAT1"})
+		writeZip(t, mk("synty", "B", "B_SourceFiles_v3.zip"), map[string]string{"SourceFiles/Coin.fbx": "COINDAT2"})
+	})
 
 	coin := itemByName(t, srv, "q=Coin", "Coin.fbx")
 	if len(coin.Fingerprints) != 2 {

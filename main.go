@@ -42,6 +42,11 @@ func main() {
 // can capture and assert it; progress and diagnostics stay on stderr.
 var stdout io.Writer = os.Stdout
 
+// served indexes and serves. It is a package variable for the same reason as stdout:
+// a test can then assert what the config/env/flag chain resolved without standing up
+// a server and blocking on it.
+var served = serve
+
 // run dispatches the command line. Serving is the whole point of the tool, so it is
 // what a bare `quarry` does; update and version are the only subcommands.
 func run(args []string) error {
@@ -50,7 +55,7 @@ func run(args []string) error {
 		cmd, args = args[0], args[1:]
 	}
 	switch cmd {
-	case "", "browse", "update", "version", "help":
+	case "", "update", "version", "help":
 	default:
 		usage()
 		return fmt.Errorf("unknown subcommand %q", cmd)
@@ -107,7 +112,7 @@ func run(args []string) error {
 	if cfg.Root == "" {
 		return fmt.Errorf("no scan root: pass --root <dir>, set QUARRY_ROOT, or add\n  root = \"/path/to/your/assets\"\nto %s", filepath.Join(configDir, "config.toml"))
 	}
-	return serve(cfg.Root, *addr, *cacheFlag, *reindex, resolveTagsPath(*tagsFlag, configDir))
+	return served(cfg.Root, *addr, *cacheFlag, *reindex, resolveTagsPath(*tagsFlag, configDir))
 }
 
 // isFlag reports whether an argument is a flag rather than a subcommand, so that a
@@ -172,6 +177,7 @@ usage:
   quarry [flags]          index the asset root and serve the UI
   quarry update [ver]     update to the latest release (or a specific version)
   quarry version          print the version
+  quarry help             print this message
 
 flags:
   -root <dir>         asset scan root (overrides config.toml / QUARRY_ROOT)

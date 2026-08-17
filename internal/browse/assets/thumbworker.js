@@ -176,16 +176,41 @@ async function buildPosed(clip, vendor, rootRest) {
 // the next job overwrites the canvas.
 let queue = Promise.resolve();
 
+// cancelled holds jobs the page gave up on (their cards were cleared) between the
+// message arriving and the queue reaching them. Without it a filter change leaves the
+// queue working through a backlog for cards nobody is looking at before it renders
+// what is on screen.
+const cancelled = new Set();
+
+// JOB_TIMEOUT_MS bounds one render. A stalled fetch or a pathological parse would
+// otherwise hold the single queue forever, and every card behind it keeps its spinner
+// for the rest of the session. Giving up draws the category icon instead.
+const JOB_TIMEOUT_MS = 30_000;
+
+function withTimeout(promise) {
+  let timer;
+  const deadline = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error('thumbnail timed out')), JOB_TIMEOUT_MS);
+  });
+  return Promise.race([promise, deadline]).finally(() => clearTimeout(timer));
+}
+
 self.onmessage = (e) => {
   if (e.data.type === 'seed') {
     if (e.data.list && e.data.list.length) CharRegistry.save(e.data.list);
     return;
   }
+  if (e.data.type === 'cancel') {
+    cancelled.add(e.data.id);
+    return;
+  }
   const { id, asset } = e.data;
+  cancelled.delete(id); // a re-request supersedes an earlier cancel for the same asset
   queue = queue.then(async () => {
+    if (cancelled.delete(id)) return; // dropped while it waited its turn
     try {
       await ensureRenderer();
-      if (!(await build(asset))) { self.postMessage({ id, blob: null }); return; }
+      if (!(await withTimeout(build(asset)))) { self.postMessage({ id, blob: null }); return; }
       const blob = await canvas.convertToBlob({ type: 'image/png' });
       self.postMessage({ id, blob });
     } catch {

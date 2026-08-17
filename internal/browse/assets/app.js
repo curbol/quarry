@@ -78,6 +78,10 @@ function reset() {
   state.gen++;
   state.offset = 0; state.total = 0; state.done = false; state.loading = false;
   state.items = [];
+  // Let go of the outgoing cards before dropping them: what is observing them, and
+  // what is still being rendered for them, outlives the DOM otherwise.
+  lazyWork.reset();
+  modelThumbs.release();
   els.grid.replaceChildren();
   fetchPage();
 }
@@ -85,7 +89,33 @@ function reset() {
 // Each type/vendor/variant filter is a checkbox dropdown: none checked = no filter
 // (all), any checked = the union of those values. The empty-string value is a real
 // facet bucket ("(loose / unknown)" for variants), so it's just another checkbox.
-const multiSelects = [];
+// dropdowns holds every one of them, tag filter included, so opening any one closes
+// the rest.
+const dropdowns = [];
+
+// wireDropdown builds the button label and caret and hooks up open/close, registering
+// the owner so the whole set stays mutually exclusive. The owner supplies setOpen,
+// because the tag filter renders its contents lazily on open. It sets this.btn,
+// this.pop and this.label on the owner.
+function wireDropdown(owner, root) {
+  owner.root = root;
+  owner.btn = root.querySelector('.ms-btn');
+  owner.pop = root.querySelector('.ms-pop');
+  owner.label = document.createElement('span');
+  owner.label.className = 'ms-btn-label';
+  const caret = document.createElement('span');
+  caret.className = 'ms-caret';
+  caret.textContent = '▾';
+  owner.btn.append(owner.label, caret);
+  owner.btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const open = owner.pop.hidden;
+    for (const d of dropdowns) d.setOpen(false);
+    owner.setOpen(open);
+  });
+  owner.pop.addEventListener('click', (e) => e.stopPropagation());
+  dropdowns.push(owner);
+}
 
 class MultiSelect {
   constructor(root, allLabel, isVariant, onChange) {
@@ -93,23 +123,7 @@ class MultiSelect {
     this.isVariant = isVariant;
     this.onChange = onChange;
     this.selected = new Set();
-    this.root = root;
-    this.btn = root.querySelector('.ms-btn');
-    this.pop = root.querySelector('.ms-pop');
-    this.label = document.createElement('span');
-    this.label.className = 'ms-btn-label';
-    const caret = document.createElement('span');
-    caret.className = 'ms-caret';
-    caret.textContent = '▾';
-    this.btn.append(this.label, caret);
-    this.btn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      const open = this.pop.hidden;
-      for (const ms of multiSelects) ms.setOpen(false);
-      this.setOpen(open);
-    });
-    this.pop.addEventListener('click', (e) => e.stopPropagation());
-    multiSelects.push(this);
+    wireDropdown(this, root);
     this.renderButton();
   }
 
@@ -164,7 +178,7 @@ const FILTERS = [
 ];
 const filters = {};
 for (const f of FILTERS) filters[f.id] = new MultiSelect(document.getElementById(f.id), f.all, f.isVariant, reset);
-document.addEventListener('click', () => { for (const ms of multiSelects) ms.setOpen(false); });
+document.addEventListener('click', () => { for (const d of dropdowns) d.setOpen(false); });
 
 function populateFacets(facets) {
   for (const f of FILTERS) filters[f.id].setOptions(facets[f.key]);
@@ -185,12 +199,18 @@ function hex6(c) { return /^#[0-9a-fA-F]{6}$/.test(c) ? c : '#9aa0aa'; }
 function applyPalette(p) {
   if (!p) return;
   tagState.enabled = !!p.enabled;
-  tagState.colors = new Map((p.tags || []).map((t) => [t.id, t.color]));
+  const colors = new Map((p.tags || []).map((t) => [t.id, t.color]));
+  // Assigning a tag returns the palette too, so a just-created tag's color is known
+  // without a second request — but it leaves every color alone. Repainting anyway
+  // walks the whole grid three times on the app's most frequent write.
+  const repaint = colors.size !== tagState.colors.size
+    || [...colors].some(([id, c]) => tagState.colors.get(id) !== c);
+  tagState.colors = colors;
   tagState.counts = new Map((p.tags || []).map((t) => [t.id, t.count]));
   document.body.classList.toggle('tags-on', tagState.enabled);
   tagFilter.root.hidden = !tagState.enabled;
   tagFilter.setOptions();
-  restyleTags();
+  if (repaint) restyleTags();
 }
 
 async function loadPalette() {
@@ -212,12 +232,33 @@ async function apiAssign(fingerprints, tag, on) {
   return data.tags || [];
 }
 
+// apiTag edits the palette (create, rename, recolor, delete) and returns whether it
+// took. An error body is JSON too, so feeding the response straight to applyPalette
+// read a missing `enabled` as false and a missing `tags` as none: a save that failed
+// would have presented as tagging switching itself off, in every open tab.
 async function apiTag(method, body) {
-  const res = await fetch('/api/tags', {
-    method, headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  applyPalette(await res.json());
+  let res;
+  try {
+    res = await fetch('/api/tags', {
+      method, headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  } catch {
+    return false;
+  }
+  const data = await res.json().catch(() => null);
+  if (!res.ok) {
+    reportTagError(data);
+    return false;
+  }
+  applyPalette(data);
+  return true;
+}
+
+// reportTagError surfaces a rejected palette edit. The store is the one thing quarry
+// writes, so a write that did not land has to say so rather than look like a no-op.
+function reportTagError(data) {
+  alert('Tag change failed.\n\n' + ((data && data.error) || 'The server rejected the change.'));
 }
 
 // restyleTags repaints every rendered sliver, chip, and filter dot after a recolor.
@@ -346,21 +387,7 @@ const tagFilter = {
   related: false,
   manage: false,
   init() {
-    this.btn = this.root.querySelector('.ms-btn');
-    this.pop = this.root.querySelector('.ms-pop');
-    this.label = document.createElement('span');
-    this.label.className = 'ms-btn-label';
-    const caret = document.createElement('span');
-    caret.className = 'ms-caret';
-    caret.textContent = '▾';
-    this.btn.append(this.label, caret);
-    this.btn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      const open = this.pop.hidden;
-      for (const ms of multiSelects) ms.setOpen(false);
-      this.setOpen(open);
-    });
-    this.pop.addEventListener('click', (e) => e.stopPropagation());
+    wireDropdown(this, this.root);
     this.renderButton();
   },
   setOpen(open) {
@@ -459,14 +486,18 @@ const tagFilter = {
     color.type = 'color';
     color.className = 'tag-color';
     color.value = hex6(tagColor(id));
-    color.addEventListener('change', () => apiTag('PATCH', { id, color: color.value }));
+    color.addEventListener('change', async () => {
+      if (!await apiTag('PATCH', { id, color: color.value })) color.value = hex6(tagColor(id));
+    });
     const name = document.createElement('input');
     name.type = 'text';
     name.className = 'tag-name';
     name.value = id;
     const commit = async () => {
       const v = name.value.trim();
-      if (v && v !== id) { await apiTag('PATCH', { id, newId: v }); reset(); }
+      if (!v || v === id) return;
+      if (await apiTag('PATCH', { id, newId: v })) reset();
+      else name.value = id;
     };
     name.addEventListener('keydown', (e) => { if (e.key === 'Enter') { name.blur(); } });
     name.addEventListener('blur', commit);
@@ -476,7 +507,8 @@ const tagFilter = {
     del.textContent = '🗑';
     del.title = 'delete tag';
     del.addEventListener('click', async () => {
-      if (confirm('Delete tag "' + id + '"? It will be removed from all assets.')) { await apiTag('DELETE', { id }); reset(); }
+      if (!confirm('Delete tag "' + id + '"? It will be removed from all assets.')) return;
+      if (await apiTag('DELETE', { id })) reset();
     });
     row.append(color, name, del);
     return row;
@@ -484,7 +516,7 @@ const tagFilter = {
 };
 tagFilter.init();
 
-document.addEventListener('click', () => { closeTagMenu(); tagFilter.setOpen(false); });
+document.addEventListener('click', closeTagMenu);
 
 // ---- cards ----
 
@@ -602,8 +634,12 @@ function thumbContent(a) {
     const el = document.createElement('div');
     el.className = 'font-thumb';
     el.textContent = 'Ag';
-    ensureFont(a).then((fam) => { el.style.fontFamily = `"${fam}", serif`; })
-      .catch(() => el.replaceWith(iconEl(a.category)));
+    // Deferred like the model thumbnails: a FontFace load fetches the whole file, and
+    // a page of a font pack would otherwise pull every one of them at card creation.
+    lazyWork.when(el, () => {
+      ensureFont(a).then((fam) => { el.style.fontFamily = `"${fam}", serif`; })
+        .catch(() => el.replaceWith(iconEl(a.category)));
+    });
     return el;
   }
   return iconEl(a.category);
@@ -688,11 +724,43 @@ function iconEl(category) {
 
 // ---- lazy 3D thumbnails: one shared renderer, sequential queue, cached ----
 
+// THUMB_CACHE_MAX is how many rendered thumbnails stay resident. Each is a PNG blob
+// the browser keeps alive until its object URL is revoked, so this is a memory bound,
+// not a hit-rate tuning knob: a few screenfuls in either scroll direction.
+const THUMB_CACHE_MAX = 400;
+
+// lazyWork defers per-card work (a thumbnail render, a font download) until the card
+// is near the viewport, and forgets every card the grid drops. An IntersectionObserver
+// holds its targets and a card that never scrolled into view is never unobserved, so
+// each reset — a keystroke, a filter toggle — would otherwise strand another batch of
+// detached cards and the assets they reference for the life of the page.
+const lazyWork = {
+  observer: null,
+  reset() {
+    if (this.observer) this.observer.disconnect();
+    this.observer = new IntersectionObserver((entries) => {
+      for (const e of entries) {
+        if (!e.isIntersecting) continue;
+        this.observer.unobserve(e.target);
+        const run = e.target._onVisible;
+        e.target._onVisible = null;
+        if (run) run();
+      }
+    }, { rootMargin: '200px' });
+  },
+  when(el, run) { el._onVisible = run; this.observer.observe(el); },
+};
+lazyWork.reset();
+
 // ModelThumbnails is a thin client over the thumbnail worker: it observes cards, posts
 // each asset's descriptor, and swaps in the PNG blob the worker renders off the main
 // thread. No parsing or WebGL happens here, so a large model never blocks the UI.
 class ModelThumbnails {
   constructor() {
+    // Rendered thumbnails are blobs the browser holds until their URL is revoked, so
+    // the cache is bounded: a session that scrolls a 150k-asset library would
+    // otherwise accumulate every PNG it ever drew. Insertion order is eviction order,
+    // refreshed on each hit.
     this.cache = new Map();   // asset.id -> object URL (a rendered blob)
     this.pending = new Map(); // asset.id -> holder awaiting its render
     this.worker = new Worker('/static/thumbworker.js', { type: 'module' });
@@ -701,17 +769,19 @@ class ModelThumbnails {
     // opened or pinned, so mesh-less clips whose rig can't be auto-discovered still pose
     // on the character the user chose in the lightbox.
     this.worker.postMessage({ type: 'seed', list: CharRegistry.list() });
-    this.observer = new IntersectionObserver((entries) => {
-      for (const e of entries) {
-        if (e.isIntersecting) { this.observer.unobserve(e.target); this.request(e.target); }
-      }
-    }, { rootMargin: '200px' });
   }
-  observe(holder, asset) { holder._asset = asset; this.observer.observe(holder); }
+  observe(holder, asset) { holder._asset = asset; lazyWork.when(holder, () => this.request(holder)); }
+  // release cancels the renders still queued for cards the grid is about to drop, so
+  // the worker does not work through a backlog for thumbnails nobody is looking at any
+  // more before it reaches the ones on screen.
+  release() {
+    for (const id of this.pending.keys()) this.worker.postMessage({ type: 'cancel', id });
+    this.pending.clear();
+  }
   request(holder) {
     const asset = holder._asset;
     const cached = this.cache.get(asset.id);
-    if (cached) { this.swap(holder, cached); return; }
+    if (cached) { this.touch(asset.id); this.swap(holder, cached); return; }
     holder.classList.add('loading');
     this.pending.set(asset.id, holder);
     // Only the fields the worker's build needs — DTOs aren't structured-clone-friendly wholesale.
@@ -727,12 +797,25 @@ class ModelThumbnails {
       },
     });
   }
+  touch(id) {
+    const url = this.cache.get(id);
+    this.cache.delete(id);
+    this.cache.set(id, url);
+  }
+  remember(id, url) {
+    this.cache.set(id, url);
+    while (this.cache.size > THUMB_CACHE_MAX) {
+      const oldest = this.cache.keys().next().value;
+      URL.revokeObjectURL(this.cache.get(oldest));
+      this.cache.delete(oldest);
+    }
+  }
   onResult({ id, blob }) {
     const holder = this.pending.get(id);
     this.pending.delete(id);
     if (blob) {
       const url = URL.createObjectURL(blob);
-      this.cache.set(id, url);
+      this.remember(id, url);
       if (holder && holder.isConnected) this.swap(holder, url);
     } else if (holder && holder.isConnected) {
       holder.classList.remove('loading'); // no render (failed / mesh-less with no rig)
@@ -767,6 +850,11 @@ const lb = {
 };
 let activeViewer = null;
 
+// lbGen counts lightbox openings. Anything async started for one asset checks it
+// before touching the panel, so a slow response cannot land on whatever the user
+// navigated to in the meantime.
+let lbGen = 0;
+
 // updateLbNav enables/disables the prev/next arrows for the current position in the
 // loaded result set. Next stays enabled at the tail while more pages can still load.
 function updateLbNav() {
@@ -790,6 +878,7 @@ async function navLightbox(delta) {
 
 function openLightbox(a) {
   if (activeViewer) { activeViewer.stop(); activeViewer = null; } // tear down when navigating
+  const gen = ++lbGen;
   lb.index = state.items.indexOf(a);
   updateLbNav();
   lb.name.textContent = a.name;
@@ -805,14 +894,17 @@ function openLightbox(a) {
   // as a fallback (a copy dropped from the index, or a format the scanner skipped).
   if (!hasDims && bitmap) {
     const probe = new Image();
-    const dd = () => lb.fields.querySelector('dd[data-field="Dimensions"]');
+    // The field is found by querying the DOM, which by then may belong to a different
+    // asset: a probe that outlives its own lightbox has to stay quiet, not write one
+    // asset's pixel size into another's panel.
+    const dd = () => (gen === lbGen ? lb.fields.querySelector('dd[data-field="Dimensions"]') : null);
     probe.onload = () => { const el = dd(); if (el) el.textContent = `${probe.naturalWidth} × ${probe.naturalHeight}`; };
     probe.onerror = () => { const el = dd(); if (el) el.textContent = '—'; };
     probe.src = contentURL(a.id);
   }
   lb.character.replaceChildren(); // the viewer fills this for clip-only animations
   renderLbTags(a);
-  renderLbRelated(a);
+  renderLbRelated(a, gen);
   renderCopies(a);
 
   lb.view.replaceChildren();
@@ -885,7 +977,9 @@ function lbTagChip(a, id) {
   color.value = hex6(tagColor(id));
   color.title = 'change color';
   color.addEventListener('click', (e) => e.stopPropagation());
-  color.addEventListener('change', () => apiTag('PATCH', { id, color: color.value }));
+  color.addEventListener('change', async () => {
+    if (!await apiTag('PATCH', { id, color: color.value })) color.value = hex6(tagColor(id));
+  });
 
   const label = document.createElement('span');
   label.className = 'tag-chip-label';
@@ -959,9 +1053,10 @@ function renderCopies(a) {
 // renderLbRelated shows the card's linked companions ("parts of this set") as small
 // clickable thumbnails that open that asset. It fetches the related cards on demand
 // (they can live anywhere in the library) and stays hidden when there are none or
-// tagging is off. It clears synchronously first, so a fetch in flight never flashes a
-// previous card's companions.
-async function renderLbRelated(a) {
+// tagging is off. Clearing on entry only protects the call doing the clearing, so the
+// generation is checked after the fetch too: navigating mid-flight would otherwise
+// append one asset's companions under the next asset's heading.
+async function renderLbRelated(a, gen) {
   const box = lb.related;
   box.replaceChildren();
   box.hidden = true;
@@ -971,7 +1066,7 @@ async function renderLbRelated(a) {
     const qs = a.fingerprints.map((fp) => 'fingerprint=' + encodeURIComponent(fp)).join('&');
     items = ((await (await fetch('/api/related?' + qs)).json()).items) || [];
   } catch { return; }
-  if (!items.length || lb.root.hidden) return;
+  if (!items.length || lb.root.hidden || gen !== lbGen) return;
 
   const head = document.createElement('div');
   head.className = 'lb-related-head';

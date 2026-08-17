@@ -1,0 +1,10 @@
+# quarry config. Copy to your config dir as config.toml:
+#   $XDG_CONFIG_HOME/quarry/config.toml, else ~/.config/quarry/config.toml
+# (or point --config / QUARRY_CONFIG_DIR somewhere else).
+#
+# Everything here has a flag equivalent; the file just saves you from retyping.
+
+# The directory quarry scans. This is the one setting with no default: point it at
+# the tree holding your asset packs, whatever their vendor. A leading ~ is expanded.
+# Overridden by QUARRY_ROOT and by --root.
+root = "~/code/raw-assets"

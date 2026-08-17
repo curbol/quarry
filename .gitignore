@@ -1,0 +1,9 @@
+# Machine-specific config (scan root) — never committed.
+config.toml
+
+# A tag store belongs with the project whose assets it tags, not with this tool repo;
+# ignored here defensively so running quarry from this directory never commits one.
+quarry.tags.toml
+
+# Built binary.
+/quarry

@@ -7,7 +7,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 `quarry` is a Go CLI that indexes a local game-asset library into a searchable
 catalog of individual assets and serves a web UI to search, preview, and tag them.
 It is read-only over the library: the tag store is its one write surface. See
-`README.md` for the user-facing description.
+`README.md` (user-facing) and `docs/design.md` (the authoritative design doc: fingerprint
+scheme, tag store schema, index cache). Read `docs/design.md` before changing the
+fingerprint scheme, the tag store format, or the cache layout.
 
 ## Build & test
 

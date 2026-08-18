@@ -316,3 +316,69 @@ func TestResolveTokenPrefersEnvOverGhCLI(t *testing.T) {
 		t.Errorf("token = %q, want GITHUB_TOKEN to win outright", got)
 	}
 }
+
+// A dev build has no release to compare against, so `update` has nothing to do but
+// say so. Reaching the download path from one would replace a locally-built binary
+// with whatever the newest release happens to be.
+func TestRunRejectsADevBuild(t *testing.T) {
+	for _, current := range []string{"", "dev", "  dev  "} {
+		err := Run(current, "")
+		if err == nil {
+			t.Fatalf("Run(%q) succeeded; want a dev-build error", current)
+		}
+		if !strings.Contains(err.Error(), "dev build") {
+			t.Errorf("Run(%q) error = %q, want it to name the dev build", current, err)
+		}
+	}
+}
+
+// Being current is the common case: `quarry update` on an up-to-date install has to
+// stop after the version check. Everything past it locates and overwrites the running
+// executable — which, under `go test`, is the test binary.
+func TestRunStopsWhenAlreadyCurrent(t *testing.T) {
+	for _, tc := range []struct{ name, tag, target string }{
+		{"latest", "v1.2.3", ""},
+		{"a requested version", "v1.2.3", "1.2.3"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var assetHits int
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.Contains(r.URL.Path, "/assets/") {
+					assetHits++
+				}
+				fmt.Fprintf(w, `{"tag_name":%q,"assets":[{"name":"quarry-1.2.3-linux-intel.zip","url":%q}]}`,
+					tc.tag, "http://"+r.Host+"/assets/1")
+			}))
+			defer srv.Close()
+
+			old := releasesAPIURL
+			releasesAPIURL = srv.URL
+			defer func() { releasesAPIURL = old }()
+
+			// The running binary is this test's own, so a Run that does not stop here
+			// would try to replace it.
+			if err := Run("1.2.3", tc.target); err != nil {
+				t.Fatalf("Run on an already-current install returned %v, want nil", err)
+			}
+			if assetHits != 0 {
+				t.Errorf("Run downloaded an asset %d time(s) despite being current", assetHits)
+			}
+		})
+	}
+}
+
+// The tag is compared with its "v" stripped from either side, so a release tagged
+// v1.2.3 and a binary built as 1.2.3 (or v1.2.3) are the same version.
+func TestRunTreatsAVPrefixAsTheSameVersion(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"tag_name":"v0.4.0","assets":[]}`)
+	}))
+	defer srv.Close()
+	old := releasesAPIURL
+	releasesAPIURL = srv.URL
+	defer func() { releasesAPIURL = old }()
+
+	if err := Run("v0.4.0", ""); err != nil {
+		t.Errorf("Run(v0.4.0) = %v, want nil (no assets are listed, so anything past the version check fails)", err)
+	}
+}

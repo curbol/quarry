@@ -19,6 +19,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/curbol/quarry/internal/safewrite"
 )
 
 const binaryName = "quarry"
@@ -288,15 +290,7 @@ func download(token, url, dst string) error {
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("download failed: HTTP %d", resp.StatusCode)
 	}
-	f, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	if _, err := io.Copy(f, resp.Body); err != nil {
-		f.Close()
-		return err
-	}
-	return f.Close()
+	return safewrite.Stream(dst, resp.Body, 0o644)
 }
 
 func extractBinary(zipPath, dir string) (string, error) {
@@ -319,17 +313,7 @@ func extractBinary(zipPath, dir string) (string, error) {
 		}
 		defer rc.Close()
 		out := filepath.Join(dir, want)
-		w, err := os.Create(out)
-		if err != nil {
-			return "", err
-		}
-		if _, err := io.Copy(w, rc); err != nil {
-			w.Close()
-			return "", err
-		}
-		// Check the close: a flush failure here would otherwise yield a silently
-		// truncated binary that the caller renames over the running executable.
-		if err := w.Close(); err != nil {
+		if err := safewrite.Stream(out, rc, 0o755); err != nil {
 			return "", err
 		}
 		return out, nil
@@ -347,15 +331,5 @@ func copyFile(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, info.Mode())
-	if err != nil {
-		return err
-	}
-	if _, err := io.Copy(out, in); err != nil {
-		out.Close()
-		return err
-	}
-	// Checked, not deferred: a flush failure here would otherwise yield a silently
-	// truncated copy that the caller renames over the running executable.
-	return out.Close()
+	return safewrite.Stream(dst, in, info.Mode())
 }

@@ -9,6 +9,8 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+
+	"github.com/curbol/quarry/internal/safewrite"
 )
 
 // unityEntry accumulates the members of one GUID directory as the tar streams by.
@@ -164,17 +166,7 @@ func extractUnityPackage(archivePath, destDir string) error {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return err
 		}
-		out, err := os.Create(filepath.Join(dir, member))
-		if err != nil {
-			return err
-		}
-		if _, err := io.Copy(out, tr); err != nil {
-			out.Close()
-			return err
-		}
-		// Checked, not deferred: a flush failure would leave a silently truncated
-		// payload that later reads treat as the asset's real bytes.
-		return out.Close()
+		return safewrite.Stream(filepath.Join(dir, member), tr, 0o644)
 	})
 }
 

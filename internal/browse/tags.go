@@ -360,6 +360,9 @@ func (s *server) writeUnderLock(w http.ResponseWriter, mutate func() (any, error
 	s.tagsMu.Lock()
 	defer s.tagsMu.Unlock()
 	resp, err := mutate()
+	// Bumped whether or not the edit stuck: a rejected one still reloads the store, and
+	// a memoized result set carries the tags it was built with either way.
+	s.tagsGeneration++
 	if err != nil {
 		s.reloadLocked()
 		writeErr(w, http.StatusBadRequest, err.Error())

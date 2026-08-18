@@ -6,10 +6,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
 	"sync"
+
+	"github.com/curbol/quarry/internal/safewrite"
 )
 
 // indexVersion is bumped whenever the scan logic changes (what's indexed, how it's
@@ -17,7 +20,7 @@ import (
 // also keys the unpacked-archive tree, so a change to what extraction writes belongs
 // here too: an archive whose bytes never changed keeps its fingerprint, and only the
 // version tells the old extraction apart from what the current code would produce.
-const indexVersion = 15
+const indexVersion = 16
 
 // SkippedFile records a library file the scan could not read. A damaged archive
 // costs its own contents, not the rest of the library, so the failure is carried
@@ -78,7 +81,16 @@ func Build(root, cacheDir string) (*Index, error) {
 // and the cached fingerprint of every loose file whose stat fingerprint is
 // unchanged, re-deriving only changed or new files. This avoids re-decompressing
 // every unitypackage and re-reading every loose file's bytes on each run.
+//
+// Reuse is only sound for entries derived by this version's scan logic, so an index
+// carrying another version's is emptied first and re-derived whole. Enforcing that
+// here rather than at the call site is what keeps a caller that reaches for Load and
+// Refresh directly from silently merging two schemes' assets into one index.
 func (ix *Index) Refresh() error {
+	if ix.Version != indexVersion {
+		ix.Assets, ix.ArchivePrint, ix.LoosePrint = nil, map[string]string{}, map[string]string{}
+		ix.Version = indexVersion
+	}
 	entries, skipped, err := walkLibrary(ix.Root)
 	if err != nil {
 		return err
@@ -166,32 +178,13 @@ func (ix *Index) Save(cachePath string) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(dir, ".browse-index-*")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	fail := func(err error) error {
-		tmp.Close()
-		os.Remove(tmpName)
-		return err
-	}
-	buf := bufio.NewWriter(tmp)
-	if err := json.NewEncoder(buf).Encode(ix); err != nil {
-		return fail(err)
-	}
-	if err := buf.Flush(); err != nil {
-		return fail(err)
-	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(tmpName)
-		return err
-	}
-	if err := os.Rename(tmpName, cachePath); err != nil {
-		os.Remove(tmpName)
-		return err
-	}
-	return nil
+	return safewrite.Atomic(cachePath, ".browse-index-*", func(w io.Writer) error {
+		buf := bufio.NewWriter(w)
+		if err := json.NewEncoder(buf).Encode(ix); err != nil {
+			return err
+		}
+		return buf.Flush()
+	})
 }
 
 // LoadOrBuild returns a usable index: a fresh build when reindex is set or no valid
@@ -248,22 +241,4 @@ func (ix *Index) Lookup(id string) (Asset, bool) {
 		return Asset{}, false
 	}
 	return *a, true
-}
-
-// Vendors, Variants, Categories return the distinct facet values with counts, for
-// the filter UI.
-func (ix *Index) facet(get func(Asset) string) map[string]int {
-	m := map[string]int{}
-	for _, a := range ix.Assets {
-		m[get(a)]++
-	}
-	return m
-}
-
-func (ix *Index) Vendors() map[string]int { return ix.facet(func(a Asset) string { return a.Vendor }) }
-func (ix *Index) Variants() map[string]int {
-	return ix.facet(func(a Asset) string { return a.Variant })
-}
-func (ix *Index) Categories() map[string]int {
-	return ix.facet(func(a Asset) string { return string(a.Category) })
 }

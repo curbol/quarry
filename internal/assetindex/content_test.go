@@ -197,4 +197,65 @@ func TestSaveLoadRefresh(t *testing.T) {
 	if len(ix3.Assets) != n0+1 {
 		t.Errorf("after add, count = %d, want %d", len(ix3.Assets), n0+1)
 	}
+	var added Asset
+	for _, a := range ix3.Assets {
+		if a.Name == "new.glb" {
+			added = a
+		}
+	}
+	if added.ID == "" {
+		t.Fatal("the added file is not in the index")
+	}
+
+	// Remove a pack, refresh drops it. A refresh reuses whatever the cache holds for
+	// every unchanged file, so an entry the walk no longer reaches has to fall out
+	// rather than ride along and keep answering content requests.
+	if err := os.RemoveAll(filepath.Join(root, "explosive")); err != nil {
+		t.Fatal(err)
+	}
+	ix4, err := LoadOrBuild(root, cacheDir, cachePath, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ix4.Assets) != n0 {
+		t.Errorf("after removing the pack, count = %d, want %d", len(ix4.Assets), n0)
+	}
+	if _, ok := ix4.Lookup(added.ID); ok {
+		t.Errorf("%s still resolves after its pack was deleted", added.RelPath)
+	}
+}
+
+// The version keys both the cached index and the unpacked tree, so entries derived by
+// other scan logic must never be merged into a current index. LoadOrBuild guards this
+// at the top, but Load and Refresh are exported separately and the guarantee has to
+// hold for that route too.
+func TestRefreshRebuildsAcrossAnIndexVersion(t *testing.T) {
+	root, mk := libRoot(t)
+	cacheDir := t.TempDir()
+	cachePath := filepath.Join(cacheDir, "index.json")
+	writeZip(t, mk("synty", "P", "P_SourceFiles_v1.zip"), map[string]string{"A/x.fbx": "X"})
+
+	ix, err := LoadOrBuild(root, cacheDir, cachePath, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := len(ix.Assets)
+
+	// An index left behind by another version, carrying an asset the current scan
+	// would never produce and a stale print that would let it be reused verbatim.
+	ix.Version = indexVersion - 1
+	ix.Assets = append(ix.Assets, Asset{ID: "ghost", RelPath: "gone/ghost.fbx",
+		Source: Source{Kind: SourceLoose, FilePath: filepath.Join(root, "gone", "ghost.fbx")}})
+	if err := ix.Refresh(); err != nil {
+		t.Fatal(err)
+	}
+	if ix.Version != indexVersion {
+		t.Errorf("version = %d after refresh, want %d", ix.Version, indexVersion)
+	}
+	if len(ix.Assets) != want {
+		t.Errorf("assets = %d, want %d rebuilt from the tree alone", len(ix.Assets), want)
+	}
+	if _, ok := ix.Lookup("ghost"); ok {
+		t.Error("an asset from the previous version survived the refresh")
+	}
 }

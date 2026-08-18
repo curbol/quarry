@@ -12,10 +12,12 @@ import (
 	"io/fs"
 	"net"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/curbol/quarry/internal/assetindex"
 	"github.com/curbol/quarry/internal/tagstore"
@@ -33,11 +35,16 @@ type server struct {
 	static http.Handler
 
 	// Tagging is enabled only when a tag-store path was resolved (a project
-	// manifest neighborhood exists). tagsMu guards every access to store.
-	tagsEnabled bool
-	tagsPath    string
-	tagsMu      sync.RWMutex
-	store       *tagstore.Store
+	// manifest neighborhood exists). tagsMu guards every access to store and to
+	// tagsGeneration, which counts store edits so a memoized result set built against
+	// an older palette is not served after one.
+	tagsEnabled    bool
+	tagsPath       string
+	tagsMu         sync.RWMutex
+	store          *tagstore.Store
+	tagsGeneration uint64
+
+	results resultCache
 
 	// byFP indexes assets by content fingerprint so link expansion can resolve a
 	// related fingerprint back to its asset(s) without scanning the whole library.
@@ -159,7 +166,7 @@ func newServer(ix *assetindex.Index, store *tagstore.Store, tagsPath string) (*s
 	}
 	rmSibling, rmSuppressed := buildRootMotionPairs(ix.Assets)
 	return &server{
-		ix: ix, facets: buildFacets(ix), static: http.FileServerFS(static),
+		ix: ix, facets: buildFacets(ix.Assets, rmSuppressed), static: http.FileServerFS(static),
 		tagsEnabled: tagsPath != "", tagsPath: tagsPath, store: store, byFP: byFP,
 		rmSibling: rmSibling, rmSuppressed: rmSuppressed,
 	}, nil
@@ -213,8 +220,10 @@ func Serve(ctx context.Context, addr string, ix *assetindex.Index, tagsPath stri
 	openBrowser(url)
 
 	<-ctx.Done()
-	shutdownCtx, cancel := context.WithCancel(context.Background())
-	cancel()
+	// A grid page can be mid-download of a 65MB model when Ctrl-C lands; give those
+	// responses a moment to finish rather than cutting the connection.
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 	_ = srv.Shutdown(shutdownCtx)
 	return nil
 }
@@ -246,16 +255,94 @@ func noCache(h http.Handler) http.Handler {
 
 func (s *server) handleAssets(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
-	matcher := parseQuery(query.Get("q"))
-	types := valueSet(query["type"])
-	vendors := valueSet(query["vendor"])
-	variants := valueSet(query["variant"])
-	guids := valueSet(query["guid"])
 	offset := atoiDefault(query.Get("offset"), 0)
 	limit := atoiDefault(query.Get("limit"), defaultLimit)
 	if limit <= 0 || limit > maxLimit {
 		limit = defaultLimit
 	}
+
+	items := s.resultsFor(query)
+
+	total := len(items)
+	lo := min(max(offset, 0), total)
+	hi := min(lo+limit, total)
+
+	writeJSON(w, map[string]any{
+		"total":  total,
+		"offset": lo,
+		"items":  items[lo:hi],
+		"facets": s.facets,
+	})
+}
+
+// resultCache memoizes the answer to one query. The grid pages through a query at a
+// walking offset, but everything that produces the answer — matching, grouping, tag
+// resolution, sorting — scans the whole library and does not vary with the offset,
+// so recomputing per page makes one full scroll quadratic in library size. A single
+// entry covers that: a different query supersedes it, and holding several would
+// retain several library-sized result sets at once.
+type resultCache struct {
+	mu    sync.Mutex
+	key   string
+	gen   uint64
+	items []assetDTO
+	valid bool
+}
+
+func (c *resultCache) lookup(key string, gen uint64) ([]assetDTO, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.valid || c.key != key || c.gen != gen {
+		return nil, false
+	}
+	return c.items, true
+}
+
+func (c *resultCache) store(key string, gen uint64, items []assetDTO) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.key, c.gen, c.items, c.valid = key, gen, items, true
+}
+
+// resultsFor answers a query, reusing the previous answer while the grid pages
+// through it. The returned slice is shared with the cache and with any concurrent
+// request, so callers must only read it.
+func (s *server) resultsFor(query url.Values) []assetDTO {
+	key, gen := resultKey(query), s.tagsGen()
+	if items, ok := s.results.lookup(key, gen); ok {
+		return items
+	}
+	items := s.computeResults(query)
+	s.results.store(key, gen, items)
+	return items
+}
+
+// resultKey identifies a query by everything that shapes its result set. offset and
+// limit choose a window into that set rather than changing it, so they are left out
+// — that is what lets successive pages share one computation.
+func resultKey(query url.Values) string {
+	shape := make(url.Values, len(query))
+	for k, v := range query {
+		if k == "offset" || k == "limit" {
+			continue
+		}
+		shape[k] = v
+	}
+	return shape.Encode()
+}
+
+func (s *server) tagsGen() uint64 {
+	s.tagsMu.RLock()
+	defer s.tagsMu.RUnlock()
+	return s.tagsGeneration
+}
+
+func (s *server) computeResults(query url.Values) []assetDTO {
+	matcher := parseQuery(query.Get("q"))
+	types := valueSet(query["type"])
+	vendors := valueSet(query["vendor"])
+	variants := valueSet(query["variant"])
+	guids := valueSet(query["guid"])
 
 	var matched []assetindex.Asset
 	for _, a := range s.ix.Assets {
@@ -310,17 +397,7 @@ func (s *server) handleAssets(w http.ResponseWriter, r *http.Request) {
 		grouped = expandRelated(grouped, preTag)
 	}
 	sortItems(grouped, query.Get("sort"))
-
-	total := len(grouped)
-	lo := min(max(offset, 0), total)
-	hi := min(lo+limit, total)
-
-	writeJSON(w, map[string]any{
-		"total":  total,
-		"offset": lo,
-		"items":  grouped[lo:hi],
-		"facets": s.facets,
-	})
+	return grouped
 }
 
 // sortItems orders results: "path" keeps assets grouped by their location
@@ -461,11 +538,24 @@ func contentType(ext string) string {
 	return "application/octet-stream"
 }
 
-func buildFacets(ix *assetindex.Index) facets {
+// buildFacets counts the distinct facet values for the filter UI over the assets a
+// query can actually return. Counting every asset instead would include the
+// root-motion siblings handleAssets suppresses, leaving a count no combination of
+// filters could ever reach.
+func buildFacets(assets []assetindex.Asset, hidden map[string]bool) facets {
+	categories, vendors, variants := map[string]int{}, map[string]int{}, map[string]int{}
+	for _, a := range assets {
+		if hidden[a.ID] {
+			continue
+		}
+		categories[string(a.Category)]++
+		vendors[a.Vendor]++
+		variants[a.Variant]++
+	}
 	return facets{
-		Categories: sortedFacet(ix.Categories()),
-		Vendors:    sortedFacet(ix.Vendors()),
-		Variants:   sortedFacet(ix.Variants()),
+		Categories: sortedFacet(categories),
+		Vendors:    sortedFacet(vendors),
+		Variants:   sortedFacet(variants),
 	}
 }
 

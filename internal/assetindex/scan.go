@@ -88,6 +88,9 @@ func walkLibrary(absRoot string) ([]libEntry, []SkippedFile, error) {
 			return nil
 		}
 		name := d.Name()
+		if d.Type()&fs.ModeSymlink != 0 {
+			return symlinkEntry(absRoot, p, note)
+		}
 		if d.IsDir() {
 			if p != absRoot && strings.HasPrefix(name, ".") {
 				return filepath.SkipDir
@@ -121,6 +124,30 @@ func walkLibrary(absRoot string) ([]libEntry, []SkippedFile, error) {
 		return nil
 	})
 	return entries, skipped, err
+}
+
+// symlinkEntry decides what a symbolic link in the library becomes. filepath.WalkDir
+// does not follow links, and a link's own DirEntry describes the link (its Info size
+// is the length of the target path, and a link to a directory does not report itself
+// as one), so treating it like an ordinary file yields an asset with a fabricated
+// size whose target is never walked.
+//
+// A link into the library duplicates a file the walk reaches by its real path, so it
+// is dropped. A link out of the library is reported: Open resolves symlinks and
+// refuses anything landing outside the root, so indexing it would only produce cards
+// that cannot be served — and a whole pack behind one such link would otherwise
+// vanish with nothing said.
+func symlinkEntry(absRoot, p string, note func(string, error)) error {
+	target, err := filepath.EvalSymlinks(p)
+	if err != nil {
+		note(p, err)
+		return nil
+	}
+	if underRootPath(absRoot, target) {
+		return nil
+	}
+	note(p, fmt.Errorf("symlink to %s, which is outside the library root; quarry only serves files under the root", target))
+	return nil
 }
 
 // enumerateArchive opens one archive entry and returns its assets.

@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
+	"os"
 	"sync"
 	"testing"
 
@@ -129,4 +131,113 @@ func TestRejectedPatchLeavesNothingBehindInMemory(t *testing.T) {
 	if got := saved.TagsFor("crc32:aa:1"); len(got) != 1 || got[0] != "hero" {
 		t.Errorf("assignment on disk = %v, want [hero]", got)
 	}
+}
+
+// A root-motion sibling is folded into its in-place card and can never come back from
+// /api/assets under any filter. Counting it in the facets left a number the user could
+// not reach: clicking "animation (4)" would show three.
+func TestFacetCountsExcludeSuppressedRootMotionSiblings(t *testing.T) {
+	// The pack name is what promotes these to the animation category, which is what
+	// makes the group eligible for root-motion pairing at all.
+	srv := serverWith(t, func(mk func(...string) string) {
+		os.WriteFile(mk("quaternius", "RPG_Animations", "Walk.glb"), []byte("GLBBYTES"), 0o644)
+		os.WriteFile(mk("quaternius", "RPG_Animations", "Walk_RM.glb"), []byte("GLBBYTESRM"), 0o644)
+	})
+
+	r := getAssets(t, srv, "")
+	if r.Total != 1 {
+		t.Fatalf("grid shows %d cards, want the RM sibling folded into one", r.Total)
+	}
+	var vendorCount int
+	for _, f := range r.Facets.Vendors {
+		if f.Value == "quaternius" {
+			vendorCount = f.Count
+		}
+	}
+	if vendorCount != r.Total {
+		t.Errorf("vendor facet counts %d assets but the query returns %d; the difference is unreachable",
+			vendorCount, r.Total)
+	}
+	// Selecting the facet has to produce exactly what it advertised.
+	if got := getAssets(t, srv, "vendor=quaternius").Total; got != vendorCount {
+		t.Errorf("filtering by the facet returned %d, want the advertised %d", got, vendorCount)
+	}
+}
+
+// Paging is answered from a memoized result set, so every page has to describe the
+// same query the first one did: a consistent total, no repeats, and no gaps.
+func TestPagingIsConsistentAcrossPages(t *testing.T) {
+	srv := testServer(t)
+	whole := getAssets(t, srv, "limit=500")
+	if whole.Total < 4 {
+		t.Fatalf("fixture has %d assets, too few to page", whole.Total)
+	}
+
+	seen := map[string]bool{}
+	var order []string
+	for offset := 0; offset < whole.Total; offset += 2 {
+		page := getAssets(t, srv, fmt.Sprintf("offset=%d&limit=2", offset))
+		if page.Total != whole.Total {
+			t.Fatalf("page at %d reports total %d, want %d", offset, page.Total, whole.Total)
+		}
+		for _, it := range page.Items {
+			if seen[it.ID] {
+				t.Errorf("asset %s appeared on more than one page", it.Name)
+			}
+			seen[it.ID] = true
+			order = append(order, it.ID)
+		}
+	}
+	if len(order) != whole.Total {
+		t.Errorf("paging yielded %d assets, want %d", len(order), whole.Total)
+	}
+	for i, it := range whole.Items {
+		if i < len(order) && order[i] != it.ID {
+			t.Errorf("paged order diverges from the single-page order at %d", i)
+			break
+		}
+	}
+}
+
+// The memoized result set carries the tags each card had when it was built, so a tag
+// write has to retire it — otherwise the grid keeps serving the palette from before
+// the edit until something else changes the query.
+func TestResultsReflectATagWrittenSinceTheLastQuery(t *testing.T) {
+	srv, _ := enabledServer(t)
+	// Warm the memo for the unfiltered query, then tag one of its cards. The re-query
+	// has to come next: only one result set is held, so any query in between would
+	// evict the entry and hide a missing invalidation.
+	fp := firstFingerprint(t, srv)
+	post(t, srv, "/api/assign", `{"fingerprints":["`+fp+`"],"tag":"hero","on":true}`, http.StatusOK)
+
+	var tagged int
+	for _, it := range taggedAssets(t, srv, "").Items {
+		for _, tg := range it.Tags {
+			if tg == "hero" {
+				tagged++
+			}
+		}
+	}
+	if tagged != 1 {
+		t.Errorf("the unfiltered grid shows the tag on %d cards, want 1", tagged)
+	}
+
+	// And removing it has to be visible on the same query for the same reason.
+	post(t, srv, "/api/assign", `{"fingerprints":["`+fp+`"],"tag":"hero","on":false}`, http.StatusOK)
+	for _, it := range taggedAssets(t, srv, "").Items {
+		if len(it.Tags) != 0 {
+			t.Errorf("%s still shows %v after the tag was removed", it.Name, it.Tags)
+		}
+	}
+}
+
+func firstFingerprint(t *testing.T, srv *httptest.Server) string {
+	t.Helper()
+	for _, it := range taggedAssets(t, srv, "").Items {
+		if len(it.Fingerprints) > 0 {
+			return it.Fingerprints[0]
+		}
+	}
+	t.Fatal("no fingerprinted asset in the fixture")
+	return ""
 }

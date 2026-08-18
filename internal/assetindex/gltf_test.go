@@ -72,3 +72,41 @@ func TestGLBAnimationNamesNotGLB(t *testing.T) {
 		t.Error("expected an error for a non-GLB file")
 	}
 }
+
+// A GLB's JSON length is read from the file itself, so a truncated download or a
+// corrupt header can declare far more than is there. Both have to come back as an
+// error: looseAssets treats any error as "not a clip library" and keeps the file
+// whole, whereas a panic or a huge allocation here would take the whole scan with it.
+func TestGLBAnimationNamesRejectsBadChunkLength(t *testing.T) {
+	writeWithChunkLen := func(t *testing.T, name string, chunkLen uint32, truncate bool) string {
+		t.Helper()
+		b := makeGLB(t, map[string]any{"animations": []map[string]any{{"name": "Walk"}, {"name": "Run"}}})
+		binary.LittleEndian.PutUint32(b[12:], chunkLen)
+		if truncate {
+			b = b[:len(b)-4]
+		}
+		p := filepath.Join(t.TempDir(), name)
+		if err := os.WriteFile(p, b, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+
+	tests := []struct {
+		name     string
+		chunkLen uint32
+		truncate bool
+	}{
+		{"truncated file", 4096, true},
+		{"length past the end", 1 << 20, false},
+		{"length over the cap", maxGLBJSON + 1, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			p := writeWithChunkLen(t, "bad.glb", tc.chunkLen, tc.truncate)
+			if _, err := glbAnimationNames(p); err == nil {
+				t.Error("expected an error, got none")
+			}
+		})
+	}
+}

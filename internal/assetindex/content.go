@@ -221,10 +221,13 @@ func (ix *Index) ensureExtracted(archivePath string) (string, error) {
 
 // underRoot reports whether p resolves to a location inside the library root,
 // following symlinks so a symlinked entry cannot escape.
-func (ix *Index) underRoot(p string) bool {
-	root := resolve(ix.Root)
-	rp := resolve(p)
-	rel, err := filepath.Rel(root, rp)
+func (ix *Index) underRoot(p string) bool { return underRootPath(ix.Root, p) }
+
+// underRootPath is the containment test itself, taking the root as a parameter so
+// the scan can apply the same rule to a symlink's target that Open will apply to it
+// later: a link the scan indexes but Open would refuse is a card that cannot load.
+func underRootPath(root, p string) bool {
+	rel, err := filepath.Rel(resolve(root), resolve(p))
 	if err != nil {
 		return false
 	}

@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 
@@ -240,4 +242,243 @@ func firstFingerprint(t *testing.T, srv *httptest.Server) string {
 	}
 	t.Fatal("no fingerprinted asset in the fixture")
 	return ""
+}
+
+// writeEndpoints is every route that mutates the tag store, with a body each accepts.
+// The protections below are per-handler, so testing one of them proves nothing about
+// the other four: a new handler that forgot decodeJSON or requireEnabled would ship
+// green against a single-endpoint test.
+var writeEndpoints = []struct {
+	method, path, body string
+}{
+	{http.MethodPost, "/api/tags", `{"id":"hero","color":"#112233"}`},
+	{http.MethodPatch, "/api/tags", `{"id":"hero","newId":"champion"}`},
+	{http.MethodDelete, "/api/tags", `{"id":"hero"}`},
+	{http.MethodPost, "/api/assign", `{"fingerprints":["crc32:1:1"],"tag":"hero","on":true}`},
+	{http.MethodPost, "/api/link", `{"fingerprints":["crc32:1:1","crc32:2:2"],"on":true}`},
+}
+
+func request(t *testing.T, srv *httptest.Server, method, path, contentType, body string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(method, srv.URL+path, strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
+}
+
+// browse has no session by design, so its write surface is reachable from any page the
+// user has open. Requiring a JSON content-type forces a CORS preflight the server never
+// answers, which is what closes the drive-by path — on every endpoint, not just one.
+func TestEveryWriteEndpointRequiresJSONContentType(t *testing.T) {
+	srv, _ := enabledServer(t)
+	for _, e := range writeEndpoints {
+		for _, ct := range []string{"text/plain", "application/x-www-form-urlencoded", "multipart/form-data", ""} {
+			resp := request(t, srv, e.method, e.path, ct, e.body)
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusUnsupportedMediaType {
+				t.Errorf("%s %s with content-type %q = %d, want 415", e.method, e.path, ct, resp.StatusCode)
+			}
+		}
+		// The same request with the right content-type has to work, or the check above
+		// would pass for a route that is simply broken.
+		resp := request(t, srv, e.method, e.path, "application/json", e.body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("%s %s with application/json = %d, want 200", e.method, e.path, resp.StatusCode)
+		}
+	}
+}
+
+// With no tag store there is nothing to write to, and every endpoint has to say so
+// rather than accept the edit into a store that is never persisted.
+func TestEveryWriteEndpointRefusesWhenTaggingIsDisabled(t *testing.T) {
+	srv := serverWith(t, fixtureLibrary(t))
+	for _, e := range writeEndpoints {
+		resp := request(t, srv, e.method, e.path, "application/json", e.body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusConflict {
+			t.Errorf("%s %s while disabled = %d, want 409", e.method, e.path, resp.StatusCode)
+		}
+	}
+}
+
+// The forced-preflight defence only stops a cross-origin page. A domain whose DNS is
+// re-pointed at 127.0.0.1 is same-origin with quarry — no preflight, and it can read
+// every response. The Host header is what still carries the attacker's domain.
+func TestHostGuardRejectsARebindingHost(t *testing.T) {
+	guarded := guardHost(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	srv := httptest.NewServer(guarded)
+	t.Cleanup(srv.Close)
+
+	for _, tc := range []struct {
+		host string
+		want int
+	}{
+		{"", http.StatusOK}, // whatever httptest dialled, i.e. 127.0.0.1:port
+		{"localhost:8788", http.StatusOK},
+		{"127.0.0.1:8788", http.StatusOK},
+		{"[::1]:8788", http.StatusOK},
+		{"localhost", http.StatusOK},
+		{"evil.example:8788", http.StatusForbidden},
+		{"quarry.attacker.test", http.StatusForbidden},
+		{"192.168.1.9:8788", http.StatusForbidden},
+	} {
+		req, err := http.NewRequest(http.MethodGet, srv.URL, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if tc.host != "" {
+			req.Host = tc.host
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != tc.want {
+			t.Errorf("Host %q = %d, want %d", tc.host, resp.StatusCode, tc.want)
+		}
+	}
+}
+
+// Facet counts are a promise: click a value and get that many rows. Results are cards,
+// not assets, so a pack shipping one file in both a zip and a unitypackage produces two
+// assets and one card — counting assets advertised roughly double what clicking
+// returned. The earlier fixture happened to make grouping a no-op, which is why this
+// went unseen.
+func TestFacetCountsAreReachableWhenCopiesGroup(t *testing.T) {
+	srv := serverWith(t, func(mk func(...string) string) {
+		// The same file in two archives of one pack: two assets, one card.
+		writeZip(t, mk("synty", "Foo_Pack", "Foo_Pack_SourceFiles_v3.zip"), map[string]string{
+			"SourceFiles/Heart.fbx": "FBXHEART",
+		})
+		writeUnity(t, mk("synty", "Foo_Pack", "Foo_Pack_Unity_2022_3_v1_0_0.unitypackage"), []unityMember{
+			{guid: "aaa", pathname: "Assets/Foo/Heart.fbx", asset: "FBXHEART"},
+		})
+		os.WriteFile(mk("other", "Pack", "Rock.fbx"), []byte("ROCK"), 0o644)
+	})
+
+	var first assetsResp
+	decode(t, doJSON(t, "GET", srv.URL+"/api/assets?limit=1", nil), &first)
+
+	check := func(kind, param string, values []struct {
+		Value string
+		Count int
+	}) {
+		for _, f := range values {
+			if f.Value == "" {
+				continue
+			}
+			var got assetsResp
+			decode(t, doJSON(t, "GET", srv.URL+"/api/assets?limit=500&"+param+"="+url.QueryEscape(f.Value), nil), &got)
+			if got.Total != f.Count {
+				t.Errorf("%s %q advertises %d but filtering returns %d", kind, f.Value, f.Count, got.Total)
+			}
+		}
+	}
+	check("vendor", "vendor", first.Facets.Vendors)
+	check("category", "type", first.Facets.Categories)
+	check("variant", "variant", first.Facets.Variants)
+}
+
+// Groups merge transitively: linking {A,B} then {B,C} yields {A,B,C}. The store's own
+// tests cover the merge; this pins that it survives the HTTP layer, which is the only
+// way a user ever reaches it.
+func TestLinkMergesTransitivelyOverHTTP(t *testing.T) {
+	srv, _ := taggedLibrary(t, func(mk func(...string) string) {
+		writeZip(t, mk("synty", "P", "P_SourceFiles_v3.zip"), map[string]string{
+			"SourceFiles/Frame.fbx": "FRAME",
+			"SourceFiles/Fill.fbx":  "FILLX",
+			"SourceFiles/Trim.fbx":  "TRIMX",
+		})
+	})
+
+	var all taggedAssetsResp
+	decode(t, doJSON(t, "GET", srv.URL+"/api/assets?limit=50", nil), &all)
+	fp := map[string]string{}
+	for _, it := range all.Items {
+		if len(it.Fingerprints) > 0 {
+			fp[it.Name] = it.Fingerprints[0]
+		}
+	}
+	for _, n := range []string{"Frame.fbx", "Fill.fbx", "Trim.fbx"} {
+		if fp[n] == "" {
+			t.Fatalf("%s has no fingerprint; cards: %+v", n, fp)
+		}
+	}
+
+	post(t, srv, "/api/link", `{"fingerprints":["`+fp["Frame.fbx"]+`","`+fp["Fill.fbx"]+`"],"on":true}`, http.StatusOK)
+	post(t, srv, "/api/link", `{"fingerprints":["`+fp["Fill.fbx"]+`","`+fp["Trim.fbx"]+`"],"on":true}`, http.StatusOK)
+
+	// Frame was never linked to Trim directly; the merge is what makes it a companion.
+	related := relatedItems(t, srv, []string{fp["Frame.fbx"]})
+	got := map[string]bool{}
+	for _, it := range related.Items {
+		got[it.Name] = true
+	}
+	if !got["Trim.fbx"] {
+		t.Errorf("related to Frame = %v, want Trim.fbx via the transitive merge", got)
+	}
+	if !got["Fill.fbx"] {
+		t.Errorf("related to Frame = %v, want the direct companion Fill.fbx too", got)
+	}
+	if got["Frame.fbx"] {
+		t.Error("a card is its own companion")
+	}
+}
+
+// Paging over a library bigger than both the default page and the cap, so "clamped to
+// maxLimit" and "replaced with the default" are actually distinguishable — the previous
+// fixture had a handful of assets, where every hypothesis produces the same answer.
+func TestAssetsPagingOverALibraryBiggerThanTheLimits(t *testing.T) {
+	const total = 600
+	srv := serverWith(t, func(mk func(...string) string) {
+		entries := map[string]string{}
+		for i := 0; i < total; i++ {
+			entries[fmt.Sprintf("SourceFiles/Asset%04d.fbx", i)] = fmt.Sprintf("BODY%04d", i)
+		}
+		writeZip(t, mk("synty", "P", "P_SourceFiles_v3.zip"), entries)
+	})
+
+	for _, tc := range []struct {
+		name       string
+		qs         string
+		wantOffset int
+		wantItems  int
+	}{
+		{"default page", "", 0, defaultLimit},
+		{"explicit limit", "&limit=50", 0, 50},
+		{"limit at the cap", fmt.Sprintf("&limit=%d", maxLimit), 0, maxLimit},
+		{"limit past the cap falls back to the default", fmt.Sprintf("&limit=%d", maxLimit+1), 0, defaultLimit},
+		{"negative limit falls back to the default", "&limit=-1", 0, defaultLimit},
+		{"zero limit falls back to the default", "&limit=0", 0, defaultLimit},
+		{"non-numeric limit falls back to the default", "&limit=lots", 0, defaultLimit},
+		{"negative offset clamps to the start", "&offset=-5&limit=10", 0, 10},
+		{"offset past the end clamps to the end", fmt.Sprintf("&offset=%d&limit=10", total+50), total, 0},
+		{"last partial page", fmt.Sprintf("&offset=%d&limit=100", total-10), total - 10, 10},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var got assetsResp
+			decode(t, doJSON(t, "GET", srv.URL+"/api/assets?group=0"+tc.qs, nil), &got)
+			if got.Total != total {
+				t.Errorf("total = %d, want %d", got.Total, total)
+			}
+			if got.Offset != tc.wantOffset {
+				t.Errorf("offset = %d, want %d", got.Offset, tc.wantOffset)
+			}
+			if len(got.Items) != tc.wantItems {
+				t.Errorf("items = %d, want %d", len(got.Items), tc.wantItems)
+			}
+		})
+	}
 }

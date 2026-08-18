@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -560,5 +561,155 @@ func TestZipReaderSurvivesEvictionMidStream(t *testing.T) {
 	}
 	if string(b) != "FBXHEART" {
 		t.Errorf("entry bytes = %q, want FBXHEART", b)
+	}
+}
+
+// Prune has two halves and only the destructive one was covered: a fixture with no
+// archives leaves `live` empty, so an implementation that deleted the whole unpacked
+// tree would have passed. This pins the half that costs the user — a live extraction
+// deleted out from under a running server means every asset in that pack 404s.
+func TestPruneUnpackedKeepsLiveExtractions(t *testing.T) {
+	root, mk := libRoot(t)
+	writeUnityPackage(t, mk("synty", "P", "P_Unity_2022_3_v1.unitypackage"), []unityGUID{
+		{guid: "aaa", pathname: "Assets/P/Rock.fbx", asset: "ROCKBYTES"},
+	})
+	cacheDir := t.TempDir()
+	ix, err := LoadOrBuild(Options{Root: root, CacheDir: cacheDir}, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rock Asset
+	for _, a := range ix.Assets {
+		if a.Name == "Rock.fbx" {
+			rock = a
+		}
+	}
+	if rock.ID == "" {
+		t.Fatal("the unitypackage entry is not in the index")
+	}
+
+	// Force the extraction, then note where it landed.
+	rc, _, err := ix.Open(rock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc.Close()
+	live, err := ix.ensureExtracted(rock.Source.ArchivePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stale := filepath.Join(ix.unpackedDir(), "deadbeefdeadbeef")
+	if err := os.MkdirAll(stale, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := ix.PruneUnpacked(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Error("a stale extraction survived the prune")
+	}
+	if _, err := os.Stat(live); err != nil {
+		t.Fatalf("the current index's own extraction was deleted: %v", err)
+	}
+	rc, _, err = ix.Open(rock)
+	if err != nil {
+		t.Fatalf("Open after prune: %v", err)
+	}
+	defer rc.Close()
+	b, _ := io.ReadAll(rc)
+	if string(b) != "ROCKBYTES" {
+		t.Errorf("content after prune = %q, want ROCKBYTES", b)
+	}
+}
+
+// Two roots sharing one cache dir each prune against their own index. Without the
+// state being keyed by root, the second run deletes the first's extractions — and
+// `--addr` exists so two instances can be up at once, so it can happen underneath a
+// server that is serving them.
+func TestPruneDoesNotTouchAnotherRootsState(t *testing.T) {
+	cacheDir := t.TempDir()
+	build := func() (*Index, Asset) {
+		t.Helper()
+		root, mk := libRoot(t)
+		writeUnityPackage(t, mk("synty", "P", "P_Unity_2022_3_v1.unitypackage"), []unityGUID{
+			{guid: "aaa", pathname: "Assets/P/Rock.fbx", asset: "ROCKBYTES"},
+		})
+		ix, err := LoadOrBuild(Options{Root: root, CacheDir: cacheDir}, false, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, a := range ix.Assets {
+			if a.Name == "Rock.fbx" {
+				return ix, a
+			}
+		}
+		t.Fatal("no asset built")
+		return nil, Asset{}
+	}
+
+	first, firstRock := build()
+	firstDir, err := first.ensureExtracted(firstRock.Source.ArchivePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	second, _ := build()
+	if err := second.PruneUnpacked(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := os.Stat(firstDir); err != nil {
+		t.Errorf("the first root's extraction was pruned by the second root's run: %v", err)
+	}
+	rc, _, err := first.Open(firstRock)
+	if err != nil {
+		t.Fatalf("the first index can no longer serve: %v", err)
+	}
+	defer rc.Close()
+}
+
+// Extraction joins each member under a GUID directory, and the GUID comes straight out
+// of a tar quarry did not produce. The predicates that reject a hostile name are unit
+// tested; this pins the property that actually matters, across the two files that have
+// to agree on it.
+func TestExtractionCannotEscapeItsDirectory(t *testing.T) {
+	_, mk := libRoot(t)
+	pkg := mk("synty", "P", "P_Unity_2022_3_v1.unitypackage")
+	writeUnityPackage(t, pkg, []unityGUID{
+		{guid: "../../escaped", pathname: "Assets/P/Bad.fbx", asset: "BADBYTES"},
+		{guid: "..", pathname: "Assets/P/Dots.fbx", asset: "DOTBYTES"},
+		{guid: "/etc", pathname: "Assets/P/Abs.fbx", asset: "ABSBYTES"},
+		{guid: "ok", pathname: "Assets/P/Good.fbx", asset: "GOODBYTES"},
+	})
+
+	sandbox := t.TempDir()
+	dest := filepath.Join(sandbox, "unpacked")
+	if err := os.MkdirAll(dest, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := extractUnityPackage(pkg, dest); err != nil {
+		t.Fatal(err)
+	}
+
+	var outside []string
+	err := filepath.WalkDir(sandbox, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		if rel, rerr := filepath.Rel(dest, p); rerr != nil || strings.HasPrefix(rel, "..") {
+			outside = append(outside, p)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(outside) > 0 {
+		t.Errorf("extraction wrote outside its directory: %v", outside)
+	}
+	if _, err := os.Stat(filepath.Join(dest, "ok", "asset")); err != nil {
+		t.Errorf("the legitimate entry was not extracted: %v", err)
 	}
 }

@@ -109,6 +109,10 @@ type unityGUID struct {
 	asset    string
 	preview  bool
 	folder   bool // a Unity directory entry: pathname + asset.meta, but no asset payload
+	// assetFirst writes the payload before the pathname. Unity versions differ on the
+	// order, and the enumeration buffers the payload's head precisely because it may
+	// arrive before the extension that says what it is — a path only this exercises.
+	assetFirst bool
 }
 
 func writeUnityPackage(t *testing.T, path string, guids []unityGUID) {
@@ -124,10 +128,18 @@ func writeUnityPackage(t *testing.T, path string, guids []unityGUID) {
 		tw.Write([]byte(content))
 	}
 	for _, g := range guids {
+		payload := func() {
+			if !g.folder { // folder entries carry no asset payload
+				put(g.guid+"/asset", g.asset)
+			}
+		}
+		if g.assetFirst {
+			payload()
+		}
 		put(g.guid+"/pathname", g.pathname)
 		put(g.guid+"/asset.meta", "meta")
-		if !g.folder { // folder entries carry no asset payload
-			put(g.guid+"/asset", g.asset)
+		if !g.assetFirst {
+			payload()
 		}
 		if g.preview {
 			put(g.guid+"/preview.png", "PNGPREVIEW")
@@ -155,10 +167,10 @@ func byName(assets []Asset) map[string][]Asset {
 func TestScanImageDimensions(t *testing.T) {
 	root, mk := libRoot(t)
 
-	// A loose png, a png inside a zip, and a png inside a unitypackage — each a
-	// distinct size so the source can't be confused. The unitypackage helper writes
-	// pathname before asset (the reverse of real Unity order), so a pass here proves
-	// dimension recovery is order-independent.
+	// A loose png, a png inside a zip, and two inside a unitypackage — each a distinct
+	// size so the source can't be confused. The two packed entries differ only in tar
+	// member order: with the payload first the extension is still unknown when the
+	// bytes stream past, which is the whole reason the head is buffered at all.
 	os.WriteFile(mk("v", "P", "Loose.png"), encodePNG(t, 12, 5), 0o644)
 	writeZip(t, mk("v", "P", "P_SourceFiles_v3.zip"), map[string]string{
 		"SourceFiles/Zipped.png": string(encodePNG(t, 7, 9)),
@@ -166,6 +178,7 @@ func TestScanImageDimensions(t *testing.T) {
 	})
 	writeUnityPackage(t, mk("v", "P", "P_Unity_2022_3_v1_0_0.unitypackage"), []unityGUID{
 		{guid: "aaa", pathname: "Assets/P/Packed.png", asset: string(encodePNG(t, 3, 4))},
+		{guid: "bbb", pathname: "Assets/P/PackedFirst.png", asset: string(encodePNG(t, 8, 6)), assetFirst: true},
 	})
 
 	assets, err := Scan(root)
@@ -174,7 +187,7 @@ func TestScanImageDimensions(t *testing.T) {
 	}
 	idx := byName(assets)
 
-	want := map[string][2]int{"Loose.png": {12, 5}, "Zipped.png": {7, 9}, "Packed.png": {3, 4}}
+	want := map[string][2]int{"Loose.png": {12, 5}, "Zipped.png": {7, 9}, "Packed.png": {3, 4}, "PackedFirst.png": {8, 6}}
 	for name, wh := range want {
 		got := idx[name]
 		if len(got) != 1 {

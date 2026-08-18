@@ -258,31 +258,6 @@ func TestCardUnionAndFilter(t *testing.T) {
 	}
 }
 
-// browse has no session by design, so its one write surface is reachable from any
-// page the user has open. Requiring a JSON content-type forces a CORS preflight the
-// server never answers, which is what closes the drive-by path.
-func TestTagWritesRequireJSONContentType(t *testing.T) {
-	srv, _ := enabledServer(t)
-	body := `{"fingerprints":["crc32:1:1"],"tag":"hero","on":true}`
-	for _, ct := range []string{"text/plain", "application/x-www-form-urlencoded", "multipart/form-data", ""} {
-		req, err := http.NewRequest(http.MethodPost, srv.URL+"/api/assign", strings.NewReader(body))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if ct != "" {
-			req.Header.Set("Content-Type", ct)
-		}
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		resp.Body.Close()
-		if resp.StatusCode < 400 {
-			t.Errorf("content-type %q: got %d, want a rejection", ct, resp.StatusCode)
-		}
-	}
-}
-
 // A body big enough to exhaust memory must be cut off rather than decoded.
 func TestTagWritesBoundTheRequestBody(t *testing.T) {
 	srv, _ := enabledServer(t)

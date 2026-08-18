@@ -257,3 +257,96 @@ func TestRefreshRebuildsAcrossAnIndexVersion(t *testing.T) {
 		t.Error("an asset from the previous version survived the refresh")
 	}
 }
+
+// unreadable makes path unopenable and restores it when the test ends, so a refresh
+// that re-enumerates the archive fails visibly instead of quietly costing a
+// re-decompress. Skips as root, where the mode is not enforced.
+func unreadable(t *testing.T, path string) {
+	t.Helper()
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: file modes are not enforced")
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(path, fi.Mode()) })
+	if f, err := os.Open(path); err == nil {
+		f.Close()
+		t.Skip("the file is still readable despite mode 0000")
+	}
+}
+
+// Refresh must actually reuse what the cache holds for an unchanged archive. Every
+// other test would also pass if it silently re-enumerated everything, which is what
+// made a per-run re-decompress of every unitypackage invisible.
+//
+// Reuse is made observable by making the archive unreadable after the first build
+// while leaving its size and mtime alone: the stat print is unchanged, so a refresh
+// that reuses never opens the file, and one that re-enumerates records a skip and
+// loses the entries.
+func TestRefreshReusesCachedArchiveEnumeration(t *testing.T) {
+	root, mk := libRoot(t)
+	pkgPath := mk("synty", "P", "P_Unity_2022_3_v1.unitypackage")
+	writeUnityPackage(t, pkgPath, []unityGUID{
+		{guid: "aaa", pathname: "Assets/P/Original.fbx", asset: "ORIGINAL"},
+	})
+	cacheDir := t.TempDir()
+
+	ix, err := LoadOrBuild(Options{Root: root, CacheDir: cacheDir}, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ix.Assets) != 1 || ix.Assets[0].Name != "Original.fbx" {
+		t.Fatalf("built assets = %v", names(ix.Assets))
+	}
+
+	unreadable(t, pkgPath)
+	again, err := LoadOrBuild(Options{Root: root, CacheDir: cacheDir}, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(again.Assets) != 1 || again.Assets[0].Name != "Original.fbx" {
+		t.Errorf("assets after refresh = %v, want the cached entry: the archive was re-enumerated despite an unchanged stat print", names(again.Assets))
+	}
+	if len(again.Skipped) != 0 {
+		t.Errorf("skipped = %v, want none: a reused archive is never opened", again.Skipped)
+	}
+}
+
+// An archive every one of whose entries is deduped away by a loose twin contributes no
+// assets at all. Keying reuse on "did this archive leave assets behind" rather than on
+// its stat print meant such an archive was fully re-decompressed on every single run —
+// hundreds of MB per Synty pack, forever.
+func TestRefreshReusesAnArchiveThatContributesNothing(t *testing.T) {
+	root, mk := libRoot(t)
+	// The extracted twin beside the archive: dedup keeps the loose file and drops the
+	// archive entry, so the archive contributes nothing to the index.
+	os.WriteFile(mk("kevdev", "HBM", "src", "Walk.fbx"), []byte("FBXWALK"), 0o644)
+	zipPath := mk("kevdev", "HBM", "HBM_SourceFiles_v1.zip")
+	writeZip(t, zipPath, map[string]string{"src/Walk.fbx": "FBXWALK"})
+
+	cacheDir := t.TempDir()
+	ix, err := LoadOrBuild(Options{Root: root, CacheDir: cacheDir}, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ix.Assets) != 1 || ix.Assets[0].Source.Kind != SourceLoose {
+		t.Fatalf("assets = %v, want just the loose twin", names(ix.Assets))
+	}
+
+	unreadable(t, zipPath)
+	again, err := LoadOrBuild(Options{Root: root, CacheDir: cacheDir}, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(again.Skipped) != 0 {
+		t.Errorf("skipped = %v, want none: the archive's print was unchanged, so it should never have been opened", again.Skipped)
+	}
+	if len(again.Assets) != 1 {
+		t.Errorf("assets after refresh = %v, want the loose twin", names(again.Assets))
+	}
+}

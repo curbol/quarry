@@ -3,6 +3,7 @@ package browse
 import (
 	"net/url"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/curbol/quarry/internal/assetindex"
@@ -162,5 +163,107 @@ func TestMalformedQueriesDoNotMatchEverything(t *testing.T) {
 		if !parseQuery(q).match(unrelated) {
 			t.Errorf("term-free query %q should be treated as no filter", q)
 		}
+	}
+}
+
+// A stray ")" closes an expression that was never opened. Left in the token stream it
+// ends parsing where it sits and every term after it goes unread — ")sword" compiled to
+// no terms at all, which matches every asset in the library: the exact opposite of what
+// was typed. These pin that a mistyped query still means what the rest of it says.
+func TestMalformedGroupingKeepsTheTermsThatWereTyped(t *testing.T) {
+	sword := assetindex.Asset{Name: "Sword", Pack: "Weapons", RelPath: "w/sword.fbx"}
+	rock := assetindex.Asset{Name: "Rock", Pack: "Nature", RelPath: "n/rock.fbx"}
+	for _, tc := range []struct {
+		q                   string
+		wantSword, wantRock bool
+	}{
+		{"sword", true, false},
+		{")sword", true, false},
+		{"sword)", true, false},
+		{"((sword", true, false},
+		{"()sword", true, false},
+		{"sword OR rock", true, true},
+		{"sword OR )rock", true, true}, // the alternative survives the stray close
+		{")sword OR rock(", true, true},
+		{"(sword OR rock)", true, true},
+		{"sword rock", false, false}, // implicit AND, nothing is both
+		{"-sword", false, true},
+		{"-(sword OR rock)", false, false},
+		{"-(sword)", false, true},
+		{`"sword"`, true, false},
+		{"name:sword", true, false},
+		{"-name:sword", false, true},
+		{"pack:weapons", true, false},
+	} {
+		q := parseQuery(tc.q)
+		if got := q.match(sword); got != tc.wantSword {
+			t.Errorf("parseQuery(%q).match(Sword) = %v, want %v", tc.q, got, tc.wantSword)
+		}
+		if got := q.match(rock); got != tc.wantRock {
+			t.Errorf("parseQuery(%q).match(Rock) = %v, want %v", tc.q, got, tc.wantRock)
+		}
+	}
+}
+
+// parsePrimary recurses per "(", and a Go stack overflow is a fatal runtime error, not
+// a panic: recover cannot catch it and net/http's per-request recovery does not apply,
+// so one request of nothing but open parens took the whole server down with it. "(" is
+// a valid URL character, so ~900k of them fit inside the default 1MB header budget.
+func TestPathologicalQueriesDoNotBlowTheStack(t *testing.T) {
+	asset := assetindex.Asset{Name: "Sword", Pack: "Weapons", RelPath: "w/sword.fbx"}
+	for _, tc := range []struct{ name, q string }{
+		{"deep nesting", strings.Repeat("(", 1_000_000) + "sword"},
+		{"deep closes", strings.Repeat(")", 1_000_000) + "sword"},
+		{"alternating", strings.Repeat("(sword ", 200_000)},
+		{"many terms", strings.Repeat("sword ", 200_000)},
+		{"unterminated quote", `"sword`},
+		{"trailing operator", "sword OR "},
+		{"leading operator", "OR sword"},
+		{"only operators", "OR | OR"},
+		{"empty group", "()"},
+		{"field with no value", "name:"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			q := parseQuery(tc.q) // must return, not recurse without bound
+			q.match(asset)        // and must be evaluable
+		})
+	}
+}
+
+// A half-typed query must not widen to everything on its way to being finished: an
+// empty AND branch is the identity, so "sword OR " would otherwise compile to
+// "sword OR everything".
+func TestPartialQueriesDoNotMatchEverything(t *testing.T) {
+	rock := assetindex.Asset{Name: "Rock", Pack: "Nature", RelPath: "n/rock.fbx"}
+	for _, q := range []string{"sword OR ", "sword OR (", "sword |", "(sword OR "} {
+		if parseQuery(q).match(rock) {
+			t.Errorf("parseQuery(%q) matched an unrelated asset", q)
+		}
+	}
+}
+
+// `q` arrives in a URL, so it is bounded only by the server's header limit — about a
+// megabyte — and everything downstream is sized from it. Past the cap the tail is cut,
+// which narrows the query rather than widening it: the terms that survive still apply,
+// and a truncated one ANDs in as the partial word it is. What must not happen is the
+// query degrading to an all-match.
+func TestOverlongQueryIsTruncatedNotWidened(t *testing.T) {
+	sword := assetindex.Asset{Name: "Sword", Pack: "Weapons", RelPath: "w/sword.fbx"}
+	rock := assetindex.Asset{Name: "Rock", Pack: "Nature", RelPath: "n/rock.fbx"}
+
+	// Padded with spaces, the surviving text is exactly the leading term.
+	q := parseQuery("sword" + strings.Repeat(" ", maxQueryBytes*4))
+	if q == nil || !q.match(sword) || q.match(rock) {
+		t.Errorf("an overlong but otherwise ordinary query did not behave like %q", "sword")
+	}
+
+	// Padded with a word, the truncated remainder is a term of its own and narrows the
+	// result. Either way nothing unrelated comes back.
+	q = parseQuery("sword " + strings.Repeat("x", maxQueryBytes*4))
+	if q == nil {
+		t.Fatal("an overlong query compiled to nil, which matches the whole library")
+	}
+	if q.match(rock) {
+		t.Error("an overlong query matched an unrelated asset")
 	}
 }

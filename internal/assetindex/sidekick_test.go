@@ -118,3 +118,66 @@ func TestScanSidekickDeclutter(t *testing.T) {
 		t.Error("the character texture should remain browseable")
 	}
 }
+
+// Byproduct suppression is bounded to the character it belongs to, not to the directory
+// its .sk sits in. Two characters commonly share a directory, and scoping by directory
+// meant a character that failed to assemble lost its byproducts to its neighbour's tree
+// — the exact opposite of what sidekickByproduct promises.
+func TestSidekickSuppressionIsBoundedToItsOwnCharacter(t *testing.T) {
+	root, mk := libRoot(t)
+	writeUnityPackage(t, mk("synty", "SIDEKICK_X", "SIDEKICK_X_Unity_2021_3_v1_0_0.unitypackage"), []unityGUID{
+		{guid: "sk1", pathname: "Assets/S/Characters/Warrior_01.sk", asset: "Name: Warrior_01\nParts:\n- Name: SK_HEAD\n"},
+		{guid: "sk2", pathname: "Assets/S/Characters/Warrior_02.sk", asset: "Name: Warrior_02\nParts:\n- Name: SK_ABSENT\n"},
+		{guid: "hd1", pathname: "Assets/S/Resources/Meshes/SK_HEAD.fbx", asset: "HEADFBX"},
+		{guid: "p1", pathname: "Assets/S/Characters/Warrior_01.prefab", asset: "PREFAB1"},
+		{guid: "p2", pathname: "Assets/S/Characters/Warrior_02.prefab", asset: "PREFAB2"},
+	})
+
+	assets, err := Scan(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kept := map[string]bool{}
+	for _, a := range assets {
+		kept[a.Name] = true
+	}
+	if !kept["Warrior_01"] {
+		t.Error("Warrior_01 did not assemble")
+	}
+	if kept["Warrior_01.prefab"] {
+		t.Error("the assembled character's own prefab survived; it is superseded")
+	}
+	if !kept["Warrior_02.prefab"] {
+		t.Error("Warrior_02 failed to assemble, so its prefab is the only representation it has left — and it was dropped")
+	}
+}
+
+// A .sk exported to the top of a package makes its directory the whole package. Scoping
+// suppression by directory then claimed every prefab, material and .asset in it.
+func TestSidekickAtThePackageRootDoesNotClaimEverything(t *testing.T) {
+	root, mk := libRoot(t)
+	writeUnityPackage(t, mk("synty", "SIDEKICK_Y", "SIDEKICK_Y_Unity_2021_3_v1_0_0.unitypackage"), []unityGUID{
+		{guid: "sk1", pathname: "Assets/Hero.sk", asset: "Name: Hero\nParts:\n- Name: SK_HEAD\n"},
+		{guid: "hd1", pathname: "Assets/Resources/Meshes/SK_HEAD.fbx", asset: "HEADFBX"},
+		{guid: "u1", pathname: "Assets/Totally/Unrelated/Rock.prefab", asset: "ROCK"},
+		{guid: "u2", pathname: "Assets/Totally/Unrelated/Rock.mat", asset: "ROCKMAT"},
+		{guid: "u3", pathname: "Assets/Other/Tree.asset", asset: "TREE"},
+	})
+
+	assets, err := Scan(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kept := map[string]bool{}
+	for _, a := range assets {
+		kept[a.Name] = true
+	}
+	if !kept["Hero"] {
+		t.Error("Hero did not assemble")
+	}
+	for _, n := range []string{"Rock.prefab", "Rock.mat", "Tree.asset"} {
+		if !kept[n] {
+			t.Errorf("%s was dropped as a Sidekick byproduct; it has nothing to do with the character", n)
+		}
+	}
+}

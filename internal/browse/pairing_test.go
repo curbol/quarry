@@ -99,3 +99,64 @@ func TestRootMotionPairingIgnoresGroupsWithNoAnimation(t *testing.T) {
 		t.Errorf("non-animation files paired on their names alone: sibling=%v suppressed=%v", sibling, suppressed)
 	}
 }
+
+// One pack commonly ships as both a SourceFiles zip and a unitypackage holding the same
+// animations, and Pack is just a directory name, so both land in one pairing group.
+// Scoring only on extension made every in-place card pick the same first RM: the other
+// archive's RM was never suppressed and showed up beside the card it belongs to, while
+// that card's toggle fetched a different archive than the one it was displaying.
+func TestPairingKeepsEachArchiveToItsOwnRootMotionSibling(t *testing.T) {
+	const zipPath, uniPath = "/lib/synty/POLYGON_X/POLYGON_X_SourceFiles_v3.zip", "/lib/synty/POLYGON_X/POLYGON_X_Unity_2022_3_v1.unitypackage"
+	zipAsset := func(id, entry string) assetindex.Asset {
+		return assetindex.Asset{ID: id, Ext: "fbx", Vendor: "synty", Pack: "POLYGON_X", Category: assetindex.CategoryAnimation,
+			Source: assetindex.Source{Kind: assetindex.SourceZip, ArchivePath: zipPath, Entry: entry}}
+	}
+	uniAsset := func(id, pathname string) assetindex.Asset {
+		return assetindex.Asset{ID: id, Ext: "fbx", Vendor: "synty", Pack: "POLYGON_X", Category: assetindex.CategoryAnimation,
+			Source: assetindex.Source{Kind: assetindex.SourceUnityPackage, ArchivePath: uniPath, Guid: id, Pathname: pathname}}
+	}
+	sibling, suppressed := buildRootMotionPairs([]assetindex.Asset{
+		zipAsset("zip-walk", "SF/A_Walk_Masc.fbx"),
+		zipAsset("zip-walk-rm", "SF/A_Walk_RM_Masc.fbx"),
+		uniAsset("uni-walk", "Assets/Anim/A_Walk_Masc.fbx"),
+		uniAsset("uni-walk-rm", "Assets/Anim/A_Walk_RM_Masc.fbx"),
+	})
+
+	if sibling["zip-walk"] != "zip-walk-rm" {
+		t.Errorf("zip card -> %q, want its own archive's RM", sibling["zip-walk"])
+	}
+	if sibling["uni-walk"] != "uni-walk-rm" {
+		t.Errorf("unitypackage card -> %q, want its own archive's RM", sibling["uni-walk"])
+	}
+	for _, id := range []string{"zip-walk-rm", "uni-walk-rm"} {
+		if !suppressed[id] {
+			t.Errorf("%s is not suppressed, so it renders as its own card beside the one it belongs to", id)
+		}
+	}
+}
+
+// A group holds whatever shares a base name in one pack, which need not be one kind:
+// "_RM" is also the conventional suffix for a roughness-metallic map. Testing the group
+// as a whole let one animation's presence hide a texture nothing will ever play.
+func TestPairingLeavesANonAnimationRMAlone(t *testing.T) {
+	mk := func(id, entry, ext string, cat assetindex.Category) assetindex.Asset {
+		return assetindex.Asset{ID: id, Ext: ext, Vendor: "v", Pack: "P", Category: cat,
+			Source: assetindex.Source{Kind: assetindex.SourceZip, ArchivePath: "a.zip", Entry: entry}}
+	}
+	sibling, suppressed := buildRootMotionPairs([]assetindex.Asset{
+		mk("anim", "SF/Sword.fbx", "fbx", assetindex.CategoryAnimation),
+		mk("anim-rm", "SF/Sword_RM.fbx", "fbx", assetindex.CategoryAnimation),
+		mk("tex", "SF/Sword.png", "png", assetindex.CategoryTexture),
+		mk("tex-rm", "SF/Sword_RM.png", "png", assetindex.CategoryTexture),
+	})
+
+	if sibling["anim"] != "anim-rm" || !suppressed["anim-rm"] {
+		t.Errorf("the animation pair was not made: sibling=%v suppressed=%v", sibling, suppressed)
+	}
+	if suppressed["tex-rm"] {
+		t.Error("a roughness-metallic map was hidden as if it were a root-motion animation")
+	}
+	if _, ok := sibling["tex"]; ok {
+		t.Error("a texture was given a root-motion toggle")
+	}
+}

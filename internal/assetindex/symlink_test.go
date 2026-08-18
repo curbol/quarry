@@ -233,3 +233,110 @@ func TestFollowSymlinksSettingInvalidatesTheCache(t *testing.T) {
 		t.Errorf("turning it off again left %d assets, want %d", len(back.Assets), len(off.Assets))
 	}
 }
+
+// A root that is itself a symlink to the library is an ordinary setup — ~/library
+// pointing at a drive is the shape --follow-symlinks exists for. WalkDir lstats its
+// argument, so handing it the link made the whole walk one non-directory callback:
+// zero assets, no error, and nothing skipped to say why.
+func TestSymlinkedRootIndexesTheLibraryBehindIt(t *testing.T) {
+	real := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(real, "synty", "Pack"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(real, "synty", "Pack", "Sword.glb"), []byte("GLBBYTES"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "library")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	// Following is off here on purpose: the root is where the scan starts, not
+	// something it wandered into, so reaching it must not need the flag.
+	for _, follow := range []bool{false, true} {
+		ix, err := Build(Options{Root: link, CacheDir: t.TempDir(), FollowSymlinks: follow})
+		if err != nil {
+			t.Fatalf("follow=%v: %v", follow, err)
+		}
+		if len(ix.Assets) != 1 || ix.Assets[0].Name != "Sword.glb" {
+			t.Fatalf("follow=%v: assets = %v, want the one file under the link", follow, names(ix.Assets))
+		}
+		if len(ix.Skipped) != 0 {
+			t.Errorf("follow=%v: skipped = %v, want none", follow, ix.Skipped)
+		}
+		// Serving has to reach it too, or the card cannot load.
+		rc, _, err := ix.Open(ix.Assets[0])
+		if err != nil {
+			t.Errorf("follow=%v: Open: %v", follow, err)
+			continue
+		}
+		rc.Close()
+	}
+}
+
+// A followed link to a single file has to authorise that file for serving. Only
+// directory targets became link roots, so the scan indexed a card that Open then
+// refused — which is precisely what underRootPath exists to keep from happening.
+func TestFollowedFileSymlinkIsServable(t *testing.T) {
+	outside := t.TempDir()
+	target := filepath.Join(outside, "Sword.glb")
+	if err := os.WriteFile(target, []byte("GLBBYTES"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	root, mk := libRoot(t)
+	if err := os.Symlink(target, mk("synty", "Pack", "Sword.glb")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	ix, err := Build(Options{Root: root, CacheDir: t.TempDir(), FollowSymlinks: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ix.Assets) != 1 {
+		t.Fatalf("assets = %v, want the linked file", names(ix.Assets))
+	}
+	rc, size, err := ix.Open(ix.Assets[0])
+	if err != nil {
+		t.Fatalf("Open: %v — the scan indexed a card serving refuses", err)
+	}
+	defer rc.Close()
+	if size != int64(len("GLBBYTES")) {
+		t.Errorf("size = %d, want %d", size, len("GLBBYTES"))
+	}
+
+	// Authorising the file must not authorise its whole directory: a sibling the scan
+	// never saw stays outside what serving will open.
+	sibling := ix.Assets[0]
+	sibling.Source.FilePath = filepath.Join(outside, "Secret.glb")
+	if _, _, err := ix.Open(sibling); err == nil {
+		t.Error("a file beside the link target is servable; the link should authorise only itself")
+	}
+}
+
+// Two links into overlapping trees (a drive, and a pack inside it) reach the nested
+// tree twice. Cycle detection compared resolved paths for equality, so the inner tree
+// was walked again and every file in it indexed twice under the same id.
+func TestOverlappingSymlinkTargetsAreWalkedOnce(t *testing.T) {
+	outside := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(outside, "synty", "Pack"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outside, "synty", "Pack", "Sword.glb"), []byte("GLBBYTES"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	root, mk := libRoot(t)
+	if err := os.Symlink(outside, mk("driveA", "all")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if err := os.Symlink(filepath.Join(outside, "synty"), mk("driveB", "just-synty")); err != nil {
+		t.Fatal(err)
+	}
+
+	ix, err := Build(Options{Root: root, CacheDir: t.TempDir(), FollowSymlinks: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ix.Assets) != 1 {
+		t.Errorf("assets = %v, want one: the second link covers a tree the first already walked", names(ix.Assets))
+	}
+}

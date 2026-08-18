@@ -1,6 +1,7 @@
 package tagstore
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -376,5 +377,225 @@ func TestLoadGivesAnUndefinedTagItsDefaultColor(t *testing.T) {
 	}
 	if got != DefaultColor("hero") {
 		t.Errorf("color = %q, want the default %q", got, DefaultColor("hero"))
+	}
+}
+
+// The store is committed to source control, so a load/save cycle that changes even a
+// byte turns every quarry run into a spurious diff. Saving the same in-memory store
+// twice only proves map iteration doesn't leak; the drift that matters would come in
+// on the Load side.
+func TestLoadSaveRoundTripIsByteIdentical(t *testing.T) {
+	dir := t.TempDir()
+	first := filepath.Join(dir, FileName)
+	s := New()
+	s.Define("zebra", "#000000")
+	s.Define("alpha", "#ffffff")
+	s.Assign("fp-b", "zebra")
+	s.Assign("fp-a", "zebra")
+	s.Assign("fp-a", "alpha")
+	s.Link([]string{"fp-a", "fp-b"})
+	s.Link([]string{"fp-c", "fp-d"})
+	if err := Save(first, s); err != nil {
+		t.Fatal(err)
+	}
+
+	reloaded, err := Load(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := filepath.Join(dir, "round-trip-"+FileName)
+	if err := Save(second, reloaded); err != nil {
+		t.Fatal(err)
+	}
+	a, b := readFile(t, first), readFile(t, second)
+	if a != b {
+		t.Errorf("a load/save round trip rewrote the file:\n--- saved ---\n%s\n--- reloaded and saved ---\n%s", a, b)
+	}
+}
+
+func readFile(t *testing.T, p string) string {
+	t.Helper()
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+// Groups emits each group once, from its lowest member. With a single group that
+// holds however it is written, so the ordering and the emit-once rule are only really
+// exercised by two.
+func TestGroupsEmitsEachGroupOnceInOrder(t *testing.T) {
+	s := New()
+	s.Link([]string{"c-fp", "d-fp"})
+	s.Link([]string{"b-fp", "a-fp"})
+	want := [][]string{{"a-fp", "b-fp"}, {"c-fp", "d-fp"}}
+	if got := s.Groups(); !reflect.DeepEqual(got, want) {
+		t.Errorf("Groups() = %v, want %v", got, want)
+	}
+
+	// A transitive merge collapses two into one, still emitted once.
+	s.Link([]string{"b-fp", "c-fp"})
+	wantMerged := [][]string{{"a-fp", "b-fp", "c-fp", "d-fp"}}
+	if got := s.Groups(); !reflect.DeepEqual(got, wantMerged) {
+		t.Errorf("after a transitive link, Groups() = %v, want %v", got, wantMerged)
+	}
+}
+
+// A group needs two members to mean anything. These shapes can only arrive by hand,
+// and dropping them is the documented behavior — pinned here because silently
+// dropping user data is exactly what the unknown-key refusal exists to prevent.
+func TestLoadDropsDegenerateGroups(t *testing.T) {
+	for _, tc := range []struct{ name, body string }{
+		{"one member", "[[group]]\n  fingerprints = [\"solo\"]\n"},
+		{"no members", "[[group]]\n  fingerprints = []\n"},
+		{"one member repeated", "[[group]]\n  fingerprints = [\"same\", \"same\"]\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := filepath.Join(t.TempDir(), FileName)
+			if err := os.WriteFile(p, []byte(tc.body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			s, err := Load(p)
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if got := s.Groups(); len(got) != 0 {
+				t.Errorf("Groups() = %v, want none: a group of fewer than two is not a group", got)
+			}
+		})
+	}
+}
+
+// Links are result expansion, nothing more: they travel companions into a query's
+// results without ever changing what tags a fingerprint carries. Both the package doc
+// and the design doc promise this and nothing checked it.
+func TestLinkingNeverChangesTags(t *testing.T) {
+	s := New()
+	s.Assign("fp-a", "hero")
+	s.Link([]string{"fp-a", "fp-b"})
+
+	if got := s.TagsFor("fp-b"); len(got) != 0 {
+		t.Errorf("TagsFor(fp-b) = %v after linking to a tagged fingerprint, want none", got)
+	}
+	if got := s.TagsFor("fp-a"); !reflect.DeepEqual(got, []string{"hero"}) {
+		t.Errorf("TagsFor(fp-a) = %v, want [hero] unchanged by the link", got)
+	}
+	if got := s.Related("fp-b"); !reflect.DeepEqual(got, []string{"fp-a"}) {
+		t.Errorf("Related(fp-b) = %v, want [fp-a]", got)
+	}
+
+	s.Unlink([]string{"fp-a", "fp-b"})
+	if got := s.TagsFor("fp-a"); !reflect.DeepEqual(got, []string{"hero"}) {
+		t.Errorf("TagsFor(fp-a) = %v after unlinking, want [hero] still", got)
+	}
+	if got := s.Related("fp-a"); len(got) != 0 {
+		t.Errorf("Related(fp-a) = %v after unlinking, want none", got)
+	}
+}
+
+// A save rewrites the file whole, so it must not overwrite an edit made since the load
+// — by hand, by a checkout of a committed store, or by a second quarry sharing the
+// user-wide one. Losing that edit is total and leaves no trace.
+func TestSaveRefusesToClobberAnEditMadeSinceLoad(t *testing.T) {
+	p := filepath.Join(t.TempDir(), FileName)
+	seed := New()
+	seed.Define("hero", "#112233")
+	if err := Save(p, seed); err != nil {
+		t.Fatal(err)
+	}
+
+	mine, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mine.Assign("fp-a", "hero")
+
+	// Someone else writes the file in the meantime.
+	theirs, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	theirs.Define("villain", "#445566")
+	if err := Save(p, theirs); err != nil {
+		t.Fatal(err)
+	}
+
+	err = Save(p, mine)
+	if !errors.Is(err, ErrStale) {
+		t.Fatalf("Save = %v, want ErrStale: the other edit would have been destroyed", err)
+	}
+	after, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := after.Color("villain"); !ok {
+		t.Error("the other writer's tag is gone from the file")
+	}
+
+	// Reload is the recovery: it brings this store back in line with disk in place, so
+	// the caller keeps its pointer and the rejected edit does not survive in memory.
+	if err := mine.Reload(p); err != nil {
+		t.Fatal(err)
+	}
+	if got := mine.TagsFor("fp-a"); len(got) != 0 {
+		t.Errorf("TagsFor(fp-a) = %v after a reload, want the unsaved edit gone", got)
+	}
+	if _, ok := mine.Color("villain"); !ok {
+		t.Error("Reload did not pick up the other writer's tag")
+	}
+	if err := Save(p, mine); err != nil {
+		t.Errorf("Save after Reload: %v, want it to succeed now that the store matches disk", err)
+	}
+}
+
+// Saving to a path this store was not loaded from is a fresh write, not a rewrite of
+// something that could have changed underneath — exporting a store must not be
+// mistaken for clobbering one.
+func TestSaveToADifferentPathIsNotStale(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, FileName)
+	s := New()
+	s.Define("hero", "#112233")
+	if err := Save(p, s); err != nil {
+		t.Fatal(err)
+	}
+	if err := Save(filepath.Join(dir, "copy-"+FileName), s); err != nil {
+		t.Errorf("Save to a second path: %v", err)
+	}
+}
+
+// Rename must say when there is nothing to rename. Reporting success let a caller that
+// follows a rename with a color edit define the new id from nothing, answering
+// "renamed" while inventing a tag no asset carries.
+func TestRenameReportsAMissingTag(t *testing.T) {
+	s := New()
+	s.Define("hero", "#112233")
+	if err := s.Rename("ghost", "villain"); err == nil {
+		t.Error("renaming a tag that does not exist reported success")
+	}
+	if _, ok := s.Color("villain"); ok {
+		t.Error("the rename target was defined despite the source not existing")
+	}
+	if err := s.Rename("hero", "champion"); err != nil {
+		t.Errorf("renaming an existing tag: %v", err)
+	}
+}
+
+// A color quarry cannot parse is refused rather than quietly replaced: the next save
+// rewrites the file whole, so substituting a default would overwrite what the user
+// typed with something they never chose.
+func TestLoadRefusesAnUnreadableColor(t *testing.T) {
+	p := filepath.Join(t.TempDir(), FileName)
+	body := "[[tag]]\n  id = \"hero\"\n  color = \"red\"\n"
+	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(p)
+	if err == nil {
+		t.Fatal("a color quarry cannot read was accepted and would be rewritten on the next save")
+	}
+	if !strings.Contains(err.Error(), "hero") {
+		t.Errorf("error %q does not name the offending tag", err)
 	}
 }

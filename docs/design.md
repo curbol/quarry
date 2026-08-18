@@ -64,6 +64,12 @@ skips and reported, because browse treats a build failure as fatal and would oth
 refuse to start over one bad corner of a large library. An unreadable root is still an
 error — that is not a partial library, it is no library.
 
+A symlink is not followed. One pointing inside the root duplicates a file the walk
+already reaches by its real path, so it is dropped; one pointing outside is recorded as
+a skip, because serving refuses any path resolving outside the root and indexing it
+would only produce cards that cannot load. Reporting it matters most for a symlinked
+pack directory, which would otherwise take its whole contents out of the index silently.
+
 ## Tag store
 
 `quarry.tags.toml` records user tags and links. It resolves as `--tags`, else the nearest
@@ -127,7 +133,10 @@ lightbox "parts of this set" strip); `POST /api/link {fingerprints, on}` links o
 
 The store never prunes to a currently-scanned set: assignments and groups for fingerprints
 outside the current view are preserved, so tags and links survive a disabled pack, a narrowed
-`--root`, or another machine. quarry is otherwise read-only over the library; this is its
+`--root`, or another machine. A save rewrites the file whole, so loading refuses a key it
+does not recognize rather than dropping it: the store travels between machines that need not
+run the same quarry, and that is exactly when a newer version's field would otherwise be
+destroyed by an older version's next edit. quarry is otherwise read-only over the library; this is its
 one write surface, guarded by a mutex and written atomically. Because there is no session,
 the write endpoints require an `application/json` content-type, which forces a CORS
 preflight the server does not answer and so keeps a page the user happens to have open from

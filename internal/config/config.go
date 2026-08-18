@@ -79,11 +79,15 @@ func Load(dir string) (Config, error) {
 	if v := os.Getenv("QUARRY_ROOT"); v != "" {
 		c.Root = v
 	}
-	c.Root = expandHome(c.Root)
+	c.Root = ExpandHome(c.Root)
 	return c, nil
 }
 
-func expandHome(p string) string {
+// ExpandHome resolves a leading "~" against the user's home directory. It is
+// exported because --root overrides the value Load has already expanded, and a path
+// typed into a systemd unit or a wrapper script reaches the flag with its "~" intact
+// — no shell having been there to expand it.
+func ExpandHome(p string) string {
 	if p == "~" || strings.HasPrefix(p, "~/") {
 		if home, err := os.UserHomeDir(); err == nil {
 			return filepath.Join(home, strings.TrimPrefix(p, "~"))

@@ -35,9 +35,18 @@ func TestRunVersion(t *testing.T) {
 
 // A bare `quarry` serves, so the first argument may legitimately be a flag. Reading
 // it as a subcommand would reject every flag-only invocation.
+//
+// This is the one test that reaches the real serve, so it has to name every
+// directory it might touch: without --cache it resolves the caller's actual XDG
+// cache, reads whatever index.json is there, and would write over it for any root
+// that happens to exist.
 func TestLeadingFlagIsNotASubcommand(t *testing.T) {
 	t.Chdir(t.TempDir())
-	err := run([]string{"--root", filepath.Join(t.TempDir(), "nope"), "--config", t.TempDir()})
+	err := run([]string{
+		"--root", filepath.Join(t.TempDir(), "nope"),
+		"--config", t.TempDir(),
+		"--cache", t.TempDir(),
+	})
 	if err != nil && strings.Contains(err.Error(), "unknown subcommand") {
 		t.Errorf("leading flag parsed as a subcommand: %v", err)
 	}

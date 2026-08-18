@@ -107,7 +107,7 @@ func run(args []string) error {
 		return err
 	}
 	if *root != "" {
-		cfg.Root = *root
+		cfg.Root = config.ExpandHome(*root)
 	}
 	if cfg.Root == "" {
 		return fmt.Errorf("no scan root: pass --root <dir>, set QUARRY_ROOT, or add\n  root = \"/path/to/your/assets\"\nto %s", filepath.Join(configDir, "config.toml"))

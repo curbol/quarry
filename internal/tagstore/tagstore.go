@@ -12,14 +12,16 @@
 //
 // The store round-trips faithfully: it has no knowledge of any asset index and
 // never prunes assignments or links to a "currently-scanned" set, so they survive a
-// resync, a disabled pack, a narrowed browse root, or a move to another machine. A
-// tag's id is its label text (identity); "key:value" labels are ordinary ids by
-// convention, not enforced.
+// resync, a disabled pack, a narrowed browse root, or a move to another machine.
+// Since a save rewrites the file whole, a key Load cannot account for is refused
+// rather than dropped. A tag's id is its label text (identity); "key:value" labels
+// are ordinary ids by convention, not enforced.
 package tagstore
 
 import (
 	"fmt"
 	"hash/fnv"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -27,6 +29,8 @@ import (
 	"strings"
 
 	"github.com/BurntSushi/toml"
+
+	"github.com/curbol/quarry/internal/safewrite"
 )
 
 // FileName is the tag-store filename, looked for by Discover and used for the
@@ -320,14 +324,29 @@ func (s *Store) Tags() []TagDef {
 // Assignments are preserved verbatim; a tag referenced by an assignment but missing
 // a definition (a hand-edited file) is given a default color so the palette stays
 // complete.
+//
+// A key Load does not recognize is an error rather than something to skip. Save
+// rewrites the whole file from what Load produced, so anything silently dropped here
+// is destroyed on the next edit — and the store is meant to travel between machines
+// that may not run the same version, which is exactly when an unknown key shows up.
 func Load(path string) (*Store, error) {
 	s := New()
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		return s, nil
 	}
 	var f fileTOML
-	if _, err := toml.DecodeFile(path, &f); err != nil {
+	md, err := toml.DecodeFile(path, &f)
+	if err != nil {
 		return nil, err
+	}
+	if unknown := md.Undecoded(); len(unknown) > 0 {
+		keys := make([]string, len(unknown))
+		for i, k := range unknown {
+			keys[i] = k.String()
+		}
+		return nil, fmt.Errorf("%s holds keys this version of quarry does not understand (%s); "+
+			"it was likely written by a newer quarry — update, or remove those keys, "+
+			"rather than let the next edit drop them", path, strings.Join(keys, ", "))
 	}
 	for _, t := range f.Tags {
 		if t.ID == "" {
@@ -372,25 +391,9 @@ func Save(path string, s *Store) error {
 		f.Groups = append(f.Groups, Group{Fingerprints: g})
 	}
 
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".quarry-tags-*")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	if err := toml.NewEncoder(tmp).Encode(f); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(tmpName)
-		return err
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		os.Remove(tmpName)
-		return err
-	}
-	return nil
+	return safewrite.Atomic(path, ".quarry-tags-*", func(w io.Writer) error {
+		return toml.NewEncoder(w).Encode(f)
+	})
 }
 
 func sortedKeys(set map[string]bool) []string {

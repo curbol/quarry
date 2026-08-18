@@ -325,3 +325,56 @@ func TestFailedSaveLeavesNoTempFile(t *testing.T) {
 		}
 	}
 }
+
+// Save rewrites the file whole from what Load produced, so a key Load quietly
+// skipped would be destroyed by the next tag edit. The store is meant to travel
+// between machines that may not run the same quarry, which is exactly when a key
+// this version has never heard of turns up.
+func TestLoadRefusesUnknownKeys(t *testing.T) {
+	tests := []struct {
+		name string
+		toml string
+		want string
+	}{
+		{"unknown field on a tag", "[[tag]]\n  id = \"hero\"\n  color = \"#e11d48\"\n  icon = \"sword\"\n", "tag.icon"},
+		{"unknown field on an assignment", "[[assignment]]\n  fingerprint = \"crc32:aa:1\"\n  tags = [\"hero\"]\n  note = \"x\"\n", "assignment.note"},
+		{"unknown section", "[[collection]]\n  name = \"favourites\"\n", "collection"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			p := filepath.Join(t.TempDir(), FileName)
+			if err := os.WriteFile(p, []byte(tc.toml), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			_, err := Load(p)
+			if err == nil {
+				t.Fatal("Load accepted a file whose keys it would drop on the next save")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error = %q, want it to name %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// A store may be hand-edited to tag something without spelling out the palette
+// entry. That is a complete file, not a broken one: the tag gets its default color
+// so the palette still describes every tag in use.
+func TestLoadGivesAnUndefinedTagItsDefaultColor(t *testing.T) {
+	p := filepath.Join(t.TempDir(), FileName)
+	body := "[[assignment]]\n  fingerprint = \"crc32:aa:1\"\n  tags = [\"hero\"]\n"
+	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := s.Color("hero")
+	if !ok {
+		t.Fatal("hero is assigned but absent from the palette")
+	}
+	if got != DefaultColor("hero") {
+		t.Errorf("color = %q, want the default %q", got, DefaultColor("hero"))
+	}
+}

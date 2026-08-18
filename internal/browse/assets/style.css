@@ -273,6 +273,9 @@ header select:hover { border-color: var(--edge-hi); color: var(--text); }
 .empty { text-align: center; color: var(--muted); padding: 48px; }
 .load-error { color: var(--accent); padding-top: 16px; }
 #sentinel { height: 1px; }
+/* Holds open the space of the rows the grid recycled away, so the scrollbar keeps
+   describing the whole result set and the scroll position survives a rebuild. */
+.grid-spacer { grid-column: 1 / -1; }
 
 .lightbox { position: fixed; inset: 0; z-index: 20; display: flex; align-items: center; justify-content: center; }
 .lightbox[hidden] { display: none; }

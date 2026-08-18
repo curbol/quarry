@@ -67,7 +67,10 @@ async function fetchPage() {
     if (gen !== state.gen) return;
     if (!state.facetsLoaded && data.facets) { populateFacets(data.facets); state.facetsLoaded = true; }
     state.total = data.total;
-    for (const a of data.items) { state.items.push(a); els.grid.appendChild(card(a)); }
+    for (const a of data.items) state.items.push(a);
+    if (!gridWindow.appended()) {
+      for (const a of data.items) els.grid.appendChild(card(a));
+    }
     state.offset += data.items.length;
     if (data.items.length === 0 || state.offset >= data.total) state.done = true;
     els.count.textContent = state.total + (state.total === 1 ? ' asset' : ' assets');
@@ -94,13 +97,135 @@ function reset() {
   state.gen++;
   state.offset = 0; state.total = 0; state.done = false; state.loading = false;
   state.items = [];
-  // Let go of the outgoing cards before dropping them: what is observing them, and
-  // what is still being rendered for them, outlives the DOM otherwise.
+  // Let go of the outgoing cards before dropping them: what is observing them, what is
+  // still being rendered for them, and what would repaint them on a tag edit all
+  // outlive the DOM otherwise.
   lazyWork.reset();
   modelThumbs.release();
+  tagWatchers.clear();
+  gridWindow.reset();
   els.grid.replaceChildren();
   fetchPage();
 }
+
+// gridWindow keeps the number of live cards bounded once a scroll session gets long.
+//
+// `content-visibility: auto` skips layout and paint for off-screen cards, but it does
+// not remove them: each card is ~11 elements, so a long scroll through a large library
+// climbs into the hundreds of thousands of nodes, every one of them re-checked for
+// relevancy on each frame. Below the threshold nothing here runs at all and the grid
+// behaves exactly as it always did — the recycling path exists only for the case that
+// needs it.
+//
+// The grid is a uniform auto-fill grid, so an item's row is a division and the space a
+// dropped row occupied can be held open by a full-width spacer of the same height. That
+// keeps the scrollbar honest and the scroll position stable.
+const gridWindow = {
+  // Live cards to keep. Comfortably more than a screenful at any window size, so
+  // ordinary scrolling never outruns the rebuild.
+  size: 1500,
+  // How far the viewport may drift before rebuilding; large enough that a rebuild is
+  // rare, small enough that it never reaches the edge of the live range.
+  slack: 400,
+  start: 0,
+  end: 0,
+  active: false,
+  top: null,
+  bottom: null,
+
+  reset() {
+    this.start = 0;
+    this.end = 0;
+    this.active = false;
+    this.top = this.bottom = null;
+  },
+
+  // metrics reads the live geometry rather than assuming it: the column count depends
+  // on the viewport width and the row height on the cards' own content.
+  metrics() {
+    const cards = els.grid.querySelectorAll('.card');
+    if (!cards.length) return null;
+    const cs = getComputedStyle(els.grid);
+    const cols = cs.gridTemplateColumns.split(' ').filter(Boolean).length;
+    if (!cols) return null;
+    const gap = parseFloat(cs.rowGap) || 0;
+    const first = cards[0].getBoundingClientRect();
+    const rows = Math.ceil(cards.length / cols);
+    // Averaged across every live row rather than sampled from one card: a card's height
+    // varies a little with how its name wraps, and one sample made the estimated total
+    // height — and so the scrollbar — jump each time the window rebuilt on other cards.
+    const last = cards[cards.length - 1].getBoundingClientRect();
+    const rowH = rows > 1 ? (last.bottom - first.top + gap) / rows : first.height + gap;
+    if (!rowH) return null;
+    return { cols, rowH };
+  },
+
+  spacer(where) {
+    const el = document.createElement('div');
+    el.className = 'grid-spacer';
+    el.dataset.where = where;
+    return el;
+  },
+
+  // wanted is the item range that should be live for the current scroll position,
+  // centred on the viewport and snapped to whole rows so the spacers line up.
+  wanted(m) {
+    const total = state.items.length;
+    const firstVisibleRow = Math.max(0, Math.floor((window.scrollY - els.grid.offsetTop) / m.rowH));
+    const rowsLive = Math.ceil(this.size / m.cols);
+    const startRow = Math.max(0, firstVisibleRow - Math.floor(rowsLive / 3));
+    const start = startRow * m.cols;
+    return { start, end: Math.min(total, start + rowsLive * m.cols) };
+  },
+
+  // sync renders the wanted range if the viewport has drifted far enough to need it.
+  // Called after each page and on scroll/resize.
+  sync(force) {
+    const total = state.items.length;
+    if (!this.active && total <= this.size) return;
+    const m = this.metrics();
+    if (!m) return;
+    const want = this.wanted(m);
+    if (!force && this.active && want.start >= this.start && want.end <= this.end &&
+      want.start - this.start >= 0 && this.end - want.end >= 0 &&
+      Math.abs(want.start - this.start) < this.slack) {
+      return;
+    }
+    this.render(want.start, want.end, m);
+  },
+
+  render(start, end, m) {
+    const total = state.items.length;
+    // Dropping the cards drops what was watching them; re-registering happens as each
+    // card is rebuilt below.
+    lazyWork.reset();
+    modelThumbs.release();
+    tagWatchers.clear();
+
+    const frag = document.createDocumentFragment();
+    this.top = this.spacer('top');
+    this.top.style.height = Math.ceil(start / m.cols) * m.rowH + 'px';
+    frag.appendChild(this.top);
+    for (let i = start; i < end; i++) frag.appendChild(card(state.items[i]));
+    this.bottom = this.spacer('bottom');
+    this.bottom.style.height = Math.ceil(Math.max(0, total - end) / m.cols) * m.rowH + 'px';
+    frag.appendChild(this.bottom);
+
+    els.grid.replaceChildren(frag);
+    this.start = start;
+    this.end = end;
+    this.active = true;
+  },
+
+  // append adds a freshly loaded page. Once recycling is on the page goes into the
+  // model and the window decides what is live; before that it is appended directly, so
+  // the common case never pays for any of this.
+  appended() {
+    if (!this.active && state.items.length <= this.size) return false;
+    this.sync(true);
+    return true;
+  },
+};
 
 // Each type/vendor/variant filter is a checkbox dropdown: none checked = no filter
 // (all), any checked = the union of those values. The empty-string value is a real
@@ -233,10 +358,45 @@ async function loadPalette() {
   try { applyPalette(await (await fetch('/api/tags')).json()); } catch { /* tagging stays off */ }
 }
 
+// tagWatchers repaints the cards a tag edit affects, keyed on fingerprint — which is
+// the asset's actual identity — rather than on the object the edit happened to arrive
+// through. A card opened from the lightbox's "parts of this set" strip is a different
+// object than the grid's card for the same asset, so hanging the repaint off the object
+// left the grid showing tags that were no longer true.
+const tagWatchers = new Map(); // fingerprint -> Set<{ asset, repaint }>
+
+function watchTags(asset, repaint) {
+  const entry = { asset, repaint };
+  for (const fp of asset.fingerprints || []) {
+    let set = tagWatchers.get(fp);
+    if (!set) tagWatchers.set(fp, (set = new Set()));
+    set.add(entry);
+  }
+}
+
+// applyTagChange folds one edit into every card that shares a fingerprint with it. A
+// card's tags are the union over its fingerprints, so any card holding a fingerprint
+// that just gained the tag gains it too. Losing it is only certain when every one of
+// the card's fingerprints was in the edit — otherwise another copy may still carry it,
+// and guessing would blank a tag that is still there.
+function applyTagChange(fingerprints, tag, on) {
+  const done = new Set();
+  for (const fp of fingerprints) {
+    for (const e of tagWatchers.get(fp) || []) {
+      if (done.has(e)) continue;
+      done.add(e);
+      const tags = new Set(e.asset.tags || []);
+      if (on) tags.add(tag);
+      else if ((e.asset.fingerprints || []).every((f) => fingerprints.includes(f))) tags.delete(tag);
+      e.asset.tags = [...tags].sort();
+      e.repaint();
+    }
+  }
+}
+
 // apiAssign toggles a tag across a card's whole fingerprint set and returns the
-// resulting union of tag ids for that set.
-// apiAssign returns the set's resulting union tags, or null on failure so a caller
-// leaves the card's displayed tags untouched rather than wiping them.
+// resulting union of tag ids for that set, or null on failure so a caller leaves the
+// card's displayed tags untouched rather than wiping them.
 async function apiAssign(fingerprints, tag, on) {
   let res;
   try {
@@ -254,6 +414,9 @@ async function apiAssign(fingerprints, tag, on) {
     return null;
   }
   applyPalette(data.palette);
+  // Broadcast here rather than at each call site, so no caller can forget to and leave
+  // a card on screen contradicting what was just written.
+  applyTagChange(fingerprints, tag, on);
   return data.tags || [];
 }
 
@@ -602,7 +765,7 @@ function card(a) {
   bar.className = 'sliver-bar';
   renderSlivers(bar, a);
   thumb.appendChild(bar);
-  a._rerender = () => renderSlivers(bar, a);
+  watchTags(a, () => renderSlivers(bar, a));
 
   const tagBtn = document.createElement('button');
   tagBtn.type = 'button';
@@ -1073,7 +1236,7 @@ function renderLbTags(a) {
   if (hasFingerprints(a)) {
     add.addEventListener('click', (e) => {
       e.stopPropagation();
-      openTagMenu(add, a, () => { renderLbTags(a); a._rerender && a._rerender(); });
+      openTagMenu(add, a, () => renderLbTags(a));
     });
   } else {
     add.disabled = true;
@@ -1119,7 +1282,6 @@ function lbTagChip(a, id) {
     if (t === null) return;
     a.tags = t;
     renderLbTags(a);
-    a._rerender && a._rerender();
   });
 
   chip.append(color, label, x);
@@ -1750,6 +1912,21 @@ for (const s of [els.sort, els.group]) s.addEventListener('change', reset);
 new IntersectionObserver((entries) => {
   if (entries.some((e) => e.isIntersecting)) fetchPage();
 }, { rootMargin: '600px' }).observe(els.sentinel);
+
+// Scrolling and resizing both move which cards should be live. Coalesced into a frame
+// so a fling costs one check per paint rather than one per scroll event, and both are
+// passive so neither can hold up the scroll itself.
+let windowTick = 0;
+const syncGridWindow = () => {
+  if (windowTick) return;
+  windowTick = requestAnimationFrame(() => {
+    windowTick = 0;
+    gridWindow.sync(false);
+  });
+};
+addEventListener('scroll', syncGridWindow, { passive: true });
+// A resize changes the column count, so the spacers have to be remeasured outright.
+addEventListener('resize', () => gridWindow.sync(true), { passive: true });
 
 loadPalette();
 fetchPage();

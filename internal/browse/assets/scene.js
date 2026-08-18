@@ -125,10 +125,30 @@ function clipBones(clip) {
 // so match the suffix too.
 function clipsForAsset(obj, asset) {
   const all = obj.animations || [];
-  const want = asset && asset.source && asset.source.clip;
+  const src = (asset && asset.source) || {};
+  // clipIndex is the animation's position in the file, which is how the split was made.
+  // The name cannot do this job on its own: glTF names are optional and need not be
+  // unique, so the index carries a disambiguated label ("Walk (2)", "clip 3") that no
+  // animation in the file is actually called.
+  if (Number.isInteger(src.clipIndex) && all[src.clipIndex]) return [all[src.clipIndex]];
+  const want = src.clip;
   if (!want) return all;
   const hit = all.filter((c) => c.name === want || c.name.endsWith('|' + want));
   return hit.length ? hit : all;
+}
+
+// clipsMatching is clipsForAsset against a *different* file: the root-motion sibling,
+// which has its own animations and its own indices. Only a name match counts, plus the
+// whole-file case where the sibling holds exactly one clip and there is nothing to pick
+// wrong. Falling back to "all of them" the way clipsForAsset does would hand the toggle
+// an arbitrary animation and present it as this clip's travel variant.
+function clipsMatching(obj, asset) {
+  const all = obj.animations || [];
+  const want = asset && asset.source && asset.source.clip;
+  if (!want) return all;
+  const hit = all.filter((c) => c.name === want || c.name.endsWith('|' + want));
+  if (hit.length) return hit;
+  return all.length === 1 ? all : [];
 }
 
 // loadRMClips loads an animation's root-motion (travel) sibling file and returns its
@@ -139,7 +159,7 @@ async function loadRMClips(asset) {
   if (!asset || !asset.rootMotionId) return null;
   try {
     const rmObj = await loadModel(contentURL(asset.rootMotionId), asset.ext);
-    const cs = clipsForAsset(rmObj, asset);
+    const cs = clipsMatching(rmObj, asset);
     dispose(rmObj);
     return cs.length ? cs : null;
   } catch { return null; }
@@ -314,7 +334,10 @@ function syntyNeutral() {
   if (syntyNeutralPromise) return syntyNeutralPromise;
   syntyNeutralPromise = (async () => {
     try {
-      const r = await fetch('/api/assets?vendor=synty&limit=8&group=0&q=' + encodeURIComponent('A_TPose_Neut'));
+      // Searched by name, not filtered by vendor: the vendor facet is the user's own
+      // directory name, so a library rooted at "Synty/" would match nothing here and
+      // silently disable retargeting for the whole session.
+      const r = await fetch('/api/assets?limit=8&group=0&q=' + encodeURIComponent('A_TPose_Neut'));
       const items = (await r.json()).items || [];
       const it = items.find((x) => x.name === 'A_TPose_Neut.fbx') || items[0];
       if (!it) return null;
@@ -360,10 +383,19 @@ function retargetClip(clip, neutral, rig) {
   return rotated ? new THREE.AnimationClip(clip.name, clip.duration, tracks) : clip;
 }
 
+// isSynty tests the vendor facet, which is the first path segment of the user's own
+// library — their directory name, verbatim, normalized nowhere. Comparing it
+// case-sensitively means a library rooted at "Synty/" instead of "synty/" silently
+// skips retargeting and poses every clip into the shredded output this exists to
+// prevent, with no diagnostic anywhere.
+function isSynty(vendor) {
+  return (vendor || '').toLowerCase() === 'synty';
+}
+
 // retargetedFor returns a clip playable on rig: the Synty mesh-less clips are rebased
 // through the shared neutral; everything else plays as-is.
 async function retargetedFor(clip, vendor, rig) {
-  if (vendor !== 'synty') return clip;
+  if (!isSynty(vendor)) return clip;
   const neutral = await syntyNeutral();
   return neutral ? retargetClip(clip, neutral, rig) : clip;
 }
@@ -558,7 +590,7 @@ const CharRegistry = {
 };
 
 export {
-  loadModel, loadSidekick, normalizeClip, boneNames, clipBones, clipsForAsset, loadRMClips,
+  loadModel, loadSidekick, normalizeClip, boneNames, clipBones, clipsForAsset, loadRMClips, isSynty,
   coversBones, posedBox, frameBox, isRenderable, captureRootRest, uprightRig, prepareClipRig,
   cloneRig, poseAt, retargetedFor, stripRootMotion, dispose, CharRegistry, rigEntry, rigCandidates, CLAY, _posedV,
 };

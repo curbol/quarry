@@ -3,7 +3,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { FBXLoader } from 'three/addons/loaders/FBXLoader.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import {
-  contentURL, loadModel, loadSidekick, normalizeClip, clipBones, clipsForAsset, loadRMClips,
+  contentURL, loadModel, loadSidekick, normalizeClip, clipBones, clipsForAsset, loadRMClips, isSynty,
   coversBones, posedBox, frameBox, isRenderable, captureRootRest, uprightRig,
   prepareClipRig, cloneRig, poseAt, retargetedFor, stripRootMotion, dispose, CharRegistry, rigEntry, rigCandidates, CLAY, _posedV,
 } from '/static/scene.js';
@@ -18,6 +18,7 @@ const els = {
   grid: document.getElementById('grid'),
   sentinel: document.getElementById('sentinel'),
   empty: document.getElementById('empty'),
+  error: document.getElementById('load-error'),
 };
 
 // gen is bumped by reset() so a page still in flight from the previous filter can
@@ -58,25 +59,31 @@ async function fetchPage() {
   // while the new request does the same: duplicate cards and a wrong offset.
   const gen = state.gen;
   const p = query({ offset: state.offset, limit: PAGE });
-  let data;
   try {
     const res = await fetch('/api/assets?' + p.toString());
-    data = await res.json();
-  } catch {
-    // Release the latch so the next scroll retries. Leaving it held — which is what a
-    // throw here used to do — stops the grid loading anything more for the rest of the
-    // session, with nothing on screen to say why.
-    if (gen === state.gen) state.loading = false;
-    return;
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    if (!Array.isArray(data.items)) throw new Error('malformed response');
+    if (gen !== state.gen) return;
+    if (!state.facetsLoaded && data.facets) { populateFacets(data.facets); state.facetsLoaded = true; }
+    state.total = data.total;
+    for (const a of data.items) { state.items.push(a); els.grid.appendChild(card(a)); }
+    state.offset += data.items.length;
+    if (data.items.length === 0 || state.offset >= data.total) state.done = true;
+    els.count.textContent = state.total + (state.total === 1 ? ' asset' : ' assets');
+    els.empty.hidden = state.total !== 0;
+    els.error.hidden = true;
+  } catch (e) {
+    // Everything that consumes the response is inside the try, not just the fetch: a
+    // body that parses but is missing a field would otherwise throw with the loading
+    // latch still held, which stops the grid loading anything more for the rest of the
+    // session. Release it so the next scroll retries, and say so on screen — silently
+    // stopping is indistinguishable from having reached the end.
+    if (gen !== state.gen) return;
+    console.error('loading assets failed', e);
+    els.error.textContent = 'Could not load assets (' + (e && e.message ? e.message : 'unknown error') + '). Scroll or change a filter to retry.';
+    els.error.hidden = false;
   }
-  if (gen !== state.gen) return;
-  if (!state.facetsLoaded) { populateFacets(data.facets); state.facetsLoaded = true; }
-  state.total = data.total;
-  for (const a of data.items) { state.items.push(a); els.grid.appendChild(card(a)); }
-  state.offset += data.items.length;
-  if (data.items.length === 0 || state.offset >= data.total) state.done = true;
-  els.count.textContent = state.total + (state.total === 1 ? ' asset' : ' assets');
-  els.empty.hidden = state.total !== 0;
   state.loading = false;
   // A page may not push the sentinel off-screen (big monitor, short page); the
   // IntersectionObserver won't re-fire while it stays visible, so keep filling.
@@ -625,11 +632,16 @@ function card(a) {
 
 function thumbContent(a) {
   if (a.thumb === 'image') {
-    const img = new Image();
-    img.loading = 'lazy';
-    img.src = contentURL(a.id);
-    img.onerror = () => img.replaceWith(iconEl(a.category));
-    return img;
+    // Downscaled in the worker rather than shown at source resolution. Every image is
+    // ThumbImage regardless of size, and a texture-heavy pack is mostly 2048² and 4096²
+    // atlases: at ~67 MB of decoded bitmap each, one screenful of 4K textures in a
+    // 158px grid is a couple of gigabytes resident. content-visibility does not help,
+    // because the decode is driven by the image loader, not by paint.
+    const holder = document.createElement('div');
+    holder.className = 'thumb-3d';
+    holder.appendChild(iconEl(a.category));
+    modelThumbs.observe(holder, a);
+    return holder;
   }
   if (a.thumb === 'preview') {
     const img = new Image();
@@ -662,15 +674,37 @@ function thumbContent(a) {
 
 // ---- fonts ----
 
-const loadedFonts = new Set();
+// loadedFonts caps how many font files stay registered on the document. Every card
+// that scrolls past downloads a whole typeface and document.fonts holds it forever, so
+// scrolling a font pack would keep every file it ever showed resident. Insertion order
+// is eviction order, matching the thumbnail cache.
+//
+// The value is the in-flight promise, not just a marker, so two cards for the same
+// font share one download instead of each creating and registering its own FontFace.
+const loadedFonts = new Map(); // asset.id -> Promise<{ fam, face }>
+const FONT_CACHE_MAX = 60;
 
 // ensureFont registers a font's bytes as a FontFace under a per-asset family and
 // resolves that family name, so sample text can be rendered in the real typeface.
 function ensureFont(a) {
   const fam = 'f' + a.id;
-  if (loadedFonts.has(a.id)) return Promise.resolve(fam);
-  return new FontFace(fam, `url(${contentURL(a.id)})`).load()
-    .then((face) => { document.fonts.add(face); loadedFonts.add(a.id); return fam; });
+  const cached = loadedFonts.get(a.id);
+  if (cached) {
+    loadedFonts.delete(a.id);
+    loadedFonts.set(a.id, cached); // refresh its place in eviction order
+    return cached.then((e) => e.fam);
+  }
+  const entry = new FontFace(fam, `url(${contentURL(a.id)})`).load()
+    .then((face) => { document.fonts.add(face); return { fam, face }; })
+    .catch((err) => { loadedFonts.delete(a.id); throw err; });
+  loadedFonts.set(a.id, entry);
+  while (loadedFonts.size > FONT_CACHE_MAX) {
+    const oldest = loadedFonts.keys().next().value;
+    const dropped = loadedFonts.get(oldest);
+    loadedFonts.delete(oldest);
+    dropped.then((e) => document.fonts.delete(e.face)).catch(() => {});
+  }
+  return entry.then((e) => e.fam);
 }
 
 // fontSample renders a specimen (name, pangram, glyph set, size ramp) in the font.
@@ -789,8 +823,15 @@ class ModelThumbnails {
     this.cache = new Map();   // asset.id -> object URL (a rendered blob)
     this.pending = new Map(); // asset.id -> holder awaiting its render
     this.watch();
+    this.dead = false;
     this.worker = new Worker('/static/thumbworker.js', { type: 'module' });
     this.worker.onmessage = (e) => this.onResult(e.data);
+    // A worker that fails at module load never installs its own message handler, so no
+    // reply ever comes back and every 3D card keeps its spinner for the life of the
+    // page with nothing tying the failure to the UI. Give up loudly instead: settle the
+    // cards waiting on it and stop asking.
+    this.worker.onerror = (e) => this.fail(e && e.message);
+    this.worker.onmessageerror = () => this.fail('a thumbnail result could not be delivered');
     // Seed the worker's (localStorage-less) rig registry with the bodies the user has
     // opened or pinned, so mesh-less clips whose rig can't be auto-discovered still pose
     // on the character the user chose in the lightbox.
@@ -810,11 +851,27 @@ class ModelThumbnails {
       }
     }, { rootMargin: '200px' });
   }
-  observe(holder, asset) { holder._asset = asset; this.vis.observe(holder); }
+  observe(holder, asset) {
+    if (this.dead) return; // the category icon already in the holder is the final answer
+    holder._asset = asset;
+    this.vis.observe(holder);
+  }
+  fail(message) {
+    if (this.dead) return;
+    this.dead = true;
+    console.error('thumbnail worker stopped; 3D previews in the grid are unavailable', message || '');
+    for (const holder of this.pending.values()) {
+      if (holder.isConnected) holder.classList.remove('loading');
+      this.vis.unobserve(holder);
+    }
+    this.pending.clear();
+    this.vis.disconnect();
+  }
   // release drops the renders queued for cards the grid is about to replace, and lets
   // go of the cards themselves: an IntersectionObserver holds its targets, so keeping
   // them observed would strand a batch of detached nodes on every filter change.
   release() {
+    if (this.dead) return;
     for (const id of this.pending.keys()) this.worker.postMessage({ type: 'cancel', id });
     this.pending.clear();
     this.watch();
@@ -828,7 +885,7 @@ class ModelThumbnails {
   }
   request(holder) {
     const asset = holder._asset;
-    if (this.pending.has(asset.id)) return;
+    if (this.dead || this.pending.has(asset.id)) return;
     const cached = this.cache.get(asset.id);
     if (cached) { this.touch(asset.id); this.swap(holder, cached); return; }
     holder.classList.add('loading');
@@ -840,6 +897,7 @@ class ModelThumbnails {
         id: asset.id, ext: asset.ext, vendor: asset.vendor, pack: asset.pack, thumb: asset.thumb,
         source: {
           clip: asset.source && asset.source.clip,
+          clipIndex: asset.source && asset.source.clipIndex,
           filePath: asset.source && asset.source.filePath,
           parts: asset.source && asset.source.parts,
         },
@@ -907,6 +965,9 @@ let activeViewer = null;
 // before touching the panel, so a slow response cannot land on whatever the user
 // navigated to in the meantime.
 let lbGen = 0;
+// lbReturnFocus is the element focus came from, restored on close so keyboard
+// navigation resumes where it left off instead of at the top of the document.
+let lbReturnFocus = null;
 
 // updateLbNav enables/disables the prev/next arrows for the current position in the
 // loaded result set. Next stays enabled at the tail while more pages can still load.
@@ -931,6 +992,9 @@ async function navLightbox(delta) {
 
 function openLightbox(a) {
   if (activeViewer) { activeViewer.stop(); activeViewer = null; } // tear down when navigating
+  // The tag menu closes over the asset it was opened for, so arrowing to another card
+  // while it is up would edit this card's tags under the next card's name.
+  closeTagMenu();
   const gen = ++lbGen;
   lb.index = state.items.indexOf(a);
   updateLbNav();
@@ -982,6 +1046,12 @@ function openLightbox(a) {
     lb.view.appendChild(iconEl(a.category));
   }
   lb.root.hidden = false;
+  // Cards are focusable and open on Enter, so a card left focused behind the modal
+  // would re-open the lightbox on every Enter — building a second viewer each time —
+  // and Tab would walk the grid underneath.
+  if (!els.grid.inert) lbReturnFocus = document.activeElement;
+  els.grid.inert = true;
+  document.getElementById('lb-close').focus();
 }
 
 // renderLbTags shows the card's tags as colored chips (each recolorable and
@@ -1148,21 +1218,54 @@ function relatedThumb(it) {
 
 function closeLightbox() {
   lb.root.hidden = true;
+  // Anchored to a control inside the lightbox, so without this it is left floating
+  // over the grid with nothing to dismiss it but a stray click.
+  closeTagMenu();
   if (activeViewer) { activeViewer.stop(); activeViewer = null; }
   lb.view.replaceChildren();
   lb.character.replaceChildren();
   lb.related.replaceChildren();
   lb.related.hidden = true;
+  // The grid was made inert on open so Enter could not re-trigger the card behind the
+  // modal; hand focus back to where it came from.
+  els.grid.inert = false;
+  if (lbReturnFocus && lbReturnFocus.isConnected) lbReturnFocus.focus();
+  lbReturnFocus = null;
+}
+
+// One WebGL context for every preview, created on first use and reused for the life
+// of the page.
+//
+// A renderer per lightbox open would leak a context each time: three's dispose()
+// releases its own resources but not the GL context (forceContextLoss is a separate
+// call), and the canvas is only collected whenever GC gets to it. Browsers cap
+// contexts per renderer process (~16) and evict the *oldest* when the cap is hit —
+// which is the thumbnail worker's, created once and reused for the page's life. So
+// arrowing through a couple of dozen models would silently blank every 3D thumbnail
+// in the grid for the rest of the session, with nothing logged anywhere.
+let sharedRenderer = null;
+function acquireRenderer() {
+  if (sharedRenderer) return sharedRenderer;
+  const r = new THREE.WebGLRenderer({ antialias: true });
+  r.setClearColor(0x14161d, 1);
+  r.shadowMap.enabled = true;
+  r.shadowMap.type = THREE.PCFSoftShadowMap;
+  // A context can still be lost for reasons outside our control (GPU reset, tab
+  // backgrounded too long). Dropping the reference is what lets the next open build a
+  // working one instead of rendering forever into a dead canvas.
+  r.domElement.addEventListener('webglcontextlost', (e) => {
+    e.preventDefault();
+    if (sharedRenderer === r) sharedRenderer = null;
+  });
+  sharedRenderer = r;
+  return r;
 }
 
 function startViewer(container, asset) {
   const w = container.clientWidth || 600, h = container.clientHeight || 500;
-  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  const renderer = acquireRenderer();
   renderer.setSize(w, h);
   renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
-  renderer.setClearColor(0x14161d, 1);
-  renderer.shadowMap.enabled = true;
-  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
   container.appendChild(renderer.domElement);
   const scene = new THREE.Scene();
   scene.add(new THREE.HemisphereLight(0xffffff, 0x2a2c33, 3.0));
@@ -1253,6 +1356,9 @@ function startViewer(container, asset) {
     moveBtn.classList.toggle('on', motionOn);
     moveBtn.title = motionOn ? 'Showing root motion — click to play in place' : 'Playing in place — click to show root motion';
     clips = motionOn ? playMotion : playInPlace;
+    // The picker lists whichever set is live; the two can differ in both length and
+    // names, so leaving it alone would label these clips with the other set's.
+    if (ctrls) ctrls.setClips(clips);
     playClip(curClip);
   });
   moveBtn.hidden = true;
@@ -1281,14 +1387,20 @@ function startViewer(container, asset) {
   };
 
   const playClip = (i) => {
+    // Guarded because the root-motion toggle swaps `clips` between two sets that need
+    // not be the same length: a whole-file RM sibling holds one clip where the in-place
+    // file holds many, so an index valid a moment ago can now be past the end, and
+    // clipAction(undefined) throws out of the click handler and leaves the toggle stuck.
+    const clip = clips[i] || clips[0];
+    if (!clip) return;
     if (action) action.stop();
-    curClip = i;
-    action = mixer.clipAction(clips[i]);
+    curClip = clips.indexOf(clip);
+    action = mixer.clipAction(clip);
     action.reset(); action.play();
-    clipDur = clips[i].duration || 0;
-    curTrimmedFrom = (clips[i].userData && clips[i].userData.trimmedFrom) || 0;
+    clipDur = clip.duration || 0;
+    curTrimmedFrom = (clip.userData && clip.userData.trimmedFrom) || 0;
     playing = true;
-    if (ctrls) ctrls.setClip(i);
+    if (ctrls) ctrls.setClip(curClip);
   };
 
   const buildPlayback = (mixerRoot, cs, charInfo, rootRest, rmCs) => {
@@ -1343,7 +1455,7 @@ function startViewer(container, asset) {
       if (obj) { scene.remove(obj); dispose(obj); }
       obj = char; scene.add(char);
       mixer = null; action = null;
-      buildPlayback(char, clips, { id: item.id, name: item.name }, asset.vendor === 'synty' ? null : soloRootRest, rmCs);
+      buildPlayback(char, clips, { id: item.id, name: item.name }, isSynty(asset.vendor) ? null : soloRootRest, rmCs);
       return true;
     }).catch(() => false);
   };
@@ -1407,7 +1519,9 @@ function startViewer(container, asset) {
       if (e.key === 'ArrowDown') { e.preventDefault(); if (items.length) { active = Math.min(active + 1, items.length - 1); render(); } }
       else if (e.key === 'ArrowUp') { e.preventDefault(); if (items.length) { active = Math.max(active - 1, 0); render(); } }
       else if (e.key === 'Enter') { e.preventDefault(); const it = items[active] || items[0]; if (it) choose(it); }
-      else if (e.key === 'Escape') { drop.hidden = true; }
+      // Stops here: Escape in an open dropdown dismisses the dropdown, not the lightbox
+      // the dropdown lives in.
+      else if (e.key === 'Escape') { drop.hidden = true; e.stopPropagation(); }
     });
     return box;
   }
@@ -1460,13 +1574,15 @@ function startViewer(container, asset) {
     const scrub = document.createElement('input'); scrub.type = 'range'; scrub.min = '0'; scrub.max = '1000'; scrub.value = '0'; scrub.className = 'lb-scrub';
     const time = document.createElement('span'); time.className = 'lb-time';
     bar.append(play, scrub, time);
-    let sel = null;
-    if (clips.length > 1) {
-      sel = document.createElement('select'); sel.className = 'lb-clipsel';
-      clips.forEach((c, i) => sel.appendChild(new Option(c.name || 'clip ' + (i + 1), String(i))));
-      sel.addEventListener('change', () => playClip(+sel.value));
-      bar.appendChild(sel);
-    }
+    const sel = document.createElement('select'); sel.className = 'lb-clipsel';
+    sel.addEventListener('change', () => playClip(+sel.value));
+    const fillClips = (cs) => {
+      sel.replaceChildren();
+      cs.forEach((c, i) => sel.appendChild(new Option(c.name || 'clip ' + (i + 1), String(i))));
+      sel.hidden = cs.length < 2;
+    };
+    fillClips(clips);
+    bar.appendChild(sel);
     const showTime = (t) => {
       time.textContent = `${t.toFixed(2)} / ${clipDur.toFixed(2)}s`;
       if (curTrimmedFrom) { time.textContent += ' ✂'; time.title = `Held-pose tail trimmed (was ${curTrimmedFrom.toFixed(2)}s)`; }
@@ -1483,7 +1599,8 @@ function startViewer(container, asset) {
     container.appendChild(bar);
     return {
       sync(t) { if (document.activeElement !== scrub) scrub.value = String(clipDur ? (t / clipDur) * 1000 : 0); showTime(t); },
-      setClip(i) { if (sel) sel.value = String(i); },
+      setClip(i) { sel.value = String(i); },
+      setClips: fillClips,
     };
   }
 
@@ -1584,7 +1701,12 @@ function startViewer(container, asset) {
       if (ground) { ground.geometry.dispose(); ground.material.dispose(); }
       if (shadowPlane) { shadowPlane.geometry.dispose(); shadowPlane.material.dispose(); }
       gizmoScene.traverse((o) => { o.geometry?.dispose?.(); o.material?.dispose?.(); });
-      renderer.dispose();
+      // The light's 2048² depth target is per-viewer and is not reachable from the
+      // scene graph walk above, so it has to be released by name.
+      dir.shadow.dispose();
+      // The renderer outlives the viewer; only its canvas leaves the DOM. Detaching
+      // the scene is what actually frees this preview's GPU memory.
+      scene.clear();
       renderer.domElement.remove();
     },
   };
@@ -1596,9 +1718,13 @@ lb.prev.addEventListener('click', () => navLightbox(-1));
 lb.next.addEventListener('click', () => navLightbox(1));
 document.addEventListener('keydown', (e) => {
   if (lb.root.hidden) return;
-  if (e.key === 'Escape') { closeLightbox(); return; }
+  // The field guard comes first, Escape included: inside the character search Escape
+  // closes the dropdown (handled there, which stops propagation), and inside the tag
+  // input it cancels the edit. Closing the whole lightbox from under either is not what
+  // the key meant there.
   const t = e.target;
   if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+  if (e.key === 'Escape') { closeLightbox(); return; }
   if (e.key === 'ArrowLeft') { e.preventDefault(); navLightbox(-1); }
   else if (e.key === 'ArrowRight') { e.preventDefault(); navLightbox(1); }
 });

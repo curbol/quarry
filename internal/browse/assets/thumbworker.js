@@ -29,7 +29,7 @@ if (typeof window === 'undefined') {
 
 import * as THREE from '/static/vendor/three/three.module.min.js';
 import {
-  loadModel, loadSidekick, clipsForAsset, prepareClipRig, poseAt, stripRootMotion, isRenderable,
+  loadModel, loadSidekick, clipsForAsset, prepareClipRig, poseAt, stripRootMotion, isRenderable, isSynty,
   captureRootRest, cloneRig, retargetedFor, dispose, CharRegistry, frameBox, contentURL,
 } from '/static/scene.js';
 
@@ -52,6 +52,13 @@ async function ensureRenderer() {
       await new Promise((r) => setTimeout(r, 150));
     }
   }
+  // A lost context renders nothing but still resolves convertToBlob, so without this
+  // every later thumbnail would come back as a blank image with no error anywhere.
+  // Dropping the reference makes the next job build a fresh renderer.
+  canvas.addEventListener?.('webglcontextlost', (e) => {
+    e.preventDefault();
+    renderer = null;
+  });
   scene = new THREE.Scene();
   scene.add(new THREE.HemisphereLight(0xffffff, 0x33343a, 2.6));
   const dir = new THREE.DirectionalLight(0xffffff, 2.2);
@@ -148,19 +155,30 @@ function evictFiles() {
   }
 }
 
+// rigFor finds a character mesh that can wear this clip. A registry entry that fails
+// to load is dropped and the search continues, the same recovery the lightbox makes:
+// entries are cached across page loads, so a re-index leaves stale ids behind, and
+// remembering the failure instead would make every clip thumbnail for that vendor fail
+// for the rest of the session.
 async function rigFor(clip, asset) {
   const vendor = asset.vendor;
+  const bones = clipBonesOf(clip);
   await CharRegistry.seed();
-  let m = CharRegistry.match(clipBonesOf(clip), vendor);
-  if (!m) { await CharRegistry.discoverForVendor(vendor, clipBonesOf(clip), asset.pack); m = CharRegistry.match(clipBonesOf(clip), vendor); }
-  if (!m) return null;
-  if (!rigs.has(m.id)) {
+  let m = CharRegistry.match(bones, vendor);
+  if (!m) { await CharRegistry.discoverForVendor(vendor, bones, asset.pack); m = CharRegistry.match(bones, vendor); }
+  while (m) {
+    if (rigs.has(m.id)) return rigs.get(m.id);
     const rig = await loadModel(contentURL(m.id), m.ext)
       .then((r) => (isRenderable(r) ? r : (dispose(r), null)))
       .catch(() => null);
-    rigs.set(m.id, rig);
+    if (rig) {
+      rigs.set(m.id, rig);
+      return rig;
+    }
+    CharRegistry.remove(m.id);
+    m = CharRegistry.match(bones, vendor);
   }
-  return rigs.get(m.id);
+  return null;
 }
 
 function clipBonesOf(clip) {
@@ -172,13 +190,29 @@ async function buildPosed(clip, asset, rootRest) {
   const template = await rigFor(clip, asset);
   if (!template) return false;
   const rig = cloneRig(template);
-  const refBox = prepareClipRig(rig, vendor === 'synty' ? null : rootRest);
+  const refBox = prepareClipRig(rig, isSynty(vendor) ? null : rootRest);
   const posed = stripRootMotion(await retargetedFor(clip, vendor, rig), rootBoneName(rig), rig.userData.upAxis);
   const mixer = poseAt(rig, posed);
   snap(rig, refBox);
   mixer.stopAllAction();
   dispose(rig);
   return true;
+}
+
+// downscale turns a source image into a grid-sized PNG. createImageBitmap resizes
+// during decode, so the full-resolution bitmap is never resident on the main thread —
+// which is the whole point, since a 4096² texture atlas is ~67MB decoded and a page of
+// them is measured in gigabytes.
+async function downscale(asset) {
+  const res = await fetch(contentURL(asset.id));
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  const src = await createImageBitmap(await res.blob(), { resizeWidth: SIZE, resizeQuality: 'medium' });
+  // Its own canvas, not the shared 3D one: this runs off the queue, so drawing onto
+  // that canvas would race whatever render is in flight.
+  const c = new OffscreenCanvas(src.width, src.height);
+  c.getContext('2d').drawImage(src, 0, 0);
+  src.close();
+  return c.convertToBlob({ type: 'image/png' });
 }
 
 // Serialize jobs: one render on the shared canvas at a time, converted to a blob before
@@ -215,13 +249,27 @@ self.onmessage = (e) => {
   }
   const { id, asset } = e.data;
   cancelled.delete(id); // a re-request supersedes an earlier cancel for the same asset
+  // Images bypass the queue: they never touch the shared GL canvas the queue exists to
+  // serialize, and making them wait behind a 65MB model parse is what a grid of
+  // textures would spend all its time doing.
+  if (asset.thumb === 'image') {
+    downscale(asset)
+      .then((blob) => { if (!cancelled.delete(id)) self.postMessage({ id, blob }); })
+      .catch(() => { if (!cancelled.delete(id)) self.postMessage({ id, blob: null }); });
+    return;
+  }
   queue = queue.then(async () => {
     if (cancelled.delete(id)) return; // dropped while it waited its turn
     try {
-      await ensureRenderer();
-      if (!(await withTimeout(build(asset)))) { self.postMessage({ id, blob: null }); return; }
-      const blob = await canvas.convertToBlob({ type: 'image/png' });
-      self.postMessage({ id, blob });
+      // The timeout covers the whole job, not just build(): creating the context and
+      // encoding the blob can stall too, and either one hanging outside the deadline
+      // would wedge this single queue and leave every card behind it spinning.
+      const ok = await withTimeout((async () => {
+        await ensureRenderer();
+        if (!(await build(asset))) return null;
+        return canvas.convertToBlob({ type: 'image/png' });
+      })());
+      self.postMessage({ id, blob: ok || null });
     } catch {
       self.postMessage({ id, blob: null });
     }

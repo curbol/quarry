@@ -43,9 +43,17 @@ func imageDims(head []byte, ext string) (int, int) {
 		if len(head) < 26 || string(head[:2]) != "BM" {
 			return 0, 0
 		}
-		return int(int32(binary.LittleEndian.Uint32(head[18:]))), int(int32(binary.LittleEndian.Uint32(head[22:])))
+		// A top-down BMP stores a negative height; the sign is row order, not a dimension.
+		return abs32(int32(binary.LittleEndian.Uint32(head[18:]))), abs32(int32(binary.LittleEndian.Uint32(head[22:])))
 	}
 	return 0, 0
+}
+
+func abs32(v int32) int {
+	if v < 0 {
+		return int(-v)
+	}
+	return int(v)
 }
 
 // isDimExt reports whether an extension is a raster format imageDims can measure.

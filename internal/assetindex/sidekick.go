@@ -52,34 +52,40 @@ func parseSidekick(data []byte) (name string, parts []string) {
 // picked out by extension alone from an archive this tool did not produce.
 const maxSidekickBytes = 256 << 10
 
-func applySidekick(archivePath string, entries map[string]*unityEntry, order []string, assets []Asset) ([]Asset, error) {
+func applySidekick(archivePath string, assets []Asset) []Asset {
+	// Driven off the surviving assets, not the raw enumeration: a part resolved from a
+	// guid the enumeration already dropped (no payload, unsafe path, a sidecar) would
+	// name an id the index cannot serve, and the frontend would silently render the
+	// character short a limb.
 	skGuids := map[string]bool{}
 	fbxByBase := map[string]string{}
-	for _, g := range order {
-		p := entries[g].pathname
-		switch extOf(p) {
+	byGuid := make(map[string]int, len(assets))
+	for i := range assets {
+		a := &assets[i]
+		if a.Source.Kind != SourceUnityPackage {
+			continue
+		}
+		byGuid[a.Source.Guid] = i
+		switch a.Ext {
 		case "sk":
-			skGuids[g] = true
+			skGuids[a.Source.Guid] = true
 		case "fbx":
-			fbxByBase[strings.TrimSuffix(path.Base(p), path.Ext(p))] = g
+			fbxByBase[strings.TrimSuffix(a.Name, path.Ext(a.Name))] = a.ID
 		}
 	}
 	if len(skGuids) == 0 {
-		return assets, nil
+		return assets
 	}
 	skBytes, err := readUnityAssetBytes(archivePath, skGuids, maxSidekickBytes)
 	if err != nil {
-		return nil, err
+		// Assembly is a vendor-specific second pass over a package the vendor-neutral
+		// first pass already enumerated. Losing it costs the character cards, not the
+		// several thousand assets the package otherwise contributes.
+		return assets
 	}
-	byGuid := make(map[string]int, len(assets))
-	for i := range assets {
-		if assets[i].Source.Kind == SourceUnityPackage {
-			byGuid[assets[i].Source.Guid] = i
-		}
-	}
-	// Only a character that actually assembled supersedes its byproducts; the trees
-	// rooted at those characters bound the suppression below.
-	var assembledTrees []string
+	// Only a character that actually assembled supersedes its byproducts; the
+	// characters collected here bound the suppression below.
+	var assembled []sidekickChar
 	for g := range skGuids {
 		data, ok := skBytes[g]
 		if !ok {
@@ -88,39 +94,52 @@ func applySidekick(archivePath string, entries map[string]*unityEntry, order []s
 		name, partNames := parseSidekick(data)
 		var partIDs []string
 		for _, pn := range partNames {
-			if pg, ok := fbxByBase[pn]; ok {
-				partIDs = append(partIDs, id(Source{Kind: SourceUnityPackage, ArchivePath: archivePath, Guid: pg}))
+			if partID, ok := fbxByBase[pn]; ok {
+				partIDs = append(partIDs, partID)
 			}
 		}
 		i, ok := byGuid[g]
 		if !ok || len(partIDs) == 0 {
 			continue
 		}
+		p := assets[i].Source.Pathname
 		if name != "" {
 			assets[i].Name = name
 		}
 		assets[i].Category = CategoryModel
 		assets[i].Thumb = ThumbSidekick
 		assets[i].Source.Parts = partIDs
-		assembledTrees = append(assembledTrees, path.Dir(assets[i].Source.Pathname)+"/")
+		assembled = append(assembled, sidekickChar{
+			tree: path.Dir(p) + "/",
+			base: strings.TrimSuffix(path.Base(p), path.Ext(p)),
+		})
 	}
 	kept := assets[:0]
 	for _, a := range assets {
-		if !sidekickByproduct(a, assembledTrees) {
+		if !sidekickByproduct(a, assembled) {
 			kept = append(kept, a)
 		}
 	}
-	return kept, nil
+	return kept
 }
+
+// sidekickChar is one assembled character's suppression scope: the directory its
+// .sk sits in, and the .sk's own base name, which every byproduct of that character
+// is named after.
+type sidekickChar struct{ tree, base string }
 
 // sidekickByproduct reports a per-character byproduct that its assembled .sk
 // character supersedes: the magenta prefab, its material, and the combined-mesh /
-// avatar .asset data, which sit in the character's own tree (directly beside the
-// .sk or under its Materials/ and Meshes/ subdirs). The reusable part meshes live
-// under Resources/ and the character's textures are a kept extension, so both stay
-// browseable. A character that failed to assemble contributes no tree, so its
-// byproducts survive — they are the only representation it has left.
-func sidekickByproduct(a Asset, assembledTrees []string) bool {
+// avatar .asset data, which sit beside the .sk (or under its Materials/ and Meshes/
+// subdirs) and carry its name. The reusable part meshes live under Resources/ and
+// the character's textures are a kept extension, so both stay browseable. A
+// character that failed to assemble contributes nothing here, so its byproducts
+// survive — they are the only representation it has left.
+//
+// Matching the name as well as the directory is what keeps that last promise true:
+// two characters commonly share a directory, and a .sk exported to the top of a
+// package would otherwise claim every prefab and material in it.
+func sidekickByproduct(a Asset, assembled []sidekickChar) bool {
 	if a.Thumb == ThumbSidekick {
 		return false
 	}
@@ -129,8 +148,8 @@ func sidekickByproduct(a Asset, assembledTrees []string) bool {
 	default:
 		return false
 	}
-	for _, tree := range assembledTrees {
-		if strings.HasPrefix(a.Source.Pathname, tree) {
+	for _, c := range assembled {
+		if strings.HasPrefix(a.Source.Pathname, c.tree) && strings.HasPrefix(a.Name, c.base) {
 			return true
 		}
 	}

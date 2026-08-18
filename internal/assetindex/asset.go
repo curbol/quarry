@@ -75,11 +75,34 @@ type Source struct {
 	// Clip names one embedded animation of a multi-clip model file (a Quaternius-style
 	// GLB animation library split into per-clip assets). The bytes served are the whole
 	// file; Clip only tells the preview which animation to play.
-	Clip string `json:"clip,omitempty"`
+	//
+	// glTF animation names are optional and need not be unique, so Clip carries a
+	// disambiguated label rather than the raw name — which is what makes it usable as
+	// identity, and what makes it unreliable for lookup. ClipIndex is the animation's
+	// position in the file, which is how the preview finds the right one; it is a
+	// pointer so that "clip 0" is distinguishable from "not a clip asset".
+	Clip      string `json:"clip,omitempty"`
+	ClipIndex *int   `json:"clipIndex,omitempty"`
 	// Parts lists the ids of the individual FBX meshes that compose an assembled Synty
 	// Sidekick character (see ThumbSidekick). The character has no bytes of its own; the
 	// frontend loads each part by id and merges them onto the shared skeleton.
 	Parts []string `json:"parts,omitempty"`
+}
+
+// EntryPath is where the asset's file sits inside whatever holds it: the entry name
+// for a zip, the Unity pathname for a unitypackage, the file path for a loose file.
+// It lives here, next to Kind, because every caller that switches on Kind to pick
+// one of those three fields has to be taught about a new kind — and a switch that
+// forgets one silently falls back to an unrelated field.
+func (s Source) EntryPath() string {
+	switch s.Kind {
+	case SourceZip:
+		return s.Entry
+	case SourceUnityPackage:
+		return s.Pathname
+	default:
+		return s.FilePath
+	}
 }
 
 // Asset is one browseable item: a loose file or a single entry inside an archive.

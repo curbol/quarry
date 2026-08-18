@@ -88,12 +88,19 @@ type zipEntryReader struct {
 	rc    io.ReadCloser
 	ref   *zipRef
 	cache *zipReaders
+	// once guards the refcount decrement. io.Closer permits a second Close, and a
+	// second release here would drive the count negative — past the zero the eviction
+	// path waits for, leaking the archive's descriptor for the process lifetime.
+	once sync.Once
 }
 
 func (r *zipEntryReader) Read(p []byte) (int, error) { return r.rc.Read(p) }
 func (r *zipEntryReader) Close() error {
-	err := r.rc.Close()
-	r.cache.release(r.ref)
+	var err error
+	r.once.Do(func() {
+		err = r.rc.Close()
+		r.cache.release(r.ref)
+	})
 	return err
 }
 
@@ -121,35 +128,61 @@ type zipRef struct {
 	byName  map[string]*zip.File
 	refs    int
 	evicted bool
+	// ready is closed once rc/byName are populated (or err is set). It lets acquire
+	// publish a slot and then open the archive with the cache mutex released: parsing
+	// a pack zip's central directory is the expensive part, and holding the lock
+	// across it stalls every other content request, including ones already cached.
+	ready chan struct{}
+	err   error
 }
 
 func (c *zipReaders) acquire(path string) (*zipRef, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if ref := c.open[path]; ref != nil {
 		ref.refs++
 		c.touchLocked(path)
+		c.mu.Unlock()
+		<-ref.ready
+		if ref.err != nil {
+			c.release(ref)
+			return nil, ref.err
+		}
 		return ref, nil
 	}
-
-	zr, err := zip.OpenReader(path)
-	if err != nil {
-		return nil, err
-	}
-	byName := make(map[string]*zip.File, len(zr.File))
-	for _, f := range zr.File {
-		// First wins, matching the order a scan of zr.File would have found them in.
-		if _, dup := byName[f.Name]; !dup {
-			byName[f.Name] = f
-		}
-	}
-	ref := &zipRef{rc: zr, byName: byName, refs: 1}
+	ref := &zipRef{refs: 1, ready: make(chan struct{})}
 	if c.open == nil {
 		c.open = map[string]*zipRef{}
 	}
 	c.open[path] = ref
 	c.order = append(c.order, path)
 	c.evictLocked()
+	c.mu.Unlock()
+
+	zr, err := zip.OpenReader(path)
+	if err == nil {
+		byName := make(map[string]*zip.File, len(zr.File))
+		for _, f := range zr.File {
+			// First wins, matching the order a scan of zr.File would have found them in.
+			if _, dup := byName[f.Name]; !dup {
+				byName[f.Name] = f
+			}
+		}
+		ref.rc, ref.byName = zr, byName
+	} else {
+		ref.err = err
+	}
+	close(ref.ready)
+	if err != nil {
+		// Unpublish, so a later request retries rather than inheriting the failure.
+		c.mu.Lock()
+		if c.open[path] == ref {
+			delete(c.open, path)
+			c.dropOrderLocked(path)
+		}
+		c.mu.Unlock()
+		c.release(ref)
+		return nil, err
+	}
 	return ref, nil
 }
 
@@ -157,7 +190,7 @@ func (c *zipReaders) release(ref *zipRef) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	ref.refs--
-	if ref.refs == 0 && ref.evicted {
+	if ref.refs == 0 && ref.evicted && ref.rc != nil {
 		ref.rc.Close()
 	}
 }
@@ -166,6 +199,15 @@ func (c *zipReaders) touchLocked(path string) {
 	for i, p := range c.order {
 		if p == path {
 			c.order = append(append(c.order[:i:i], c.order[i+1:]...), path)
+			return
+		}
+	}
+}
+
+func (c *zipReaders) dropOrderLocked(path string) {
+	for i, p := range c.order {
+		if p == path {
+			c.order = append(c.order[:i:i], c.order[i+1:]...)
 			return
 		}
 	}
@@ -181,7 +223,7 @@ func (c *zipReaders) evictLocked() {
 			continue
 		}
 		ref.evicted = true
-		if ref.refs == 0 {
+		if ref.refs == 0 && ref.rc != nil {
 			ref.rc.Close()
 		}
 	}

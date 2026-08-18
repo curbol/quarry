@@ -84,7 +84,7 @@ var ErrNoCacheDir = errors.New("index has no cache dir to extract into")
 // the version distinguishes an extraction made by older code from what the current
 // code would write.
 func (ix *Index) unpackedDir() string {
-	return filepath.Join(ix.cacheDir, "unpacked", strconv.Itoa(indexVersion))
+	return filepath.Join(ix.stateDir(), "unpacked", strconv.Itoa(indexVersion))
 }
 
 // PruneUnpacked removes extraction directories the current index no longer
@@ -106,10 +106,28 @@ func (ix *Index) PruneUnpacked() error {
 		}
 	}
 
-	root := filepath.Join(ix.cacheDir, "unpacked")
+	// State was once written directly under the cache dir rather than per root, so a
+	// cache written by an older quarry holds a tree nothing will ever consult again.
+	// It is quarry's own regenerable output in quarry's own cache dir, so sweep it.
+	if legacy := filepath.Join(ix.cacheDir, "unpacked"); legacy != filepath.Join(ix.stateDir(), "unpacked") {
+		if _, err := os.Stat(legacy); err == nil {
+			remove(legacy)
+			remove(filepath.Join(ix.cacheDir, "index.json"))
+		}
+	}
+
+	// A run killed mid-Save leaves a 100MB-plus temp beside the cache file, which
+	// nothing else ever cleans up.
+	if stale, err := filepath.Glob(filepath.Join(ix.stateDir(), ".browse-index-*")); err == nil {
+		for _, p := range stale {
+			remove(p)
+		}
+	}
+
+	root := filepath.Join(ix.stateDir(), "unpacked")
 	versions, err := os.ReadDir(root)
 	if os.IsNotExist(err) {
-		return nil
+		return firstErr
 	}
 	if err != nil {
 		return err
@@ -207,16 +225,19 @@ func (ix *Index) ensureExtracted(archivePath string) (string, error) {
 		}
 	})
 
-	if ex.err != nil {
-		// Re-arm so a later request retries: a failure (e.g. transient disk-full)
-		// shouldn't poison this package for the whole process lifetime.
-		ix.extractMu.Lock()
-		if ix.extractions[fp] == ex {
-			delete(ix.extractions, fp)
-		}
-		ix.extractMu.Unlock()
+	// Cleared either way. On failure this re-arms the retry, so a transient disk-full
+	// doesn't poison the package for the process lifetime. On success it means a dest
+	// that later disappears — pruned by another instance sharing the cache dir — is
+	// extracted again rather than reported present forever by a spent sync.Once.
+	ix.extractMu.Lock()
+	if ix.extractions[fp] == ex {
+		delete(ix.extractions, fp)
 	}
-	return dest, ex.err
+	ix.extractMu.Unlock()
+	if ex.err != nil {
+		return "", ex.err
+	}
+	return dest, nil
 }
 
 // underRoot reports whether p resolves inside what this index actually covers:
@@ -224,11 +245,18 @@ func (ix *Index) ensureExtracted(archivePath string) (string, error) {
 // symlinks is what stops an unfollowed link from reaching outside; the link roots
 // are what keep that check meaningful once following is on, instead of dropping it.
 func (ix *Index) underRoot(p string) bool {
-	if underRootPath(ix.Root, p) {
-		return true
-	}
-	for _, lr := range ix.LinkRoots {
-		if underRootPath(lr, p) {
+	// Root and LinkRoots are fixed for the index's lifetime, so they are resolved once
+	// rather than re-lstat'd per side per request: a grid page is a hundred Opens.
+	ix.rootsOnce.Do(func() {
+		ix.resolvedRoots = make([]string, 0, 1+len(ix.LinkRoots))
+		ix.resolvedRoots = append(ix.resolvedRoots, resolve(ix.Root))
+		for _, lr := range ix.LinkRoots {
+			ix.resolvedRoots = append(ix.resolvedRoots, resolve(lr))
+		}
+	})
+	rp := resolve(p)
+	for _, r := range ix.resolvedRoots {
+		if contains(r, rp) {
 			return true
 		}
 	}
@@ -239,7 +267,12 @@ func (ix *Index) underRoot(p string) bool {
 // the scan can apply the same rule to a symlink's target that Open will apply to it
 // later: a link the scan indexes but Open would refuse is a card that cannot load.
 func underRootPath(root, p string) bool {
-	rel, err := filepath.Rel(resolve(root), resolve(p))
+	return contains(resolve(root), resolve(p))
+}
+
+// contains is the containment test over two already-resolved paths.
+func contains(root, p string) bool {
+	rel, err := filepath.Rel(root, p)
 	if err != nil {
 		return false
 	}

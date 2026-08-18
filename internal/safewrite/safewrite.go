@@ -15,6 +15,12 @@ import (
 // directory, renamed into place. A reader therefore never sees a half-written file,
 // and a failure at any point leaves the previous contents untouched. The temp file
 // is removed on every failure path. tmpPattern is an os.CreateTemp pattern.
+//
+// The bytes are fsynced before the rename, because rename atomicity alone only
+// survives a crashing process, not a crashing machine: the rename can reach the
+// journal while the data blocks have not, and the file comes back zero-length. A
+// TOML store truncated that way still parses, so the loss reads as "your tags are
+// gone" with nothing reporting an error.
 func Atomic(path, tmpPattern string, encode func(io.Writer) error) error {
 	tmp, err := os.CreateTemp(filepath.Dir(path), tmpPattern)
 	if err != nil {
@@ -27,6 +33,19 @@ func Atomic(path, tmpPattern string, encode func(io.Writer) error) error {
 		return err
 	}
 	if err := encode(tmp); err != nil {
+		return fail(err)
+	}
+	if err := tmp.Sync(); err != nil {
+		return fail(err)
+	}
+	// The temp file is created 0600, and the rename carries that onto the target. A
+	// store the user (or a checkout) left group-readable must not silently become
+	// owner-only on the first edit.
+	if fi, err := os.Stat(path); err == nil {
+		if err := tmp.Chmod(fi.Mode().Perm()); err != nil {
+			return fail(err)
+		}
+	} else if err := tmp.Chmod(0o644); err != nil {
 		return fail(err)
 	}
 	// Checked, not deferred: a flush failure would otherwise be renamed into place as
@@ -42,10 +61,15 @@ func Atomic(path, tmpPattern string, encode func(io.Writer) error) error {
 	return nil
 }
 
-// Stream copies src into dst, creating or truncating it with perm. The final Close
-// is checked rather than deferred, for the same reason Atomic checks its own: a
-// flush failure would leave a silently truncated file that later reads treat as the
-// real thing.
+// Stream copies src into dst, creating or truncating it with perm, and removes dst
+// if the copy does not complete. The final Close is checked rather than deferred,
+// for the same reason Atomic checks its own: a flush failure would leave a silently
+// truncated file that later reads treat as the real thing.
+//
+// Unlike Atomic this writes in place, so an interrupted Stream takes the previous
+// contents of dst with it. Use it where dst is a fresh path — a temp dir about to be
+// renamed, a download staged beside its target — and Atomic where dst is a file
+// something else may already be reading.
 func Stream(dst string, src io.Reader, perm os.FileMode) error {
 	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
 	if err != nil {
@@ -53,7 +77,12 @@ func Stream(dst string, src io.Reader, perm os.FileMode) error {
 	}
 	if _, err := io.Copy(out, src); err != nil {
 		out.Close()
+		os.Remove(dst)
 		return err
 	}
-	return out.Close()
+	if err := out.Close(); err != nil {
+		os.Remove(dst)
+		return err
+	}
+	return nil
 }

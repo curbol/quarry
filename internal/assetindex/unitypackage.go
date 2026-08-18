@@ -14,16 +14,25 @@ import (
 )
 
 // unityEntry accumulates the members of one GUID directory as the tar streams by.
-// head holds the asset payload's leading bytes so image dimensions can be recovered
-// once the pathname (and thus the extension) is known — the two members arrive in
-// either order across Unity versions, so the bytes are buffered rather than decoded
-// inline.
+// head holds the asset payload's leading bytes only until the pathname (and thus the
+// extension) settles what they are — the two members arrive in either order across
+// Unity versions, so the bytes are buffered rather than decoded inline, and dropped
+// for the two ints they yield as soon as both members are in hand.
 type unityEntry struct {
-	pathname   string
-	hasAsset   bool
-	assetSize  int64
-	head       []byte
-	hasPreview bool
+	pathname      string
+	hasAsset      bool
+	assetSize     int64
+	head          []byte
+	width, height int
+	hasPreview    bool
+}
+
+// setDims decodes the buffered head for an image extension and releases it.
+func (e *unityEntry) setDims(head []byte, ext string) {
+	if isDimExt(ext) {
+		e.width, e.height = imageDims(head, ext)
+	}
+	e.head = nil
 }
 
 // splitUnityName splits a tar member name into its GUID dir and member, tolerating
@@ -94,11 +103,11 @@ func walkUnityTar(archivePath string, visit func(guid, member string, hdr *tar.H
 func unityAssets(archivePath, displayRel, vendor, pack, variant string) ([]Asset, error) {
 	entries := map[string]*unityEntry{}
 	var order []string
-	// Only images consume the head buffer, and the two members arrive in either order
-	// across Unity versions: buffer while the extension is still unknown, and drop the
-	// buffer as soon as either member proves the entry is not an image. A large pack
-	// holds thousands of non-image entries, whose buffers would otherwise be retained
-	// for the whole archive pass.
+	// Only images need the head bytes, and the two members arrive in either order
+	// across Unity versions, so the head is buffered only while the extension is still
+	// unknown and decoded the moment the other member settles it. Holding the bytes to
+	// the end of the pass instead would pin 8KB per image across a pack shipping tens
+	// of thousands of textures.
 	err := walkUnityTar(archivePath, func(guid, member string, hdr *tar.Header, tr *tar.Reader) error {
 		e := entries[guid]
 		if e == nil {
@@ -110,8 +119,11 @@ func unityAssets(archivePath, displayRel, vendor, pack, variant string) ([]Asset
 		case "asset":
 			e.hasAsset = true
 			e.assetSize = hdr.Size
-			if e.pathname == "" || isDimExt(extOf(e.pathname)) {
+			switch {
+			case e.pathname == "":
 				e.head = readHead(tr)
+			case isDimExt(extOf(e.pathname)):
+				e.setDims(readHead(tr), extOf(e.pathname))
 			}
 		case "pathname":
 			b, err := io.ReadAll(io.LimitReader(tr, maxPathnameBytes))
@@ -119,8 +131,8 @@ func unityAssets(archivePath, displayRel, vendor, pack, variant string) ([]Asset
 				return err
 			}
 			e.pathname = strings.TrimSpace(firstLine(string(b)))
-			if !isDimExt(extOf(e.pathname)) {
-				e.head = nil
+			if e.head != nil {
+				e.setDims(e.head, extOf(e.pathname))
 			}
 		case "preview.png":
 			e.hasPreview = true
@@ -145,12 +157,10 @@ func unityAssets(archivePath, displayRel, vendor, pack, variant string) ([]Asset
 			e.assetSize,
 			unityFingerprint(guid),
 		)
-		if isDimExt(a.Ext) {
-			a.Width, a.Height = imageDims(e.head, a.Ext)
-		}
+		a.Width, a.Height = e.width, e.height
 		assets = append(assets, a)
 	}
-	return applySidekick(archivePath, entries, order, assets)
+	return applySidekick(archivePath, assets), nil
 }
 
 // extractUnityPackage decompresses a .unitypackage once, writing each GUID's

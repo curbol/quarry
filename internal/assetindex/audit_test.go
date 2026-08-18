@@ -25,6 +25,18 @@ func libRoot(t *testing.T) (root string, mk func(...string) string) {
 	}
 }
 
+// cacheFileFor is where LoadOrBuild keeps one root's index. Tests that reach for the
+// cache file go through this rather than assembling a path, so the layout stays a
+// single decision inside the package.
+func cacheFileFor(t *testing.T, cacheDir, root string) string {
+	t.Helper()
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return filepath.Join(stateDir(cacheDir, abs), "index.json")
+}
+
 // A personal library is big and accumulates the odd partial copy. One unreadable
 // archive must cost that archive, not the whole index — browse treats a build
 // failure as fatal and would refuse to start.
@@ -57,7 +69,7 @@ func TestSaveIsAtomicAndChecked(t *testing.T) {
 
 	dir := t.TempDir()
 	cachePath := filepath.Join(dir, "browse-index.json")
-	if err := ix.Save(cachePath); err != nil {
+	if err := ix.save(cachePath); err != nil {
 		t.Fatal(err)
 	}
 	entries, err := os.ReadDir(dir)
@@ -73,7 +85,7 @@ func TestSaveIsAtomicAndChecked(t *testing.T) {
 	if err := os.MkdirAll(blocked, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := ix.Save(blocked); err == nil {
+	if err := ix.save(blocked); err == nil {
 		t.Error("Save reported success writing over a directory")
 	}
 }
@@ -93,10 +105,10 @@ func TestSaveLoadPreservesIndexedFields(t *testing.T) {
 		t.Fatal(err)
 	}
 	cachePath := filepath.Join(t.TempDir(), "browse-index.json")
-	if err := ix.Save(cachePath); err != nil {
+	if err := ix.save(cachePath); err != nil {
 		t.Fatal(err)
 	}
-	loaded, err := Load(cachePath, t.TempDir())
+	loaded, err := load(cachePath, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,15 +135,15 @@ func TestLoadOrBuildRejectsStaleCache(t *testing.T) {
 	root, mk := libRoot(t)
 	os.WriteFile(mk("v", "p", "Sword.glb"), []byte("GLBBYTES"), 0o644)
 	cacheDir := t.TempDir()
-	cachePath := filepath.Join(t.TempDir(), "browse-index.json")
 
-	ix, err := LoadOrBuild(Options{Root: root, CacheDir: cacheDir}, cachePath, false, nil)
+	ix, err := LoadOrBuild(Options{Root: root, CacheDir: cacheDir}, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if ix.Version != indexVersion {
 		t.Fatalf("built index has version %d", ix.Version)
 	}
+	cachePath := cacheFileFor(t, cacheDir, root)
 
 	var raw map[string]any
 	b, err := os.ReadFile(cachePath)
@@ -148,7 +160,7 @@ func TestLoadOrBuildRejectsStaleCache(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	again, err := LoadOrBuild(Options{Root: root, CacheDir: cacheDir}, cachePath, false, nil)
+	again, err := LoadOrBuild(Options{Root: root, CacheDir: cacheDir}, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,11 +173,15 @@ func TestLoadOrBuildRejectsStaleCache(t *testing.T) {
 func TestLoadOrBuildRebuildsFromCorruptCache(t *testing.T) {
 	root, mk := libRoot(t)
 	os.WriteFile(mk("v", "p", "Sword.glb"), []byte("GLBBYTES"), 0o644)
-	cachePath := filepath.Join(t.TempDir(), "browse-index.json")
+	cacheDir := t.TempDir()
+	cachePath := cacheFileFor(t, cacheDir, root)
+	if err := os.MkdirAll(filepath.Dir(cachePath), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(cachePath, []byte(`{"assets":[{"id":`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	ix, err := LoadOrBuild(Options{Root: root, CacheDir: t.TempDir()}, cachePath, false, nil)
+	ix, err := LoadOrBuild(Options{Root: root, CacheDir: cacheDir}, false, nil)
 	if err != nil {
 		t.Fatalf("corrupt cache should rebuild, got %v", err)
 	}

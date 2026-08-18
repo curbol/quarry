@@ -16,16 +16,7 @@ import (
 // assetFileBase is the extension-less base name of the file an asset lives in (the
 // archive entry, unity pathname, or loose path), where the root-motion token appears.
 func assetFileBase(s assetindex.Source) string {
-	var name string
-	switch s.Kind {
-	case assetindex.SourceZip:
-		name = s.Entry
-	case assetindex.SourceUnityPackage:
-		name = s.Pathname
-	default:
-		name = s.FilePath
-	}
-	name = path.Base(name)
+	name := path.Base(s.EntryPath())
 	return strings.TrimSuffix(name, path.Ext(name))
 }
 
@@ -60,21 +51,19 @@ func buildRootMotionPairs(assets []assetindex.Asset) (sibling map[string]string,
 		if len(g.rm) == 0 || len(g.nonRM) == 0 {
 			continue
 		}
-		hasAnim := false
-		for _, i := range g.nonRM {
-			if assets[i].Category == assetindex.CategoryAnimation {
-				hasAnim = true
-				break
-			}
-		}
-		if !hasAnim {
-			continue
-		}
 		// Suppress only the RM files some in-place card actually plays. pickRM picks one
 		// per card (preferring the same container), so hiding the whole group would make
 		// an RM with no in-place counterpart in its own format unreachable in browse
 		// even though the file is right there on disk.
+		//
+		// Only animations pair. A group can hold more than one kind — a pack shipping
+		// Sword.fbx beside Sword.png, whose roughness-metallic map is Sword_RM.png — and
+		// testing the group as a whole would let the animation's presence hide a texture
+		// nothing will ever play.
 		for _, ni := range g.nonRM {
+			if assets[ni].Category != assetindex.CategoryAnimation {
+				continue
+			}
 			if rmID := pickRM(assets, g.rm, assets[ni]); rmID != "" {
 				sibling[assets[ni].ID] = rmID
 				suppressed[rmID] = true
@@ -85,12 +74,19 @@ func buildRootMotionPairs(assets []assetindex.Asset) (sibling map[string]string,
 }
 
 // pickRM chooses the RM sibling for an in-place asset. The sibling has to be the same
-// container: a glb clip's travel is the glb RM, not the fbx RM of the same library
-// shipped in the same pack, and loading the wrong one fails. That is a requirement
-// rather than a preference — a pack that ships only the other format has no sibling
-// to offer, and pairing it anyway would both break the toggle and hide a file the
-// grid should still show. Among same-container candidates the same clip wins (a
-// per-clip RM over a whole-file one).
+// container format: a glb clip's travel is the glb RM, not the fbx RM of the same
+// library shipped in the same pack, and loading the wrong one fails. That is a
+// requirement rather than a preference — a pack that ships only the other format has
+// no sibling to offer, and pairing it anyway would both break the toggle and hide a
+// file the grid should still show.
+//
+// Among same-format candidates, the same archive wins over another, then the same
+// clip over a whole-file RM. The archive term matters because Pack is a directory
+// name: one pack commonly ships as both a SourceFiles zip and a unitypackage holding
+// the same animations, which lands both copies in one group. Without it every in-place
+// card in that group picks the same first RM — so the other archive's RM is never
+// suppressed and shows up beside the card it belongs to, while that card's toggle
+// fetches a different archive than the one it is displaying.
 func pickRM(assets []assetindex.Asset, rm []int, nonRM assetindex.Asset) string {
 	best, bestScore := "", -1
 	for _, ri := range rm {
@@ -99,6 +95,9 @@ func pickRM(assets []assetindex.Asset, rm []int, nonRM assetindex.Asset) string 
 			continue
 		}
 		score := 0
+		if r.Source.ArchivePath == nonRM.Source.ArchivePath {
+			score += 2
+		}
 		if r.Source.Clip == nonRM.Source.Clip {
 			score++
 		}

@@ -204,7 +204,6 @@ func TestFollowSymlinksStopsOnACycle(t *testing.T) {
 func TestFollowSymlinksSettingInvalidatesTheCache(t *testing.T) {
 	root, mk := libRoot(t)
 	cacheDir := t.TempDir()
-	cachePath := filepath.Join(cacheDir, "index.json")
 	outside := t.TempDir()
 	if err := os.WriteFile(filepath.Join(outside, "sword.glb"), []byte("GLBBYTES"), 0o644); err != nil {
 		t.Fatal(err)
@@ -214,11 +213,11 @@ func TestFollowSymlinksSettingInvalidatesTheCache(t *testing.T) {
 		t.Skipf("symlinks unavailable: %v", err)
 	}
 
-	off, err := LoadOrBuild(Options{Root: root, CacheDir: cacheDir}, cachePath, false, nil)
+	off, err := LoadOrBuild(Options{Root: root, CacheDir: cacheDir}, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	on, err := LoadOrBuild(Options{Root: root, CacheDir: cacheDir, FollowSymlinks: true}, cachePath, false, nil)
+	on, err := LoadOrBuild(Options{Root: root, CacheDir: cacheDir, FollowSymlinks: true}, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -226,7 +225,7 @@ func TestFollowSymlinksSettingInvalidatesTheCache(t *testing.T) {
 		t.Errorf("turning following on kept the cached %d assets (%v); the linked pack should have appeared",
 			len(off.Assets), names(on.Assets))
 	}
-	back, err := LoadOrBuild(Options{Root: root, CacheDir: cacheDir}, cachePath, false, nil)
+	back, err := LoadOrBuild(Options{Root: root, CacheDir: cacheDir}, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

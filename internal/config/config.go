@@ -5,6 +5,9 @@
 package config
 
 import (
+	"errors"
+	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -30,56 +33,66 @@ type fileConfig struct {
 // ResolveDir picks the user config directory, which holds config.toml and the
 // user-wide tag store: an explicit flag, else $QUARRY_CONFIG_DIR, else
 // $XDG_CONFIG_HOME/quarry, else ~/.config/quarry.
-func ResolveDir(flag string) string {
-	if flag != "" {
-		return flag
-	}
-	if v := os.Getenv("QUARRY_CONFIG_DIR"); v != "" {
-		return v
-	}
-	if v := os.Getenv("XDG_CONFIG_HOME"); v != "" {
-		return filepath.Join(v, "quarry")
-	}
-	if home, err := os.UserHomeDir(); err == nil {
-		return filepath.Join(home, ".config", "quarry")
-	}
-	return "quarry"
+func ResolveDir(flag string) (string, error) {
+	return resolveXDG(flag, "QUARRY_CONFIG_DIR", "XDG_CONFIG_HOME", ".config",
+		"cannot locate your config directory: %w; pass --config <dir> or set QUARRY_CONFIG_DIR")
 }
 
 // ResolveCacheDir picks the directory for regenerable state (the asset index and
 // unpacked archive contents): an explicit flag, else $QUARRY_CACHE_DIR, else
 // $XDG_CACHE_HOME/quarry, else ~/.cache/quarry. This is expendable data, so it lives
 // under the cache home, away from config and from the asset library itself.
-func ResolveCacheDir(flag string) string {
+func ResolveCacheDir(flag string) (string, error) {
+	return resolveXDG(flag, "QUARRY_CACHE_DIR", "XDG_CACHE_HOME", ".cache",
+		"cannot locate your cache directory: %w; pass --cache <dir> or set QUARRY_CACHE_DIR")
+}
+
+// resolveXDG walks the documented precedence and reports failure rather than falling
+// back to a name in the working directory. A relative fallback reads as harmless and
+// is not: quarry is most naturally run from inside the library, and the cache dir is
+// where the index and every unpacked archive get written — into the read-only tree,
+// for the next run to then index.
+func resolveXDG(flag, ownEnv, xdgEnv, homeSub, failure string) (string, error) {
 	if flag != "" {
-		return flag
+		return ExpandHome(flag), nil
 	}
-	if v := os.Getenv("QUARRY_CACHE_DIR"); v != "" {
-		return v
+	if v := os.Getenv(ownEnv); v != "" {
+		return ExpandHome(v), nil
 	}
-	if v := os.Getenv("XDG_CACHE_HOME"); v != "" {
-		return filepath.Join(v, "quarry")
+	if v := os.Getenv(xdgEnv); v != "" {
+		return filepath.Join(ExpandHome(v), "quarry"), nil
 	}
-	if home, err := os.UserHomeDir(); err == nil {
-		return filepath.Join(home, ".cache", "quarry")
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf(failure, err)
 	}
-	return "quarry-cache"
+	return filepath.Join(home, homeSub, "quarry"), nil
 }
 
 // Load reads an optional config.toml in dir, then applies the QUARRY_ROOT override. A
-// missing config.toml is fine: every setting has a flag.
+// missing config.toml is fine: every setting has a flag. Anything else about the file
+// is reported rather than absorbed — a config that cannot be read is not a config that
+// is absent, and a key this version does not know is a setting the user believes is in
+// effect. A silently ignored `follow_symlink` typo is a whole drive missing from the
+// index with nothing said.
 func Load(dir string) (Config, error) {
 	var c Config
 	p := filepath.Join(dir, "config.toml")
-	if _, err := os.Stat(p); err == nil {
-		var fc fileConfig
-		if _, err := toml.DecodeFile(p, &fc); err != nil {
-			return Config{}, err
+	var fc fileConfig
+	md, err := toml.DecodeFile(p, &fc)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+	case err != nil:
+		return Config{}, fmt.Errorf("reading %s: %w", p, err)
+	default:
+		if unknown := md.Undecoded(); len(unknown) > 0 {
+			keys := make([]string, len(unknown))
+			for i, k := range unknown {
+				keys[i] = k.String()
+			}
+			return Config{}, fmt.Errorf("%s sets keys this version of quarry does not understand (%s)", p, strings.Join(keys, ", "))
 		}
-		if fc.Root != "" {
-			c.Root = fc.Root
-		}
-		c.FollowSymlinks = fc.FollowSymlinks
+		c.Root, c.FollowSymlinks = fc.Root, fc.FollowSymlinks
 	}
 	if v := os.Getenv("QUARRY_ROOT"); v != "" {
 		c.Root = v

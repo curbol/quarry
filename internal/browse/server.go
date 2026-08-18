@@ -7,6 +7,7 @@ import (
 	"context"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -48,7 +49,7 @@ type server struct {
 
 	// byFP indexes assets by content fingerprint so link expansion can resolve a
 	// related fingerprint back to its asset(s) without scanning the whole library.
-	byFP map[string][]assetindex.Asset
+	byFP map[string][]int32
 
 	// rmSibling maps an in-place animation asset id to its root-motion sibling id;
 	// rmSuppressed marks the RM assets a sibling covers, hidden from the grid. Both
@@ -158,10 +159,10 @@ func newServer(ix *assetindex.Index, store *tagstore.Store, tagsPath string) (*s
 	if store == nil {
 		store = tagstore.New()
 	}
-	byFP := map[string][]assetindex.Asset{}
-	for _, a := range ix.Assets {
-		if a.Fingerprint != "" {
-			byFP[a.Fingerprint] = append(byFP[a.Fingerprint], a)
+	byFP := map[string][]int32{}
+	for i := range ix.Assets {
+		if fp := ix.Assets[i].Fingerprint; fp != "" {
+			byFP[fp] = append(byFP[fp], int32(i))
 		}
 	}
 	rmSibling, rmSuppressed := buildRootMotionPairs(ix.Assets)
@@ -170,6 +171,37 @@ func newServer(ix *assetindex.Index, store *tagstore.Store, tagsPath string) (*s
 		tagsEnabled: tagsPath != "", tagsPath: tagsPath, store: store, byFP: byFP,
 		rmSibling: rmSibling, rmSuppressed: rmSuppressed,
 	}, nil
+}
+
+// loopbackHosts are the Host values a browser sends for a server bound to loopback.
+// Anything else reaching a loopback listener arrived by a name that resolves here,
+// which is the DNS-rebinding shape.
+var loopbackHosts = map[string]bool{
+	"localhost": true, "127.0.0.1": true, "::1": true, "[::1]": true,
+}
+
+// guardHost rejects requests whose Host is not one this server could legitimately be
+// reached by. The write endpoints are protected by requiring a JSON content-type,
+// which forces a CORS preflight this server does not answer — but that only stops a
+// *cross-origin* page. A page served from a domain whose DNS is re-pointed at
+// 127.0.0.1 is same-origin with quarry: no preflight, and it can both write to the
+// tag store and read every response. Checking Host is what closes that, because the
+// browser still sends the attacker's domain there.
+//
+// Only applied when the listener is on loopback: --addr on a routable interface is a
+// deliberate choice to serve other machines, which have their own names for this one.
+func guardHost(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host := r.Host
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h
+		}
+		if !loopbackHosts[host] {
+			http.Error(w, "unexpected Host header", http.StatusForbidden)
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
 }
 
 // handler builds the route mux; shared by Serve and tests.
@@ -210,22 +242,44 @@ func Serve(ctx context.Context, addr string, ix *assetindex.Index, tagsPath stri
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", addr, err)
 	}
-	srv := &http.Server{Handler: s.handler()}
-	go srv.Serve(ln)
-	url := "http://" + ln.Addr().String()
-	fmt.Printf("browse %d assets at %s  (Ctrl-C to stop)\n", len(ix.Assets), url)
+	h := s.handler()
+	if isLoopback(ln.Addr()) {
+		h = guardHost(h)
+	}
+	srv := &http.Server{Handler: h}
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.Serve(ln) }()
+	addrURL := "http://" + ln.Addr().String()
+	fmt.Printf("browse %d assets at %s  (Ctrl-C to stop)\n", len(ix.Assets), addrURL)
 	if s.tagsEnabled {
 		fmt.Printf("tags: %s\n", tagsPath)
 	}
-	openBrowser(url)
+	openBrowser(addrURL)
 
-	<-ctx.Done()
+	// Serving can stop on its own — the listener dies, the port is pulled away. Waiting
+	// only on ctx there would leave quarry sitting silently on a URL that answers
+	// nothing until the user gives up and interrupts it.
+	select {
+	case <-ctx.Done():
+	case err := <-serveErr:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return fmt.Errorf("serve %s: %w", addr, err)
+		}
+		return nil
+	}
 	// A grid page can be mid-download of a 65MB model when Ctrl-C lands; give those
 	// responses a moment to finish rather than cutting the connection.
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(shutdownCtx)
 	return nil
+}
+
+// isLoopback reports whether the listener is bound to a loopback address, i.e. only
+// reachable from this machine.
+func isLoopback(a net.Addr) bool {
+	ta, ok := a.(*net.TCPAddr)
+	return ok && ta.IP.IsLoopback()
 }
 
 func (s *server) index(w http.ResponseWriter, r *http.Request) {
@@ -344,8 +398,11 @@ func (s *server) computeResults(query url.Values) []assetDTO {
 	variants := valueSet(query["variant"])
 	guids := valueSet(query["guid"])
 
-	var matched []assetindex.Asset
-	for _, a := range s.ix.Assets {
+	// Positions into ix.Assets, not copies of them: an unfiltered browse of a 150k-asset
+	// library would otherwise copy every struct twice on the way to the cards.
+	var matched []int32
+	for i := range s.ix.Assets {
+		a := &s.ix.Assets[i]
 		if s.rmSuppressed[a.ID] {
 			continue // folded into its in-place sibling's card (root-motion toggle)
 		}
@@ -361,20 +418,22 @@ func (s *server) computeResults(query url.Values) []assetDTO {
 		if guids != nil && !guids[a.Source.Guid] {
 			continue
 		}
-		if !matcher.match(a) {
+		if !matcher.match(*a) {
 			continue
 		}
-		matched = append(matched, a)
+		matched = append(matched, int32(i))
 	}
 
 	// Group identical copies (same file name + size) into one entry unless disabled,
 	// so the same asset shipped across variants/packs shows once with all its paths.
-	grouped := groupItems(matched)
+	var grouped []assetDTO
 	if query.Get("group") == "0" {
 		grouped = make([]assetDTO, len(matched))
-		for i, a := range matched {
-			grouped[i] = toDTO(a)
+		for i, ai := range matched {
+			grouped[i] = toDTO(s.ix.Assets[ai])
 		}
+	} else {
+		grouped = groupItems(s.ix.Assets, matched)
 	}
 	for i := range grouped {
 		grouped[i].RootMotionID = s.rmSibling[grouped[i].ID]
@@ -434,35 +493,38 @@ func groupNameKey(name string) string {
 
 // groupItems collapses assets that are the same file (normalized name + size) into
 // one DTO, keeping first-seen order, choosing the best-thumbnail copy as the
-// representative, and listing every copy.
-func groupItems(assets []assetindex.Asset) []assetDTO {
+// representative, and listing every copy. It takes positions into assets rather than
+// a slice of them, so grouping a library-sized result set does not copy it again.
+func groupItems(assets []assetindex.Asset, sel []int32) []assetDTO {
 	type group struct {
-		rep    assetindex.Asset
-		copies []assetindex.Asset
+		rep    int32
+		copies []int32
 	}
 	byKey := map[string]*group{}
 	var order []string
-	for _, a := range assets {
+	for _, ai := range sel {
+		a := &assets[ai]
 		key := groupNameKey(a.Name) + "\x00" + strconv.FormatInt(a.Size, 10)
 		g := byKey[key]
 		if g == nil {
-			g = &group{rep: a}
+			g = &group{rep: ai}
 			byKey[key] = g
 			order = append(order, key)
-		} else if thumbRank(a.Thumb) > thumbRank(g.rep.Thumb) {
-			g.rep = a
+		} else if thumbRank(a.Thumb) > thumbRank(assets[g.rep].Thumb) {
+			g.rep = ai
 		}
-		g.copies = append(g.copies, a)
+		g.copies = append(g.copies, ai)
 	}
 	out := make([]assetDTO, 0, len(order))
 	for _, key := range order {
 		g := byKey[key]
-		d := toDTO(g.rep)
+		d := toDTO(assets[g.rep])
 		d.Count = len(g.copies)
 		d.Copies = make([]copyDTO, len(g.copies))
 		fps := map[string]bool{}
-		for i, c := range g.copies {
-			d.Copies[i] = copyOf(c)
+		for i, ci := range g.copies {
+			c := &assets[ci]
+			d.Copies[i] = copyOf(*c)
 			if c.Fingerprint != "" {
 				fps[c.Fingerprint] = true
 			}
@@ -538,19 +600,40 @@ func contentType(ext string) string {
 	return "application/octet-stream"
 }
 
-// buildFacets counts the distinct facet values for the filter UI over the assets a
-// query can actually return. Counting every asset instead would include the
-// root-motion siblings handleAssets suppresses, leaving a count no combination of
-// filters could ever reach.
+// buildFacets counts the distinct facet values for the filter UI over what a query
+// can actually return. Two things make that different from counting every asset.
+// Root-motion siblings are suppressed from results, so counting them leaves a number
+// no combination of filters could reach. And results are cards, not assets: a pack
+// shipping one file in both a zip and a unitypackage produces two assets and one
+// card, so counting assets would advertise a vendor total roughly double what
+// clicking that vendor returns.
+//
+// A card contributes once per distinct value across its copies, which is exactly
+// reachable — the facet filter runs over assets, before grouping, so a card survives
+// if any of its copies carries the value.
 func buildFacets(assets []assetindex.Asset, hidden map[string]bool) facets {
-	categories, vendors, variants := map[string]int{}, map[string]int{}, map[string]int{}
-	for _, a := range assets {
-		if hidden[a.ID] {
-			continue
+	visible := make([]int32, 0, len(assets))
+	for i := range assets {
+		if !hidden[assets[i].ID] {
+			visible = append(visible, int32(i))
 		}
-		categories[string(a.Category)]++
-		vendors[a.Vendor]++
-		variants[a.Variant]++
+	}
+	categories, vendors, variants := map[string]int{}, map[string]int{}, map[string]int{}
+	bump := func(m map[string]int, seen map[string]bool, v string) {
+		if !seen[v] {
+			seen[v] = true
+			m[v]++
+		}
+	}
+	for _, card := range groupItems(assets, visible) {
+		cs, vs, vrs := map[string]bool{}, map[string]bool{}, map[string]bool{}
+		for _, c := range card.Copies {
+			bump(vendors, vs, c.Vendor)
+			bump(variants, vrs, c.Variant)
+		}
+		// Category is a property of the card, not of a copy: the representative is what
+		// the grid renders and what the type filter is compared against.
+		bump(categories, cs, string(card.Category))
 	}
 	return facets{
 		Categories: sortedFacet(categories),

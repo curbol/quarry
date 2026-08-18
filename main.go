@@ -15,6 +15,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 
 	"github.com/curbol/quarry/internal/assetindex"
@@ -88,13 +89,13 @@ func run(args []string) error {
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
-			usage()
+			usageTo(stdout)
 			return nil
 		}
 		return err
 	}
 	if cmd == "help" {
-		usage()
+		usageTo(stdout)
 		return nil
 	}
 	if cmd == "version" || *showVersion {
@@ -114,7 +115,14 @@ func run(args []string) error {
 		return fmt.Errorf("quarry takes no positional arguments (got %q); to index elsewhere use --root %s", fs.Arg(0), fs.Arg(0))
 	}
 
-	configDir := config.ResolveDir(*cfgDir)
+	configDir, err := config.ResolveDir(*cfgDir)
+	if err != nil {
+		return err
+	}
+	cacheDir, err := config.ResolveCacheDir(*cacheFlag)
+	if err != nil {
+		return err
+	}
 	cfg, err := config.Load(configDir)
 	if err != nil {
 		return err
@@ -135,7 +143,7 @@ func run(args []string) error {
 	return served(settings{
 		Root:           cfg.Root,
 		Addr:           *addr,
-		CacheDir:       *cacheFlag,
+		CacheDir:       cacheDir,
 		TagsPath:       resolveTagsPath(*tagsFlag, configDir),
 		Reindex:        *reindex,
 		FollowSymlinks: cfg.FollowSymlinks,
@@ -154,7 +162,7 @@ func isFlag(arg string) bool {
 // in the config dir, so tagging works from anywhere and is never silently off.
 func resolveTagsPath(tagsFlag, configDir string) string {
 	if tagsFlag != "" {
-		return tagsFlag
+		return config.ExpandHome(tagsFlag)
 	}
 	if wd, err := os.Getwd(); err == nil {
 		if p, ok := tagstore.Discover(wd); ok {
@@ -164,15 +172,37 @@ func resolveTagsPath(tagsFlag, configDir string) string {
 	return filepath.Join(configDir, tagstore.FileName)
 }
 
+// withinRoot reports whether dir sits inside root, comparing resolved absolute
+// paths so a symlinked cache dir cannot slip past the check.
+func withinRoot(root, dir string) bool {
+	resolve := func(p string) string {
+		if r, err := filepath.EvalSymlinks(p); err == nil {
+			return r
+		}
+		if abs, err := filepath.Abs(p); err == nil {
+			return abs
+		}
+		return filepath.Clean(p)
+	}
+	rel, err := filepath.Rel(resolve(root), resolve(dir))
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
 // serve indexes the asset root and runs the UI until interrupted.
 func serve(s settings) error {
-	cacheDir := config.ResolveCacheDir(s.CacheDir)
-	cachePath := filepath.Join(cacheDir, "index.json")
-
+	// The cache holds the index and every unpacked archive. Under the scan root it
+	// would be written into a tree quarry promises to leave alone, and indexed as
+	// library content on the next run.
+	if withinRoot(s.Root, s.CacheDir) {
+		return fmt.Errorf("cache dir %s is inside the scan root %s; pick one outside it with --cache", s.CacheDir, s.Root)
+	}
 	warn := func(m string) { fmt.Fprintln(os.Stderr, "warning:", m) }
 	fmt.Fprintf(os.Stderr, "indexing %s …\n", s.Root)
-	opt := assetindex.Options{Root: s.Root, CacheDir: cacheDir, FollowSymlinks: s.FollowSymlinks}
-	ix, err := assetindex.LoadOrBuild(opt, cachePath, s.Reindex, warn)
+	opt := assetindex.Options{Root: s.Root, CacheDir: s.CacheDir, FollowSymlinks: s.FollowSymlinks}
+	ix, err := assetindex.LoadOrBuild(opt, s.Reindex, warn)
 	if err != nil {
 		return fmt.Errorf("build asset index: %w", err)
 	}
@@ -198,8 +228,12 @@ func printVersion() {
 	fmt.Fprintf(stdout, "quarry %s (%s %s/%s)\n", version, runtime.Version(), runtime.GOOS, runtime.GOARCH)
 }
 
-func usage() {
-	fmt.Fprint(os.Stderr, `quarry - search and 3D-preview a local game-asset library
+// usage writes the help text to w. An explicitly requested `quarry help` goes to
+// stdout so it can be piped; the same text on an error path goes to stderr.
+func usage() { usageTo(os.Stderr) }
+
+func usageTo(w io.Writer) {
+	fmt.Fprint(w, `quarry - search and 3D-preview a local game-asset library
 
 usage:
   quarry [flags]          index the asset root and serve the UI

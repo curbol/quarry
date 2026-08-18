@@ -71,9 +71,15 @@ type libEntry struct {
 // the exception — that is not a partial library, it is no library — so it still
 // fails, rather than quietly indexing nothing.
 func walkLibrary(absRoot string, follow bool) ([]libEntry, []SkippedFile, []string, error) {
+	// The walk starts at the resolved root, not the configured one: WalkDir lstats
+	// its argument, so a root that is itself a symlink to the library would report
+	// as a non-directory and the whole walk would end after one callback, indexing
+	// nothing. Containment still uses the configured root, which resolves to the
+	// same place.
+	start := resolve(absRoot)
 	w := &walker{root: absRoot, follow: follow, visited: map[string]bool{}}
-	w.visited[resolve(absRoot)] = true
-	err := w.tree(absRoot, "")
+	w.visited[start] = true
+	err := w.tree(start, "")
 	return w.entries, w.skipped, w.linkRoots, err
 }
 
@@ -88,11 +94,25 @@ type walker struct {
 	linkRoots []string
 	// visited holds the resolved directories already walked, so a link back into a
 	// tree already covered — or into one covering it — terminates instead of looping.
+	// Membership is tested by containment, not equality; see covered.
 	visited map[string]bool
 }
 
 func (w *walker) skip(rel string, err error) {
 	w.skipped = append(w.skipped, SkippedFile{RelPath: rel, Reason: err.Error()})
+}
+
+// covered reports a directory some earlier walk already reached. Exact equality is
+// not enough: two links into overlapping trees (one to a drive, another to a pack
+// inside it) would otherwise walk the nested tree twice, indexing every file in it
+// under two ids that resolve to the same bytes.
+func (w *walker) covered(target string) bool {
+	for v := range w.visited {
+		if underRootPath(v, target) {
+			return true
+		}
+	}
+	return false
 }
 
 // rel names a walked path as the user sees it: relative to the library root, through
@@ -202,10 +222,13 @@ func (w *walker) symlink(p, r string) error {
 		return nil
 	}
 	if !info.IsDir() {
+		// The resolved file authorises itself and nothing else in its directory.
+		// Without this Open refuses the very asset the scan just indexed.
+		w.linkRoots = append(w.linkRoots, target)
 		w.file(p, r, filepath.Base(p), info)
 		return nil
 	}
-	if w.visited[target] {
+	if w.covered(target) {
 		w.skip(r, fmt.Errorf("symlink to %s, which this scan has already walked", target))
 		return nil
 	}
@@ -243,15 +266,19 @@ func archiveAssets(e libEntry) ([]Asset, *SkippedFile) {
 // compute its content fingerprint and, for an image, its pixel dimensions.
 // Build/Refresh reuse a cached loose asset via LoosePrint so these reads only
 // happen for new or changed files.
-func looseAsset(e libEntry) Asset {
-	a := newAsset(Source{Kind: SourceLoose, FilePath: e.path}, e.name, e.rel, e.vendor, e.pack, "", e.size, looseFingerprint(e.path))
+func looseAsset(e libEntry) (Asset, error) {
+	fp, err := looseFingerprint(e.path)
+	if err != nil {
+		return Asset{}, err
+	}
+	a := newAsset(Source{Kind: SourceLoose, FilePath: e.path}, e.name, e.rel, e.vendor, e.pack, "", e.size, fp)
 	if isDimExt(a.Ext) {
 		if f, err := os.Open(e.path); err == nil {
 			a.Width, a.Height = imageDims(readHead(f), a.Ext)
 			f.Close()
 		}
 	}
-	return a
+	return a, nil
 }
 
 // isRootMotionVariant reports a root-motion sibling of an animation library (e.g.
@@ -266,8 +293,8 @@ func isRootMotionVariant(name string) bool {
 // model file. All clips of a file share its bytes (Source.FilePath); Source.Clip
 // names which animation the preview plays. The content fingerprint combines the
 // file's fingerprint with the clip name so each clip tags independently and stably.
-func clipAsset(e libEntry, clip, fileFP string) Asset {
-	s := Source{Kind: SourceLoose, FilePath: e.path, Clip: clip}
+func clipAsset(e libEntry, clip string, index int, fileFP string) Asset {
+	s := Source{Kind: SourceLoose, FilePath: e.path, Clip: clip, ClipIndex: &index}
 	fp := ""
 	if fileFP != "" {
 		fp = fileFP + "#" + clip
@@ -291,20 +318,46 @@ func clipAsset(e libEntry, clip, fileFP string) Asset {
 // looseAssets builds the asset(s) for a loose file. A multi-animation .glb (a
 // Quaternius-style animation library) is split into one virtual asset per embedded
 // clip, all sharing the file's bytes; its root-motion (_RM) sibling is left whole.
-// Everything else (including single-animation and unreadable GLBs) is one asset.
-func looseAssets(e libEntry) []Asset {
-	if strings.EqualFold(filepath.Ext(e.name), ".glb") && !isRootMotionVariant(e.name) {
-		if names, err := glbAnimationNames(e.path); err == nil && len(names) >= 2 {
-			names = uniqueClipNames(names)
-			fp := looseFingerprint(e.path)
-			out := make([]Asset, 0, len(names))
-			for _, n := range names {
-				out = append(out, clipAsset(e, n, fp))
-			}
-			return out
-		}
+// Everything else (including single-animation GLBs) is one asset.
+//
+// A non-nil skip means the derivation did not fully succeed. Any assets returned
+// alongside it are still usable — a GLB whose clip list could not be read still
+// previews whole — but the caller must not cache them against the file's stat
+// print, or one transient read failure would be frozen in until the next
+// --reindex, long after the cause was fixed.
+func looseAssets(e libEntry) ([]Asset, *SkippedFile) {
+	skip := func(err error) *SkippedFile {
+		return &SkippedFile{RelPath: e.rel, Reason: err.Error()}
 	}
-	return []Asset{looseAsset(e)}
+	whole := func() ([]Asset, *SkippedFile) {
+		a, err := looseAsset(e)
+		if err != nil {
+			return nil, skip(err)
+		}
+		return []Asset{a}, nil
+	}
+	if !strings.EqualFold(filepath.Ext(e.name), ".glb") || isRootMotionVariant(e.name) {
+		return whole()
+	}
+	names, err := glbAnimationNames(e.path)
+	if err != nil || len(names) < 2 {
+		// A .glb whose container will not parse is not a failure to report: one whole
+		// asset is the right answer for anything that is not a multi-clip animation
+		// library, which includes every ordinary model. A file that cannot be read at
+		// all is a different matter, and looseAsset reports that when it reads the
+		// bytes for the fingerprint.
+		return whole()
+	}
+	fp, err := looseFingerprint(e.path)
+	if err != nil {
+		return nil, skip(err)
+	}
+	labels := uniqueClipNames(names)
+	out := make([]Asset, 0, len(labels))
+	for i, n := range labels {
+		out = append(out, clipAsset(e, n, i, fp))
+	}
+	return out, nil
 }
 
 // uniqueClipNames makes a GLB's animation names usable as identity. glTF names are
@@ -354,9 +407,14 @@ func Scan(root string) ([]Asset, error) {
 }
 
 // vendorPack derives the vendor (first path segment) and pack (second segment) of
-// a root-relative path. A file directly under a vendor has no pack.
+// a root-relative path. A file directly under a vendor has no pack, and a file
+// sitting loose in the library root (a receipt, a README) has neither — naming it
+// its own vendor would give the filter a bucket holding one file.
 func vendorPack(rel string) (vendor, pack string) {
 	segs := strings.Split(rel, "/")
+	if len(segs) < 2 {
+		return "", ""
+	}
 	vendor = segs[0]
 	if len(segs) >= 3 {
 		pack = segs[1]
@@ -408,9 +466,5 @@ func looseDedupKey(a Asset) string {
 }
 
 func archiveDedupKey(a Asset) string {
-	entry := a.Source.Entry
-	if a.Source.Kind == SourceUnityPackage {
-		entry = a.Source.Pathname
-	}
-	return dedupKey(a.Vendor, a.Pack, entry, a.Size)
+	return dedupKey(a.Vendor, a.Pack, a.Source.EntryPath(), a.Size)
 }

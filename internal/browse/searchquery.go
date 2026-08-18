@@ -13,15 +13,48 @@ import (
 // `(a AND b) OR c`. Malformed input never errors: it degrades to a best effort.
 type searchQuery struct{ root searchNode }
 
+// maxQueryBytes bounds the raw query. `q` arrives in a URL, so it is bounded only by
+// the server's header limit — about a megabyte — and everything downstream is sized
+// from it. No query anyone types comes close.
+const maxQueryBytes = 4 << 10
+
+// maxQueryDepth bounds group nesting. parsePrimary recurses per "(", and Go's stack
+// overflow is a fatal runtime error rather than a panic: it cannot be recovered, so
+// one request of nothing but open parens would take the whole server down with it.
+const maxQueryDepth = 32
+
 // parseQuery compiles a raw query string, or returns nil when it holds no terms
 // (an all-match). A nil *searchQuery matches every asset.
 func parseQuery(s string) *searchQuery {
-	toks := tokenize(s)
+	if len(s) > maxQueryBytes {
+		s = s[:maxQueryBytes]
+	}
+	toks := dropUnmatchedClose(tokenize(s))
 	if len(toks) == 0 {
 		return nil
 	}
 	p := &parser{toks: toks}
-	return &searchQuery{root: p.parseOr()}
+	// Parsing runs to the end of the input rather than stopping at the first thing it
+	// cannot place, so no term the user typed is silently discarded. With unmatched
+	// closes already gone this is a single pass; the loop is what keeps that true if
+	// the tokenizer ever grows a token the grammar does not expect.
+	var kids []searchNode
+	for p.pos < len(p.toks) {
+		before := p.pos
+		if k := p.parseOr(); k != nil {
+			kids = append(kids, k)
+		}
+		if p.pos == before {
+			p.pos++ // an unmatched ")" that no branch consumed; skip it and carry on
+		}
+	}
+	switch len(kids) {
+	case 0:
+		return nil
+	case 1:
+		return &searchQuery{root: kids[0]}
+	}
+	return &searchQuery{root: andNode{kids: kids}}
 }
 
 func (q *searchQuery) match(a assetindex.Asset) bool {
@@ -171,6 +204,15 @@ func tokenize(s string) []token {
 			continue
 		}
 		if leadingDash && field == "" && value == "" {
+			// The term loop stops at "(", so a dash directly before a group arrives here
+			// with nothing attached. It negates the group: reading it as a literal "-"
+			// instead would AND a term the user never typed onto the group they meant to
+			// exclude, and "-(a OR b)" would match nothing rather than everything else.
+			if i < n && r[i] == '(' {
+				toks = append(toks, token{kind: tokLParen, neg: true})
+				i++
+				continue
+			}
 			value = "-" // a lone '-' is a literal term, not a negation
 			leadingDash = false
 		}
@@ -179,14 +221,38 @@ func tokenize(s string) []token {
 	return toks
 }
 
+// dropUnmatchedClose removes ")" tokens that close nothing. Left in the stream one
+// ends the expression where it sits and everything after it goes unread — ")sword"
+// would compile to no terms at all and match the whole library, and "a OR )b" would
+// lose the alternative. Removing them is what lets the rest of a mistyped query
+// still mean what it says.
+func dropUnmatchedClose(toks []token) []token {
+	out := toks[:0]
+	depth := 0
+	for _, t := range toks {
+		switch t.kind {
+		case tokLParen:
+			depth++
+		case tokRParen:
+			if depth == 0 {
+				continue
+			}
+			depth--
+		}
+		out = append(out, t)
+	}
+	return out
+}
+
 func isSearchField(name string) bool {
 	_, ok := searchFields[name]
 	return ok
 }
 
 type parser struct {
-	toks []token
-	pos  int
+	toks  []token
+	pos   int
+	depth int
 }
 
 func (p *parser) peek() (token, bool) {
@@ -248,9 +314,20 @@ func (p *parser) parsePrimary() searchNode {
 	t := p.toks[p.pos]
 	p.pos++
 	if t.kind == tokLParen {
+		if p.depth >= maxQueryDepth {
+			// Past the depth cap the group is read but not built: skip to its close so
+			// the rest of the query still parses, rather than recursing without bound.
+			p.skipGroup()
+			return nil
+		}
+		p.depth++
 		inner := p.parseOr()
+		p.depth--
 		if nt, ok := p.peek(); ok && nt.kind == tokRParen {
 			p.pos++
+		}
+		if t.neg && inner != nil {
+			return notNode{kid: inner}
 		}
 		return inner // nil when the group held no terms
 	}
@@ -262,4 +339,20 @@ func (p *parser) parsePrimary() searchNode {
 		node = notNode{kid: node}
 	}
 	return node
+}
+
+// skipGroup consumes tokens through the close of a group whose open paren was just
+// read, tracking nesting so an inner group's close does not end the outer one.
+func (p *parser) skipGroup() {
+	for depth := 1; p.pos < len(p.toks); p.pos++ {
+		switch p.toks[p.pos].kind {
+		case tokLParen:
+			depth++
+		case tokRParen:
+			if depth--; depth == 0 {
+				p.pos++
+				return
+			}
+		}
+	}
 }

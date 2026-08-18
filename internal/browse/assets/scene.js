@@ -408,6 +408,35 @@ function dispose(object) {
   });
 }
 
+// rigEntry describes an asset as a rig a clip can play on, or null when it is not one.
+// Several skeletons carrying the same bone names is one character whose props (a sword,
+// a helmet) each ship as their own skinned mesh on a copy of the rig — nested, so posing
+// the outer copy carries the props with it. Several *different* skeletons is a showcase
+// file packing many characters into one mesh; there the duplicate names bind ambiguously
+// and shred the pose, so it never becomes a rig. Bone names are recorded deduped: a
+// replicated skeleton would otherwise count its bones once per copy, which reads as a
+// showcase mesh to match().
+function rigEntry(item, root) {
+  const skels = new Set();
+  root.traverse((n) => { if (n.isSkinnedMesh && n.skeleton) skels.add(n.skeleton); });
+  const families = new Set([...skels].map((s) => s.bones.map((b) => b.name).sort().join('|')));
+  if (families.size > 1) return null;
+  const bones = [...new Set(boneNames(root))];
+  if (!isRenderable(root) || bones.length < 10) return null;
+  return { id: item.id, name: item.name, ext: item.ext, bones, vendor: item.vendor };
+}
+
+// rigCandidates searches the library for assets that might serve as a rig. Animations
+// are searched alongside models because a body shipped inside an animation pack is
+// classified as an animation itself — nothing in its name marks it as the rig — so
+// searching models alone hides the very character a pack's own clips need.
+async function rigCandidates(q, vendor, limit) {
+  const url = `/api/assets?type=model&type=animation&limit=${limit}`
+    + (vendor ? `&vendor=${encodeURIComponent(vendor)}` : '')
+    + `&q=${encodeURIComponent(q)}`;
+  try { return (await (await fetch(url)).json()).items || []; } catch { return []; }
+}
+
 // ---- character registry: match a clip-only animation to a rig it can play on ----
 // A skinned character mesh whose bone names cover a clip's tracks can play that clip
 // directly (proven for the Synty rig: the native body and the clips share a rest
@@ -462,24 +491,19 @@ const CharRegistry = {
   isPinned(id) { return !!(this.list().find((x) => x.id === id) || {}).pinned; },
   async register(item) {
     const known = this.list().find((e) => e.id === item.id);
-    if (known) { // already loaded; only backfill a missing vendor so legacy caches scope
+    // Trust a known entry only when its bones were recorded one name per bone; an entry
+    // holding a name per bone *instance* predates rigEntry and reads as a showcase mesh
+    // to match(), so reload it rather than keeping it permanently unmatchable.
+    if (known && known.bones.length === new Set(known.bones).size) {
       if (item.vendor && known.vendor !== item.vendor) { known.vendor = item.vendor; this.save(this.list().map((e) => e.id === item.id ? known : e)); }
       return true;
     }
     let root;
     try { root = await loadModel(contentURL(item.id), item.ext); } catch { return false; }
-    const bones = boneNames(root);
-    // A showcase FBX packs several characters into one mesh (multiple skeletons, duplicate
-    // bone names like two "Hips"); those can't be posed cleanly — the retarget bind map and
-    // three.js property bindings resolve the name ambiguously and shred the character. Only
-    // register a single-skeleton body (a clean rig may still carry a few incidental duplicate
-    // helper-bone names, so gate on skeleton count, not on any duplicate).
-    const skels = new Set();
-    root.traverse((n) => { if (n.isSkinnedMesh && n.skeleton) skels.add(n.skeleton); });
-    const rigged = isRenderable(root) && bones.length >= 10 && skels.size <= 1;
+    const entry = rigEntry(item, root);
     dispose(root);
-    if (rigged) this.add({ id: item.id, name: item.name, ext: item.ext, bones, vendor: item.vendor });
-    return rigged;
+    if (entry) this.add(entry);
+    return !!entry;
   },
   // Lazily discover a few character bodies by name so auto-match works before the
   // user has opened a matching character. Runs once per session; bounded; add()
@@ -502,7 +526,7 @@ const CharRegistry = {
   },
   // When the seed didn't cover a clip's rig, look for a body in the clip's own vendor
   // (a clip's native character usually ships in the same vendor's packs).
-  async discoverForVendor(vendor, want) {
+  async discoverForVendor(vendor, want, pack) {
     if (!vendor) return;
     // Load candidate bodies until one actually covers this clip (a single showcase mesh can
     // win by bone count yet be a multi-skeleton mesh register now rejects, and some bodies
@@ -510,16 +534,25 @@ const CharRegistry = {
     // rig; bound the loads so a vendor without a match doesn't scan the whole library.
     const seen = new Set(this.list().map((e) => e.id));
     let loaded = 0;
-    for (const t of ['Character', 'Hero', 'Human', 'Knight', 'Warrior', 'Body', 'Model', 'Base']) {
-      let items;
-      try { items = (await (await fetch(`/api/assets?type=model&limit=8&vendor=${encodeURIComponent(vendor)}&q=${encodeURIComponent(t)}`)).json()).items || []; } catch { continue; }
+    // Reports whether the search is over — either a rig now covers the clip, or the
+    // per-vendor load budget is spent.
+    const consider = async (items) => {
       for (const it of items) {
-        if (loaded >= 14) return;
+        if (loaded >= 14) return true;
         if (seen.has(it.id)) continue;
         seen.add(it.id); loaded++;
         await this.register(it);
-        if (want && this.match(want, vendor)) return;
+        if (want && this.match(want, vendor)) return true;
       }
+      return false;
+    };
+    // The pack shipping the clips usually ships their body too, under whatever name its
+    // vendor happens to use. Weight finds it where the name terms below cannot: a rigged
+    // character carries mesh and skin data no clip file has, so it is the heaviest thing
+    // in an animation pack by a wide margin.
+    if (pack && await consider((await rigCandidates(pack, vendor, 100)).sort((a, b) => b.size - a.size).slice(0, 3))) return;
+    for (const t of ['Character', 'Hero', 'Human', 'Knight', 'Warrior', 'Body', 'Model', 'Base']) {
+      if (await consider(await rigCandidates(t, vendor, 8))) return;
     }
   },
 };
@@ -527,5 +560,5 @@ const CharRegistry = {
 export {
   loadModel, loadSidekick, normalizeClip, boneNames, clipBones, clipsForAsset, loadRMClips,
   coversBones, posedBox, frameBox, isRenderable, captureRootRest, uprightRig, prepareClipRig,
-  cloneRig, poseAt, retargetedFor, stripRootMotion, dispose, CharRegistry, CLAY, _posedV,
+  cloneRig, poseAt, retargetedFor, stripRootMotion, dispose, CharRegistry, rigEntry, rigCandidates, CLAY, _posedV,
 };

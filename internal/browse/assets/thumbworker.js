@@ -20,6 +20,13 @@ if (typeof document === 'undefined') {
   globalThis.document = { createElementNS: () => fakeImage(), createElement: () => fakeImage() };
 }
 
+// An FBX that embeds its textures as binary content hands them to the renderer as blob
+// URLs minted through window.URL, and a worker has a global URL but no window at all —
+// without this the whole parse throws and the card keeps its category icon.
+if (typeof window === 'undefined') {
+  globalThis.window = { URL };
+}
+
 import * as THREE from '/static/vendor/three/three.module.min.js';
 import {
   loadModel, loadSidekick, clipsForAsset, prepareClipRig, poseAt, stripRootMotion, isRenderable,
@@ -99,7 +106,7 @@ async function buildStandalone(asset) {
   }
   const clips = clipsForAsset(obj, asset);
   dispose(obj);
-  return clips.length ? await buildPosed(clips[0], asset.vendor, rootRest) : false;
+  return clips.length ? await buildPosed(clips[0], asset, rootRest) : false;
 }
 
 async function buildShared(asset, key) {
@@ -119,7 +126,7 @@ async function buildShared(asset, key) {
     return true;
   }
   const cs = clipsForAsset(ctx.obj, asset);
-  return cs.length ? await buildPosed(cs[0], asset.vendor, ctx.rootRest) : false;
+  return cs.length ? await buildPosed(cs[0], asset, ctx.rootRest) : false;
 }
 
 async function loadSharedFile(asset) {
@@ -141,10 +148,11 @@ function evictFiles() {
   }
 }
 
-async function rigFor(clip, vendor) {
+async function rigFor(clip, asset) {
+  const vendor = asset.vendor;
   await CharRegistry.seed();
   let m = CharRegistry.match(clipBonesOf(clip), vendor);
-  if (!m) { await CharRegistry.discoverForVendor(vendor, clipBonesOf(clip)); m = CharRegistry.match(clipBonesOf(clip), vendor); }
+  if (!m) { await CharRegistry.discoverForVendor(vendor, clipBonesOf(clip), asset.pack); m = CharRegistry.match(clipBonesOf(clip), vendor); }
   if (!m) return null;
   if (!rigs.has(m.id)) {
     const rig = await loadModel(contentURL(m.id), m.ext)
@@ -159,8 +167,9 @@ function clipBonesOf(clip) {
   return [...new Set(clip.tracks.map((t) => t.name.split('.')[0]))];
 }
 
-async function buildPosed(clip, vendor, rootRest) {
-  const template = await rigFor(clip, vendor);
+async function buildPosed(clip, asset, rootRest) {
+  const vendor = asset.vendor;
+  const template = await rigFor(clip, asset);
   if (!template) return false;
   const rig = cloneRig(template);
   const refBox = prepareClipRig(rig, vendor === 'synty' ? null : rootRest);

@@ -164,10 +164,9 @@ func TestLookupUnknownID(t *testing.T) {
 func TestSaveLoadRefresh(t *testing.T) {
 	root, mk := libRoot(t)
 	cacheDir := t.TempDir()
-	cachePath := filepath.Join(cacheDir, "index.json")
 	writeZip(t, mk("synty", "P", "P_SourceFiles_v1.zip"), map[string]string{"A/x.fbx": "X"})
 
-	ix, err := LoadOrBuild(Options{Root: root, CacheDir: cacheDir}, cachePath, false, nil)
+	ix, err := LoadOrBuild(Options{Root: root, CacheDir: cacheDir}, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,7 +176,7 @@ func TestSaveLoadRefresh(t *testing.T) {
 	}
 
 	// Reload from cache and refresh: same count, ids resolve.
-	ix2, err := LoadOrBuild(Options{Root: root, CacheDir: cacheDir}, cachePath, false, nil)
+	ix2, err := LoadOrBuild(Options{Root: root, CacheDir: cacheDir}, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -190,7 +189,7 @@ func TestSaveLoadRefresh(t *testing.T) {
 
 	// Add a loose file, refresh picks it up.
 	os.WriteFile(mk("explosive", "R", "new.glb"), []byte("G"), 0o644)
-	ix3, err := LoadOrBuild(Options{Root: root, CacheDir: cacheDir}, cachePath, false, nil)
+	ix3, err := LoadOrBuild(Options{Root: root, CacheDir: cacheDir}, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,7 +212,7 @@ func TestSaveLoadRefresh(t *testing.T) {
 	if err := os.RemoveAll(filepath.Join(root, "explosive")); err != nil {
 		t.Fatal(err)
 	}
-	ix4, err := LoadOrBuild(Options{Root: root, CacheDir: cacheDir}, cachePath, false, nil)
+	ix4, err := LoadOrBuild(Options{Root: root, CacheDir: cacheDir}, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -232,10 +231,9 @@ func TestSaveLoadRefresh(t *testing.T) {
 func TestRefreshRebuildsAcrossAnIndexVersion(t *testing.T) {
 	root, mk := libRoot(t)
 	cacheDir := t.TempDir()
-	cachePath := filepath.Join(cacheDir, "index.json")
 	writeZip(t, mk("synty", "P", "P_SourceFiles_v1.zip"), map[string]string{"A/x.fbx": "X"})
 
-	ix, err := LoadOrBuild(Options{Root: root, CacheDir: cacheDir}, cachePath, false, nil)
+	ix, err := LoadOrBuild(Options{Root: root, CacheDir: cacheDir}, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

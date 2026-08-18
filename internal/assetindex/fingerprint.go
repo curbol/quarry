@@ -19,7 +19,15 @@ import (
 // distinct files in one library is negligible, and the only cost of one would be a
 // spurious shared tag.
 
+// crcFingerprint builds the print for a known CRC. A zero CRC over non-empty bytes
+// is not a fingerprint but the absence of one — some writers leave the field unset
+// in the central directory — so it degrades to "" (untaggable) rather than to a
+// constant every such entry of the same size would share, and silently tag together.
+// An empty file's CRC is genuinely zero, and its size says so.
 func crcFingerprint(crc uint32, size int64) string {
+	if crc == 0 && size > 0 {
+		return ""
+	}
 	return "crc32:" + strconv.FormatUint(uint64(crc), 16) + ":" + strconv.FormatInt(size, 10)
 }
 
@@ -27,19 +35,20 @@ func unityFingerprint(guid string) string {
 	return "uguid:" + guid
 }
 
-// looseFingerprint reads a loose file once to CRC32 its bytes. It returns "" (a
-// non-taggable asset) rather than an error when the file cannot be read, so a
-// single unreadable file never fails a whole scan.
-func looseFingerprint(path string) string {
+// looseFingerprint reads a loose file once to CRC32 its bytes. A read failure is
+// returned rather than swallowed: an asset with no fingerprint is silently
+// untaggable and unlinkable, and the caller records the file as a skip instead of
+// indexing a card that cannot be tagged and would not open either.
+func looseFingerprint(path string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return ""
+		return "", err
 	}
 	defer f.Close()
 	h := crc32.NewIEEE()
 	n, err := io.Copy(h, f)
 	if err != nil {
-		return ""
+		return "", err
 	}
-	return crcFingerprint(h.Sum32(), n)
+	return crcFingerprint(h.Sum32(), n), nil
 }

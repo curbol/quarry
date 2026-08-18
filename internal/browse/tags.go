@@ -2,10 +2,11 @@ package browse
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
+	"slices"
 	"strings"
 
-	"github.com/curbol/quarry/internal/assetindex"
 	"github.com/curbol/quarry/internal/tagstore"
 )
 
@@ -45,17 +46,28 @@ func (s *server) resolveTags(dtos []assetDTO) {
 }
 
 func (s *server) unionTagsLocked(fps []string) []string {
+	// The overwhelmingly common card has one fingerprint, and TagsFor already returns
+	// a fresh sorted slice. Taking the general path there would allocate a map and a
+	// second slice per card, across the whole library, to reproduce it.
+	if len(fps) == 1 {
+		return s.store.TagsFor(fps[0])
+	}
 	set := map[string]bool{}
 	for _, fp := range fps {
 		for _, id := range s.store.TagsFor(fp) {
 			set[id] = true
 		}
 	}
+	if len(set) == 0 {
+		return nil
+	}
 	return sortedSet(set)
 }
 
 // filterByTags keeps cards matching the requested tags against the card's union tag
 // set: AND requires all, OR (the default) requires any.
+//
+// It compacts dtos in place, so the caller must not keep using the slice it passed.
 func filterByTags(dtos []assetDTO, tags []string, mode string) []assetDTO {
 	if len(tags) == 0 {
 		return dtos
@@ -63,28 +75,26 @@ func filterByTags(dtos []assetDTO, tags []string, mode string) []assetDTO {
 	and := mode == "and"
 	out := dtos[:0]
 	for _, d := range dtos {
-		have := make(map[string]bool, len(d.Tags))
-		for _, t := range d.Tags {
-			have[t] = true
-		}
-		if matchTags(have, tags, and) {
+		if matchTags(d.Tags, tags, and) {
 			out = append(out, d)
 		}
 	}
 	return out
 }
 
-func matchTags(have map[string]bool, want []string, and bool) bool {
+// matchTags tests a card's tag set against the requested ones. Both sides are a
+// handful of entries at most, so a linear scan beats building a map per card.
+func matchTags(have, want []string, and bool) bool {
 	if and {
 		for _, t := range want {
-			if !have[t] {
+			if !slices.Contains(have, t) {
 				return false
 			}
 		}
 		return true
 	}
 	for _, t := range want {
-		if have[t] {
+		if slices.Contains(have, t) {
 			return true
 		}
 	}
@@ -93,8 +103,12 @@ func matchTags(have map[string]bool, want []string, and bool) bool {
 
 func (s *server) handleTags(w http.ResponseWriter, r *http.Request) {
 	s.tagsMu.RLock()
-	defer s.tagsMu.RUnlock()
-	writeJSON(w, s.paletteLocked())
+	palette := s.paletteLocked()
+	s.tagsMu.RUnlock()
+	// Encoded after the unlock: Go's RWMutex queues new readers behind a waiting
+	// writer, so holding this across the response would let one slow client stall
+	// every tag write too.
+	writeJSON(w, palette)
 }
 
 func (s *server) handleTagCreate(w http.ResponseWriter, r *http.Request) {
@@ -221,17 +235,23 @@ func (s *server) handleAssign(w http.ResponseWriter, r *http.Request) {
 func (s *server) resolveRelated(dtos []assetDTO) {
 	s.tagsMu.RLock()
 	defer s.tagsMu.RUnlock()
+	// With no links at all there is nothing any card could relate to, and the loop
+	// below would allocate two maps per card across the whole result set to prove it.
+	if !s.store.HasGroups() {
+		return
+	}
 	for i := range dtos {
-		own := make(map[string]bool, len(dtos[i].Fingerprints))
-		for _, fp := range dtos[i].Fingerprints {
-			own[fp] = true
-		}
-		rel := map[string]bool{}
-		for _, fp := range dtos[i].Fingerprints {
+		own := dtos[i].Fingerprints
+		var rel map[string]bool
+		for _, fp := range own {
 			for _, r := range s.store.Related(fp) {
-				if !own[r] {
-					rel[r] = true
+				if slices.Contains(own, r) {
+					continue
 				}
+				if rel == nil {
+					rel = map[string]bool{}
+				}
+				rel[r] = true
 			}
 		}
 		if len(rel) > 0 {
@@ -325,18 +345,18 @@ func (s *server) handleRelated(w http.ResponseWriter, r *http.Request) {
 	}
 	s.tagsMu.RUnlock()
 
-	var assets []assetindex.Asset
-	seen := map[string]bool{}
+	var sel []int32
+	seen := map[int32]bool{}
 	for rfp := range related {
-		for _, a := range s.byFP[rfp] {
-			if seen[a.ID] {
+		for _, ai := range s.byFP[rfp] {
+			if seen[ai] {
 				continue
 			}
-			seen[a.ID] = true
-			assets = append(assets, a)
+			seen[ai] = true
+			sel = append(sel, ai)
 		}
 	}
-	grouped := groupItems(assets)
+	grouped := groupItems(s.ix.Assets, sel)
 	s.resolveTags(grouped)
 	sortItems(grouped, "")
 	writeJSON(w, map[string]any{"items": grouped})
@@ -350,13 +370,25 @@ func (s *server) requireEnabled(w http.ResponseWriter) bool {
 	return true
 }
 
-// writeUnderLock applies one edit to the store and persists it, holding the write
-// lock across the whole sequence. mutate returns the response body, which it must
-// build while still under the lock (the palette and a card's union tags are read from
-// the store). Every write endpoint goes through here so that mutating without
-// persisting, or answering an error while memory keeps the change, is not a shape a
-// handler can express.
+// writeUnderLock applies one edit to the store, persists it, and answers. Every write
+// endpoint goes through here so that mutating without persisting, or answering an
+// error while memory keeps the change, is not a shape a handler can express.
 func (s *server) writeUnderLock(w http.ResponseWriter, mutate func() (any, error)) {
+	body, status := s.applyEdit(mutate)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	w.Write(body)
+}
+
+// applyEdit is the whole locked sequence: mutate, persist, recover on failure, and
+// encode the answer. It returns the encoded body rather than writing it, because
+// writing goes to a socket: net/http's body buffer is 2KB, so a palette any larger
+// would flush to the client while the exclusive lock is still held, and one stalled
+// reader would block every other tag read and write until it drained.
+//
+// mutate builds the response body while still under the lock, since the palette and
+// a card's union tags are read from the store.
+func (s *server) applyEdit(mutate func() (any, error)) ([]byte, int) {
 	s.tagsMu.Lock()
 	defer s.tagsMu.Unlock()
 	resp, err := mutate()
@@ -364,36 +396,51 @@ func (s *server) writeUnderLock(w http.ResponseWriter, mutate func() (any, error
 	// a memoized result set carries the tags it was built with either way.
 	s.tagsGeneration++
 	if err != nil {
-		s.reloadLocked()
-		writeErr(w, http.StatusBadRequest, err.Error())
-		return
+		status := http.StatusBadRequest
+		if errors.Is(err, tagstore.ErrStale) {
+			status = http.StatusConflict
+		}
+		return errBody(s.recoverLocked(err.Error())), status
 	}
-	if !s.persistLocked(w) {
-		return
-	}
-	writeJSON(w, resp)
-}
-
-// reloadLocked drops the in-memory store for what is on disk, so a write the file
-// never received cannot survive in memory. The caller must hold the write lock. A
-// reload that itself fails leaves the store alone: there is nothing better to use.
-func (s *server) reloadLocked() {
-	if reloaded, err := tagstore.Load(s.tagsPath); err == nil {
-		s.store = reloaded
-	}
-}
-
-// persistLocked writes the store; the caller must hold the write lock.
-func (s *server) persistLocked(w http.ResponseWriter) bool {
 	if err := tagstore.Save(s.tagsPath, s.store); err != nil {
 		// Handlers mutate the store and then persist, so a failed save would otherwise
 		// leave memory claiming more than disk holds: the UI keeps reporting the tag
 		// until a restart silently takes it away again.
-		s.reloadLocked()
-		writeErr(w, http.StatusInternalServerError, "could not save tags: "+err.Error())
-		return false
+		status := http.StatusInternalServerError
+		if errors.Is(err, tagstore.ErrStale) {
+			status = http.StatusConflict
+		}
+		return errBody(s.recoverLocked("could not save tags: " + err.Error())), status
 	}
-	return true
+	b, encErr := json.Marshal(resp)
+	if encErr != nil {
+		return errBody("could not encode the response: " + encErr.Error()), http.StatusInternalServerError
+	}
+	return b, http.StatusOK
+}
+
+// recoverLocked drops the in-memory store for what is on disk, so a write the file
+// never received cannot survive in memory, and returns the message to answer with.
+// The caller must hold the write lock.
+//
+// A reload that itself fails is the one case where memory and disk genuinely diverge
+// and nothing can be done about it, so it is named in the response rather than
+// swallowed: the client has just been told the write was rejected, and without this
+// the UI would keep showing the edit with no way to know it is not real.
+func (s *server) recoverLocked(msg string) string {
+	if err := s.store.Reload(s.tagsPath); err != nil {
+		return msg + " (and reloading the store from disk failed: " + err.Error() +
+			"; what is shown may be ahead of the file until quarry is restarted)"
+	}
+	return msg
+}
+
+func errBody(msg string) []byte {
+	b, err := json.Marshal(map[string]string{"error": msg})
+	if err != nil {
+		return []byte(`{"error":"could not encode the error"}`)
+	}
+	return b
 }
 
 // maxTagBodyBytes bounds a write request. The payloads are a handful of

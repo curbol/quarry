@@ -41,6 +41,11 @@ func glbAnimationNames(path string) ([]string, error) {
 	if chunkLen > maxGLBJSON {
 		return nil, fmt.Errorf("glb JSON chunk too large (%d bytes): %s", chunkLen, path)
 	}
+	// A corrupt header can claim a chunk larger than the file, which would otherwise
+	// allocate up to the cap before ReadFull fails on it.
+	if fi, err := f.Stat(); err == nil && int64(chunkLen) > fi.Size()-int64(len(head)) {
+		return nil, fmt.Errorf("glb JSON chunk claims %d bytes past the end of %s", chunkLen, path)
+	}
 	jb := make([]byte, chunkLen)
 	if _, err := io.ReadFull(f, jb); err != nil {
 		return nil, err

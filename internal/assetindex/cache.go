@@ -1,7 +1,6 @@
 package assetindex
 
 import (
-	"bufio"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -20,7 +19,7 @@ import (
 // also keys the unpacked-archive tree, so a change to what extraction writes belongs
 // here too: an archive whose bytes never changed keeps its fingerprint, and only the
 // version tells the old extraction apart from what the current code would produce.
-const indexVersion = 16
+const indexVersion = 17
 
 // SkippedFile records a library file the scan could not read. A damaged archive
 // costs its own contents, not the rest of the library, so the failure is carried
@@ -51,6 +50,9 @@ type Index struct {
 
 	cacheDir string
 	byID     map[string]*Asset
+
+	rootsOnce     sync.Once
+	resolvedRoots []string
 
 	extractMu   sync.Mutex
 	extractions map[string]*extraction
@@ -121,38 +123,55 @@ func (ix *Index) Refresh() error {
 		return err
 	}
 	ix.LinkRoots = linkRoots
-	oldByArchive := map[string][]Asset{}
-	oldByLoose := map[string][]Asset{}
-	for _, a := range ix.Assets {
+	// Positions, not values: an Asset is ~20 strings, so mapping the whole set by value
+	// would hold a second copy of a 150k-asset library alongside the one being rebuilt.
+	oldByArchive := map[string][]int{}
+	oldByLoose := map[string][]int{}
+	for i, a := range ix.Assets {
 		if a.Source.Kind == SourceLoose {
-			oldByLoose[a.Source.FilePath] = append(oldByLoose[a.Source.FilePath], a)
+			oldByLoose[a.Source.FilePath] = append(oldByLoose[a.Source.FilePath], i)
 		} else {
-			oldByArchive[a.Source.ArchivePath] = append(oldByArchive[a.Source.ArchivePath], a)
+			oldByArchive[a.Source.ArchivePath] = append(oldByArchive[a.Source.ArchivePath], i)
 		}
 	}
 	newPrint := map[string]string{}
 	newLoose := map[string]string{}
 	var assets []Asset
-	for _, e := range entries {
-		if e.kind == SourceLoose {
-			if fp, err := fingerprint(e.path); err == nil {
-				newLoose[e.path] = fp
-				if old, ok := oldByLoose[e.path]; ok && ix.LoosePrint[e.path] == fp {
-					assets = append(assets, old...)
-					continue
-				}
-			}
-			assets = append(assets, looseAssets(e)...)
-			continue
+	reuse := func(idx []int) {
+		for _, i := range idx {
+			assets = append(assets, ix.Assets[i])
 		}
+	}
+	for _, e := range entries {
 		fp, err := fingerprint(e.path)
 		if err != nil {
 			skipped = append(skipped, SkippedFile{RelPath: e.rel, Reason: err.Error()})
 			continue
 		}
+		if e.kind == SourceLoose {
+			if ix.LoosePrint[e.path] == fp {
+				newLoose[e.path] = fp
+				reuse(oldByLoose[e.path])
+				continue
+			}
+			a, skip := looseAssets(e)
+			// A failed derivation is deliberately left out of newLoose: the stat print
+			// describes the file, not whether reading it worked, so caching one would
+			// keep serving the degraded result even after the cause was fixed.
+			if skip != nil {
+				skipped = append(skipped, *skip)
+			} else {
+				newLoose[e.path] = fp
+			}
+			assets = append(assets, a...)
+			continue
+		}
 		newPrint[e.path] = fp
-		if old, ok := oldByArchive[e.path]; ok && ix.ArchivePrint[e.path] == fp {
-			assets = append(assets, old...)
+		// Keyed on the print alone, not on having cached assets: an archive whose every
+		// entry was dropped by dedup leaves no assets behind, and demanding some would
+		// re-decompress it on every single run.
+		if ix.ArchivePrint[e.path] == fp {
+			reuse(oldByArchive[e.path])
 			continue
 		}
 		a, skip := archiveAssets(e)
@@ -170,17 +189,21 @@ func (ix *Index) Refresh() error {
 	return nil
 }
 
-// Load reads a cached index from disk and rebuilds its id lookup. The JSON is
-// decoded as a stream: a full-library cache runs past 100MB, and reading it whole
-// first would hold those bytes alongside the index they decode into.
-func Load(cachePath, cacheDir string) (*Index, error) {
+// load reads a cached index from disk and rebuilds its id lookup. It is unexported
+// because a loaded index is not yet a usable one: nothing here checks Version or
+// Root, and pairing a stale schema with current code is what Refresh's re-derive
+// guard and LoadOrBuild's match exist to prevent. Callers want LoadOrBuild.
+//
+// encoding/json buffers a whole top-level value before decoding it, so a 100MB-plus
+// cache is briefly resident twice. See save for why that is accepted.
+func load(cachePath, cacheDir string) (*Index, error) {
 	f, err := os.Open(cachePath)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
 	var ix Index
-	if err := json.NewDecoder(bufio.NewReader(f)).Decode(&ix); err != nil {
+	if err := json.NewDecoder(f).Decode(&ix); err != nil {
 		return nil, err
 	}
 	ix.cacheDir = cacheDir
@@ -194,30 +217,53 @@ func Load(cachePath, cacheDir string) (*Index, error) {
 	return &ix, nil
 }
 
-// Save writes the index JSON, creating parent dirs. The write goes to a temp file
+// save writes the index JSON, creating parent dirs. The write goes to a temp file
 // in the destination dir and is renamed into place: an interrupted in-place write
-// would leave a truncated cache, and rebuilding one costs a full library scan. The
-// JSON is encoded as a stream, so a 100MB-plus cache is never also held whole in
-// memory beside the index it came from.
-func (ix *Index) Save(cachePath string) error {
+// would leave a truncated cache, and rebuilding one costs a full library scan.
+//
+// encoding/json marshals a top-level value whole before writing it, so a
+// 100MB-plus cache is briefly resident twice, once as the index and once as its
+// JSON. That is the cost of a single self-describing document, paid once per run
+// off the serving path; capping it would mean a record-per-line format and the
+// migration that comes with it.
+func (ix *Index) save(cachePath string) error {
 	dir := filepath.Dir(cachePath)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
 	return safewrite.Atomic(cachePath, ".browse-index-*", func(w io.Writer) error {
-		buf := bufio.NewWriter(w)
-		if err := json.NewEncoder(buf).Encode(ix); err != nil {
-			return err
-		}
-		return buf.Flush()
+		return json.NewEncoder(w).Encode(ix)
 	})
+}
+
+// stateDir is where one library's regenerable state lives: its cached index and its
+// unpacked-archive tree. It is keyed by scan root because both describe one library.
+// Sharing a cache dir between roots without this key means each run's PruneUnpacked
+// deletes the other root's extractions — including out from under a second instance
+// already serving them, which `--addr` exists to allow.
+func stateDir(cacheDir, absRoot string) string {
+	sum := sha256.Sum256([]byte(absRoot))
+	return filepath.Join(cacheDir, "roots", hex.EncodeToString(sum[:6]))
+}
+
+func (ix *Index) stateDir() string { return stateDir(ix.cacheDir, ix.Root) }
+
+// cachePath is where this index's JSON lives. Empty when the index has no cache dir,
+// which is also the state in which nothing is written.
+func (ix *Index) cachePath() string {
+	if ix.cacheDir == "" {
+		return ""
+	}
+	return filepath.Join(ix.stateDir(), "index.json")
 }
 
 // LoadOrBuild returns a usable index: a fresh build when reindex is set or no valid
 // cache exists for these options, otherwise the cached index refreshed against the
-// current tree. The result is written back to cachePath.
+// current tree. Where the cache lives is derived from the options, so no caller can
+// pair one root's index with another's path. With no cache dir the index is built
+// fresh every time and nothing is written.
 // warn reports a non-fatal condition; nil discards.
-func LoadOrBuild(opt Options, cachePath string, reindex bool, warn func(string)) (*Index, error) {
+func LoadOrBuild(opt Options, reindex bool, warn func(string)) (*Index, error) {
 	if warn == nil {
 		warn = func(string) {}
 	}
@@ -226,15 +272,19 @@ func LoadOrBuild(opt Options, cachePath string, reindex bool, warn func(string))
 		return nil, err
 	}
 	opt.Root = absRoot
-	if !reindex {
+	cachePath := ""
+	if opt.CacheDir != "" {
+		cachePath = filepath.Join(stateDir(opt.CacheDir, absRoot), "index.json")
+	}
+	if !reindex && cachePath != "" {
 		// FollowSymlinks is part of the match: it decides what the walk covers, so a
 		// cache built the other way is describing a different library.
-		if ix, err := Load(cachePath, opt.CacheDir); err == nil &&
+		if ix, err := load(cachePath, opt.CacheDir); err == nil &&
 			ix.Root == absRoot && ix.Version == indexVersion && ix.FollowSymlinks == opt.FollowSymlinks {
 			if err := ix.Refresh(); err != nil {
 				return nil, err
 			}
-			saveCache(ix, cachePath, warn)
+			saveCache(ix, warn)
 			return ix, nil
 		}
 	}
@@ -242,15 +292,19 @@ func LoadOrBuild(opt Options, cachePath string, reindex bool, warn func(string))
 	if err != nil {
 		return nil, err
 	}
-	saveCache(ix, cachePath, warn)
+	saveCache(ix, warn)
 	return ix, nil
 }
 
 // saveCache persists the index. The cache is expendable and the index in hand is
 // usable without it, so a write failure is not fatal — but it is not swallowed
 // either: silently failing here re-pays a whole library scan on every run.
-func saveCache(ix *Index, cachePath string, warn func(string)) {
-	if err := ix.Save(cachePath); err != nil {
+func saveCache(ix *Index, warn func(string)) {
+	p := ix.cachePath()
+	if p == "" {
+		return
+	}
+	if err := ix.save(p); err != nil {
 		warn(fmt.Sprintf("could not write the index cache (%v); the library will be rescanned next run", err))
 	}
 }

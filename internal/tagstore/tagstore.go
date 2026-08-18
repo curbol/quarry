@@ -19,6 +19,7 @@
 package tagstore
 
 import (
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
@@ -27,6 +28,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/BurntSushi/toml"
 
@@ -40,8 +42,15 @@ const FileName = "quarry.tags.toml"
 // Discover walks up from startDir looking for a store named FileName, returning its
 // path and true on the first hit, or ("", false) at the filesystem root. A hit means
 // the working directory sits inside a project that keeps its own tags.
+//
+// The walk is lexical, which is what makes it terminate: resolving each parent would
+// let a symlink cycle run forever. That means startDir has to be absolute for the
+// walk to have anywhere to go, so it is made absolute here rather than assumed.
 func Discover(startDir string) (string, bool) {
-	dir := startDir
+	dir, err := filepath.Abs(startDir)
+	if err != nil {
+		return "", false
+	}
 	for {
 		p := filepath.Join(dir, FileName)
 		if _, err := os.Stat(p); err == nil {
@@ -93,7 +102,33 @@ type Store struct {
 	// group points at the same set instance (which includes the member itself), so a
 	// merge is a repoint and membership/lookup is O(1).
 	groups map[string]map[string]bool
+	// loadedFrom and stamp describe the file this store was read from, so Save can tell
+	// whether anything else has written it since. A zero stamp means the file did not
+	// exist at the time, which is itself worth detecting: something creating it before
+	// the first save is the same lost edit. Saving to a different path is a fresh write
+	// rather than a rewrite, so the check does not apply there.
+	loadedFrom string
+	stamp      fileStamp
 }
+
+// fileStamp is the cheap identity of a file on disk. Size and mtime are what a
+// concurrent write changes, and reading them costs one stat.
+type fileStamp struct {
+	size    int64
+	modTime time.Time
+}
+
+func stampOf(path string) fileStamp {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return fileStamp{}
+	}
+	return fileStamp{size: fi.Size(), modTime: fi.ModTime()}
+}
+
+// ErrStale reports that the store on disk changed after this one was loaded, so
+// saving would silently discard whatever made that change.
+var ErrStale = errors.New("the tag store on disk has changed since it was loaded")
 
 // New returns an empty store.
 func New() *Store {
@@ -187,7 +222,10 @@ func (s *Store) Rename(old, neu string) error {
 	}
 	oldColor, ok := s.colors[old]
 	if !ok {
-		return nil
+		// Reported rather than treated as a no-op: a caller that follows a rename with
+		// a color edit would otherwise define the new id from nothing, and answer
+		// "renamed" while inventing a tag no asset carries.
+		return fmt.Errorf("no tag %q to rename", old)
 	}
 	if _, exists := s.colors[neu]; !exists {
 		s.colors[neu] = oldColor
@@ -217,6 +255,11 @@ func (s *Store) Delete(id string) {
 
 // TagsFor returns the sorted tag ids applied to a fingerprint.
 func (s *Store) TagsFor(fp string) []string { return sortedKeys(s.assign[fp]) }
+
+// HasGroups reports whether any link group exists, so a caller resolving companions
+// across a library-sized result set can skip the whole pass when there is nothing to
+// resolve — which is the common case, since links are made deliberately and rarely.
+func (s *Store) HasGroups() bool { return len(s.groups) > 0 }
 
 // Link groups the given fingerprints so they travel together, absorbing any groups
 // they already belong to into one (so linking {A,B} then {B,C} yields {A,B,C}).
@@ -331,6 +374,7 @@ func (s *Store) Tags() []TagDef {
 // that may not run the same version, which is exactly when an unknown key shows up.
 func Load(path string) (*Store, error) {
 	s := New()
+	s.loadedFrom = path
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		return s, nil
 	}
@@ -348,15 +392,26 @@ func Load(path string) (*Store, error) {
 			"it was likely written by a newer quarry — update, or remove those keys, "+
 			"rather than let the next edit drop them", path, strings.Join(keys, ", "))
 	}
+	// A color this version cannot parse is refused for the same reason an unknown key
+	// is: the next save rewrites the file whole, so quietly substituting a default
+	// would overwrite what the user typed with something they never chose.
+	var badColors []string
 	for _, t := range f.Tags {
 		if t.ID == "" {
 			continue
 		}
-		if c, err := NormalizeColor(t.Color); err == nil {
+		switch c, err := NormalizeColor(t.Color); {
+		case err == nil:
 			s.colors[t.ID] = c
-		} else {
+		case t.Color == "":
 			s.colors[t.ID] = DefaultColor(t.ID)
+		default:
+			badColors = append(badColors, fmt.Sprintf("%s = %q", t.ID, t.Color))
 		}
+	}
+	if len(badColors) > 0 {
+		return nil, fmt.Errorf("%s holds colors quarry cannot read (%s); use #rrggbb, or remove the color to get a generated one",
+			path, strings.Join(badColors, ", "))
 	}
 	for _, a := range f.Assignments {
 		if a.Fingerprint == "" {
@@ -369,13 +424,40 @@ func Load(path string) (*Store, error) {
 	for _, g := range f.Groups {
 		s.Link(g.Fingerprints)
 	}
+	s.stamp = stampOf(path)
 	return s, nil
+}
+
+// Reload replaces the store's contents with what is on disk, in place. It is what a
+// caller uses to recover after a failed Save: the mutation that did not reach the
+// file must not survive in memory, or the UI keeps showing an edit the store does
+// not have. Reloading in place rather than handing back a new *Store is deliberate —
+// a pointer swap is a step a caller can forget while still holding the write lock.
+// On error the store is left exactly as it was; the caller then knows memory and
+// disk have diverged and can refuse further writes.
+func (s *Store) Reload(path string) error {
+	fresh, err := Load(path)
+	if err != nil {
+		return err
+	}
+	*s = *fresh
+	return nil
 }
 
 // Save writes the store at path atomically, with tags sorted by id, assignments
 // sorted by fingerprint, groups sorted by first member, and every member list
 // sorted, for minimal diffs.
+//
+// A save rewrites the whole file, so it first checks that the file is still the one
+// Load read and returns ErrStale if not. Without that, an edit made meanwhile — by
+// hand, by a checkout of a committed project store, or by a second quarry sharing
+// the user-wide one — is destroyed with no trace. Stat-then-rename leaves a window
+// too small to matter here and too expensive to close: this is one user's file, and
+// the failure being guarded against is measured in minutes, not microseconds.
 func Save(path string, s *Store) error {
+	if s.loadedFrom == path && s.stamp != stampOf(path) {
+		return fmt.Errorf("%s: %w", path, ErrStale)
+	}
 	f := fileTOML{Tags: s.Tags()}
 	fps := make([]string, 0, len(s.assign))
 	for fp, set := range s.assign {
@@ -391,9 +473,13 @@ func Save(path string, s *Store) error {
 		f.Groups = append(f.Groups, Group{Fingerprints: g})
 	}
 
-	return safewrite.Atomic(path, ".quarry-tags-*", func(w io.Writer) error {
+	if err := safewrite.Atomic(path, ".quarry-tags-*", func(w io.Writer) error {
 		return toml.NewEncoder(w).Encode(f)
-	})
+	}); err != nil {
+		return err
+	}
+	s.loadedFrom, s.stamp = path, stampOf(path)
+	return nil
 }
 
 func sortedKeys(set map[string]bool) []string {

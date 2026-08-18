@@ -44,10 +44,27 @@ func TestPlatformAssetPerPlatform(t *testing.T) {
 	}
 }
 
-func TestPlatformAssetUnsupportedOS(t *testing.T) {
-	_, err := platformAsset(releaseAssets(), "plan9", "amd64")
-	if err == nil || !strings.Contains(err.Error(), "unsupported platform") {
-		t.Errorf("expected an unsupported-platform error, got %v", err)
+// An architecture the release does not build must be refused, not quietly served the
+// x86-64 build. checkExecutable only reads the ELF magic, which every architecture
+// shares, so a wrong-arch binary passes every check and replaces a working install
+// with one that cannot run — including the `update` needed to recover from it.
+func TestPlatformAssetUnsupportedPlatform(t *testing.T) {
+	for _, c := range []struct{ goos, goarch string }{
+		{"plan9", "amd64"},
+		{"linux", "arm"},     // 32-bit Pi
+		{"linux", "386"},     //
+		{"linux", "riscv64"}, //
+		{"linux", "ppc64le"}, //
+		{"darwin", "386"},
+	} {
+		got, err := platformAsset(releaseAssets(), c.goos, c.goarch)
+		if err == nil {
+			t.Errorf("platformAsset(%s/%s) = %q; want a refusal, not another platform's build", c.goos, c.goarch, got)
+			continue
+		}
+		if !strings.Contains(err.Error(), "no release build") {
+			t.Errorf("platformAsset(%s/%s) error = %v, want it to say no build exists", c.goos, c.goarch, err)
+		}
 	}
 }
 

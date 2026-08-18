@@ -26,8 +26,9 @@ import (
 )
 
 // version is the release version, set at build time via
-// -ldflags "-X main.version=<v>". It is "dev" for local builds.
-var version = "dev"
+// -ldflags "-X main.version=<v>". A local build carries the sentinel selfupdate
+// refuses to replace.
+var version = selfupdate.DevVersion
 
 // defaultAddr is where the UI serves when --addr is not given.
 const defaultAddr = "localhost:8788"

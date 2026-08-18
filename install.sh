@@ -14,6 +14,15 @@ INSTALL_DIR="${HOME}/.local/bin"
 log()  { printf 'INFO: %s\n' "$1"; }
 err()  { printf 'ERROR: %s\n' "$1" >&2; }
 
+# The staging dir, cleaned up however the script ends — including the aborts `set -e`
+# takes on any failing command below. It is a script-level variable rather than a
+# local because a trap body runs at exit, outside the function, where a local is gone
+# (and under `set -u` referring to one there is itself an error that skips the
+# cleanup).
+INSTALL_TMP=""
+cleanup() { [[ -n "$INSTALL_TMP" ]] && rm -rf "$INSTALL_TMP"; return 0; }
+trap cleanup EXIT
+
 # Prints an auth header, or nothing when no token is available. The explicit
 # `return 0` matters under `set -e`: without it the function's status is that of the
 # `[[ -n ]]` test, so having no token would abort the script at `hdr=$(auth_header)`
@@ -25,6 +34,19 @@ auth_header() {
   fi
   [[ -n "$token" ]] && echo "Authorization: token $token"
   return 0
+}
+
+# Runs curl with the auth header, if any, fed through a config file on stdin rather
+# than as an argument. Process arguments are world-readable (/proc/<pid>/cmdline on
+# Linux, `ps` elsewhere), so `-H "Authorization: token ..."` hands the token to every
+# other account on the machine for as long as the request runs.
+curl_auth() {
+  local hdr; hdr=$(auth_header)
+  if [[ -n "$hdr" ]]; then
+    printf 'header = "%s"\n' "$hdr" | curl -fsSL --config - "$@"
+  else
+    curl -fsSL "$@"
+  fi
 }
 
 detect_platform() {
@@ -44,11 +66,9 @@ detect_platform() {
 }
 
 latest_version() {
-  local hdr; hdr=$(auth_header)
-  local opts=(-fsSL); [[ -n "$hdr" ]] && opts+=(-H "$hdr")
   # `|| true` so a 401/404 or an unmatched grep leaves VERSION empty for the check
   # below to explain, instead of `pipefail` aborting the script without a word.
-  VERSION=$(curl "${opts[@]}" "https://api.github.com/repos/${REPO}/releases/latest" \
+  VERSION=$(curl_auth "https://api.github.com/repos/${REPO}/releases/latest" \
     | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/') || true
   VERSION=${VERSION#v}
   [[ -n "$VERSION" ]] || { err "could not resolve latest version (private repo needs gh auth or GITHUB_TOKEN)"; exit 1; }
@@ -70,26 +90,34 @@ verify_binary() {
 
 install() {
   local file="${BINARY_NAME}-${VERSION}-${PLATFORM}.zip"
-  local tmp; tmp=$(mktemp -d)
+  command -v unzip >/dev/null 2>&1 || { err "unzip is required"; exit 1; }
+  mkdir -p "$INSTALL_DIR"
+  # Staged inside INSTALL_DIR, not /tmp: the final step has to be a rename, and a
+  # rename cannot cross filesystems. From /tmp (usually tmpfs) `mv` degrades to
+  # copy-then-unlink, which writes the destination in place — so an interrupt leaves
+  # a truncated binary on PATH, there is a window where it exists but is not yet
+  # executable, and re-running while quarry is up fails with ETXTBSY.
+  INSTALL_TMP=$(mktemp -d "${INSTALL_DIR}/.quarry-install-XXXXXX")
+  local tmp="$INSTALL_TMP"
+
   local hdr; hdr=$(auth_header)
-  local url
   if [[ -n "$hdr" ]]; then
     # Private repo: resolve the asset's API URL, then download with the token.
-    url=$(curl -fsSL -H "$hdr" "https://api.github.com/repos/${REPO}/releases/tags/v${VERSION}" \
+    local url
+    url=$(curl_auth "https://api.github.com/repos/${REPO}/releases/tags/v${VERSION}" \
       | grep -F -B3 "\"name\": \"${file}\"" | grep -F '"url"' | sed -E 's/.*"url": "([^"]+)".*/\1/') || true
-    [[ -n "$url" ]] || { err "asset ${file} not found in release v${VERSION}"; rm -rf "$tmp"; exit 1; }
-    curl -fsSL -H "$hdr" -H "Accept: application/octet-stream" -o "${tmp}/${file}" "$url"
+    [[ -n "$url" ]] || { err "asset ${file} not found in release v${VERSION}"; exit 1; }
+    curl_auth -H "Accept: application/octet-stream" -o "${tmp}/${file}" "$url"
   else
     curl -fsSL -o "${tmp}/${file}" "https://github.com/${REPO}/releases/download/v${VERSION}/${file}"
   fi
 
-  command -v unzip >/dev/null 2>&1 || { err "unzip is required"; rm -rf "$tmp"; exit 1; }
   unzip -q "${tmp}/${file}" -d "$tmp"
-  verify_binary "${tmp}/${BINARY_NAME}" || { rm -rf "$tmp"; exit 1; }
-  mkdir -p "$INSTALL_DIR"
+  verify_binary "${tmp}/${BINARY_NAME}"
+  chmod +x "${tmp}/${BINARY_NAME}"
+  # Same filesystem, so this is one atomic rename: PATH holds either the old binary
+  # or the complete new one, never a half-written file.
   mv "${tmp}/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
-  chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
-  rm -rf "$tmp"
   log "installed to ${INSTALL_DIR}/${BINARY_NAME}"
 }
 

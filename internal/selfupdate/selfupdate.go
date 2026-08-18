@@ -36,11 +36,16 @@ type release struct {
 	} `json:"assets"`
 }
 
+// DevVersion is the version a locally-built binary carries. It is exported because
+// the guard below and the value main stamps in have to be the same string: if they
+// drift, `update` silently starts replacing dev builds with releases.
+const DevVersion = "dev"
+
 // Run updates the binary to target (a version like "0.2.0"), or to the latest
 // release when target is empty. current is the running binary's version.
 func Run(current, target string) error {
 	current = strings.TrimSpace(current)
-	if current == "" || current == "dev" {
+	if current == "" || current == DevVersion {
 		return fmt.Errorf("this is a dev build (version %q); `update` only works on release builds — install one with install.sh", current)
 	}
 	token := resolveToken()
@@ -133,7 +138,9 @@ func fetchRelease(token, target string) (*release, error) {
 		return nil, fmt.Errorf("no releases found%s", hint)
 	}
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		// Bounded: this body goes straight into an error the user sees, and it is
+		// whatever the far end chose to send.
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
 		return nil, fmt.Errorf("GitHub API %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	var r release
@@ -143,28 +150,31 @@ func fetchRelease(token, target string) (*release, error) {
 	return &r, nil
 }
 
+// releaseSuffix maps a platform to the asset the release workflow builds for it. The
+// mapping is exhaustive rather than defaulting per OS: an architecture with no build
+// (linux/arm on a Pi, linux/386, riscv64) would otherwise be handed the x86-64
+// binary, and since checkExecutable only reads the ELF magic — which every
+// architecture shares — the wrong build would pass every check and replace a working
+// install with one that cannot run, including the `update` needed to recover.
+var releaseSuffix = map[string]string{
+	"darwin/amd64":  "mac-intel.zip",
+	"darwin/arm64":  "mac-apple.zip",
+	"linux/amd64":   "linux-intel.zip",
+	"linux/arm64":   "linux-arm64.zip",
+	"windows/amd64": "win.zip",
+	// Windows on ARM runs x86-64 binaries under emulation, and no arm64 build ships.
+	"windows/arm64": "win.zip",
+}
+
 // platformAsset returns the asset API URL for the given OS/arch, matching the label
 // suffix the release workflow uses. The platform is a parameter rather than read from
-// runtime so every branch is assertable: the release builds five of them and CI runs
-// on one, so a mapping that drifts from the workflow's labels would otherwise surface
+// runtime so every entry is assertable: the release builds a handful and CI runs on
+// one, so a mapping that drifts from the workflow's labels would otherwise surface
 // only when a user on that platform ran `quarry update`.
 func platformAsset(rel *release, goos, goarch string) (string, error) {
-	var suffix string
-	switch goos {
-	case "darwin":
-		suffix = "mac-intel.zip"
-		if goarch == "arm64" {
-			suffix = "mac-apple.zip"
-		}
-	case "linux":
-		suffix = "linux-intel.zip"
-		if goarch == "arm64" {
-			suffix = "linux-arm64.zip"
-		}
-	case "windows":
-		suffix = "win.zip"
-	default:
-		return "", fmt.Errorf("unsupported platform %s/%s", goos, goarch)
+	suffix, ok := releaseSuffix[goos+"/"+goarch]
+	if !ok {
+		return "", fmt.Errorf("no release build for %s/%s", goos, goarch)
 	}
 	for _, a := range rel.Assets {
 		if strings.HasSuffix(a.Name, suffix) {
@@ -237,8 +247,11 @@ func checkExecutable(path string) error {
 	defer f.Close()
 	head := make([]byte, 4)
 	n, err := io.ReadFull(f, head)
-	if err != nil && n == 0 {
+	switch {
+	case n == 0 && (err == io.EOF || err == io.ErrUnexpectedEOF):
 		return fmt.Errorf("downloaded binary is empty")
+	case n == 0 && err != nil:
+		return fmt.Errorf("reading the downloaded binary: %w", err)
 	}
 	head = head[:n]
 	magics, known := executableMagic[runtime.GOOS]
@@ -293,6 +306,10 @@ func download(token, url, dst string) error {
 	return safewrite.Stream(dst, resp.Body, 0o644)
 }
 
+// maxBinaryBytes caps what is unpacked from a release archive. quarry builds are a
+// few tens of MB; this is generous enough to never bite a real one.
+const maxBinaryBytes = 512 << 20
+
 func extractBinary(zipPath, dir string) (string, error) {
 	r, err := zip.OpenReader(zipPath)
 	if err != nil {
@@ -313,7 +330,10 @@ func extractBinary(zipPath, dir string) (string, error) {
 		}
 		defer rc.Close()
 		out := filepath.Join(dir, want)
-		if err := safewrite.Stream(out, rc, 0o755); err != nil {
+		// Bounded by what a plausible build could be: a zip's declared sizes are not
+		// trustworthy, and this unpacks beside the running binary, so an inflated entry
+		// would fill the user's disk before anything noticed.
+		if err := safewrite.Stream(out, io.LimitReader(rc, maxBinaryBytes), 0o755); err != nil {
 			return "", err
 		}
 		return out, nil

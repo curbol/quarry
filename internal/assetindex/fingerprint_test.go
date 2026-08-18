@@ -68,7 +68,7 @@ func TestFingerprintStableAndRefreshRecomputes(t *testing.T) {
 	os.WriteFile(loose, []byte("GLBSWORD"), 0o644)
 	writeZip(t, mk("synty", "A", "A.zip"), map[string]string{"Models/Tree.fbx": "TREEBYTES"})
 
-	ix, err := Build(root, cacheDir)
+	ix, err := Build(Options{Root: root, CacheDir: cacheDir})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +81,7 @@ func TestFingerprintStableAndRefreshRecomputes(t *testing.T) {
 	}
 
 	// A second Build of the same tree is deterministic.
-	ix2, err := Build(root, cacheDir)
+	ix2, err := Build(Options{Root: root, CacheDir: cacheDir})
 	if err != nil {
 		t.Fatal(err)
 	}

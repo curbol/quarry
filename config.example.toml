@@ -8,3 +8,9 @@
 # the tree holding your asset packs, whatever their vendor. A leading ~ is expanded.
 # Overridden by QUARRY_ROOT and by --root.
 root = "~/code/raw-assets"
+
+# Walk symlinked directories that point outside the scan root, for a library spread
+# across several drives and stitched together with links. Off by default: quarry only
+# serves files the scan covered, and following a link is what puts its target in that
+# set. Overridden by --follow-symlinks.
+# follow_symlinks = true

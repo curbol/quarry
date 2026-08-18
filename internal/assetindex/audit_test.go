@@ -33,7 +33,7 @@ func TestBuildSkipsUnreadableArchive(t *testing.T) {
 	os.WriteFile(mk("good", "Pack", "Sword.glb"), []byte("GLBBYTES"), 0o644)
 	os.WriteFile(mk("bad", "Pack", "Truncated_SourceFiles_v1.zip"), []byte("PK\x03\x04garbage"), 0o644)
 
-	ix, err := Build(root, t.TempDir())
+	ix, err := Build(Options{Root: root, CacheDir: t.TempDir()})
 	if err != nil {
 		t.Fatalf("one bad archive aborted the build: %v", err)
 	}
@@ -50,7 +50,7 @@ func TestBuildSkipsUnreadableArchive(t *testing.T) {
 func TestSaveIsAtomicAndChecked(t *testing.T) {
 	root, mk := libRoot(t)
 	os.WriteFile(mk("v", "p", "Sword.glb"), []byte("GLBBYTES"), 0o644)
-	ix, err := Build(root, t.TempDir())
+	ix, err := Build(Options{Root: root, CacheDir: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +88,7 @@ func TestSaveLoadPreservesIndexedFields(t *testing.T) {
 	})
 	os.WriteFile(mk("v", "p", "Pic.png"), encodePNG(t, 7, 11), 0o644)
 
-	ix, err := Build(root, t.TempDir())
+	ix, err := Build(Options{Root: root, CacheDir: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +125,7 @@ func TestLoadOrBuildRejectsStaleCache(t *testing.T) {
 	cacheDir := t.TempDir()
 	cachePath := filepath.Join(t.TempDir(), "browse-index.json")
 
-	ix, err := LoadOrBuild(root, cacheDir, cachePath, false, nil)
+	ix, err := LoadOrBuild(Options{Root: root, CacheDir: cacheDir}, cachePath, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +148,7 @@ func TestLoadOrBuildRejectsStaleCache(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	again, err := LoadOrBuild(root, cacheDir, cachePath, false, nil)
+	again, err := LoadOrBuild(Options{Root: root, CacheDir: cacheDir}, cachePath, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,7 +165,7 @@ func TestLoadOrBuildRebuildsFromCorruptCache(t *testing.T) {
 	if err := os.WriteFile(cachePath, []byte(`{"assets":[{"id":`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	ix, err := LoadOrBuild(root, t.TempDir(), cachePath, false, nil)
+	ix, err := LoadOrBuild(Options{Root: root, CacheDir: t.TempDir()}, cachePath, false, nil)
 	if err != nil {
 		t.Fatalf("corrupt cache should rebuild, got %v", err)
 	}
@@ -289,7 +289,7 @@ func TestBuildSkipsMalformedUnityPackage(t *testing.T) {
 	os.WriteFile(mk("bad", "Pack", "Broken_Unity_2022_3_v1.unitypackage"),
 		[]byte("\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xffgarbage"), 0o644)
 
-	ix, err := Build(root, t.TempDir())
+	ix, err := Build(Options{Root: root, CacheDir: t.TempDir()})
 	if err != nil {
 		t.Fatalf("a malformed unitypackage aborted the build: %v", err)
 	}
@@ -309,7 +309,7 @@ func TestPruneUnpackedDropsStaleExtractions(t *testing.T) {
 	os.WriteFile(mk("v", "Pack", "Sword.glb"), []byte("GLBBYTES"), 0o644)
 	cacheDir := t.TempDir()
 
-	ix, err := Build(root, cacheDir)
+	ix, err := Build(Options{Root: root, CacheDir: cacheDir})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -353,7 +353,7 @@ func TestOpenRejectsSymlinkEscapingRoot(t *testing.T) {
 		t.Skipf("symlinks unavailable: %v", err)
 	}
 
-	ix, err := Build(root, t.TempDir())
+	ix, err := Build(Options{Root: root, CacheDir: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -382,7 +382,7 @@ func TestUnreadableDirectoryIsSkippedNotFatal(t *testing.T) {
 	}
 	t.Cleanup(func() { os.Chmod(lockedDir, 0o755) })
 
-	ix, err := Build(root, t.TempDir())
+	ix, err := Build(Options{Root: root, CacheDir: t.TempDir()})
 	if err != nil {
 		t.Fatalf("one unreadable directory aborted the whole scan: %v", err)
 	}
@@ -397,7 +397,7 @@ func TestUnreadableDirectoryIsSkippedNotFatal(t *testing.T) {
 // Tolerating an unreadable subtree must not extend to the root: a mistyped --root
 // that silently indexed nothing would look like an empty library.
 func TestUnreadableRootIsFatal(t *testing.T) {
-	if _, err := Build(filepath.Join(t.TempDir(), "does-not-exist"), t.TempDir()); err == nil {
+	if _, err := Build(Options{Root: filepath.Join(t.TempDir(), "does-not-exist"), CacheDir: t.TempDir()}); err == nil {
 		t.Error("a missing root built an empty index instead of failing")
 	}
 }
@@ -441,7 +441,7 @@ func TestFailedExtractionReachesEveryWaiter(t *testing.T) {
 	writeUnityPackage(t, pkg, []unityGUID{{guid: "abc123", pathname: "Assets/Heart.fbx", asset: "FBXBYTES"}})
 
 	cacheDir := t.TempDir()
-	ix, err := Build(root, cacheDir)
+	ix, err := Build(Options{Root: root, CacheDir: cacheDir})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -480,7 +480,7 @@ func TestExtractWithoutACacheDirIsRefused(t *testing.T) {
 	pkg := mk("synty", "Pack", "Pack_Unity_v1.unitypackage")
 	writeUnityPackage(t, pkg, []unityGUID{{guid: "abc123", pathname: "Assets/Heart.fbx", asset: "FBXBYTES"}})
 
-	ix, err := Build(root, "")
+	ix, err := Build(Options{Root: root, CacheDir: ""})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -514,7 +514,7 @@ func TestZipReaderSurvivesEvictionMidStream(t *testing.T) {
 	for i := 0; i <= zipCacheSize; i++ {
 		writeZip(t, mk("v", "Pack", fmt.Sprintf("Pack_Other%d_v1.zip", i)), map[string]string{"X.fbx": "XBYTES"})
 	}
-	ix, err := Build(root, t.TempDir())
+	ix, err := Build(Options{Root: root, CacheDir: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}

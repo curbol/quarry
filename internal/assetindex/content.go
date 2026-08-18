@@ -219,9 +219,21 @@ func (ix *Index) ensureExtracted(archivePath string) (string, error) {
 	return dest, ex.err
 }
 
-// underRoot reports whether p resolves to a location inside the library root,
-// following symlinks so a symlinked entry cannot escape.
-func (ix *Index) underRoot(p string) bool { return underRootPath(ix.Root, p) }
+// underRoot reports whether p resolves inside what this index actually covers:
+// the library root, or a directory the scan followed a symlink into. Resolving
+// symlinks is what stops an unfollowed link from reaching outside; the link roots
+// are what keep that check meaningful once following is on, instead of dropping it.
+func (ix *Index) underRoot(p string) bool {
+	if underRootPath(ix.Root, p) {
+		return true
+	}
+	for _, lr := range ix.LinkRoots {
+		if underRootPath(lr, p) {
+			return true
+		}
+	}
+	return false
+}
 
 // underRootPath is the containment test itself, taking the root as a parameter so
 // the scan can apply the same rule to a symlink's target that Open will apply to it

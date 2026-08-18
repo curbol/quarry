@@ -42,6 +42,18 @@ func main() {
 // can capture and assert it; progress and diagnostics stay on stderr.
 var stdout io.Writer = os.Stdout
 
+// settings is everything a run resolves before it serves. It is a struct because
+// every one of these is a plain scalar that would otherwise be a positional argument
+// next to three others of the same type.
+type settings struct {
+	Root           string
+	Addr           string
+	CacheDir       string
+	TagsPath       string
+	Reindex        bool
+	FollowSymlinks bool
+}
+
 // served indexes and serves. It is a package variable for the same reason as stdout:
 // a test can then assert what the config/env/flag chain resolved without standing up
 // a server and blocking on it.
@@ -71,6 +83,7 @@ func run(args []string) error {
 	reindex := fs.Bool("reindex", false, "rebuild the asset index from scratch")
 	cacheFlag := fs.String("cache", "", "cache dir for the index and unpacked archives (default: $XDG_CACHE_HOME/quarry)")
 	tagsFlag := fs.String("tags", "", "tag store path (default: the nearest quarry.tags.toml walking up from cwd, else the one in the config dir)")
+	follow := fs.Bool("follow-symlinks", false, "index symlinked directories pointing outside the scan root")
 	showVersion := fs.Bool("version", false, "print the version and exit")
 
 	if err := fs.Parse(args); err != nil {
@@ -109,10 +122,24 @@ func run(args []string) error {
 	if *root != "" {
 		cfg.Root = config.ExpandHome(*root)
 	}
+	// A bool flag cannot distinguish unset from false by its value, so only an
+	// explicitly passed --follow-symlinks overrides config.toml.
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "follow-symlinks" {
+			cfg.FollowSymlinks = *follow
+		}
+	})
 	if cfg.Root == "" {
 		return fmt.Errorf("no scan root: pass --root <dir>, set QUARRY_ROOT, or add\n  root = \"/path/to/your/assets\"\nto %s", filepath.Join(configDir, "config.toml"))
 	}
-	return served(cfg.Root, *addr, *cacheFlag, *reindex, resolveTagsPath(*tagsFlag, configDir))
+	return served(settings{
+		Root:           cfg.Root,
+		Addr:           *addr,
+		CacheDir:       *cacheFlag,
+		TagsPath:       resolveTagsPath(*tagsFlag, configDir),
+		Reindex:        *reindex,
+		FollowSymlinks: cfg.FollowSymlinks,
+	})
 }
 
 // isFlag reports whether an argument is a flag rather than a subcommand, so that a
@@ -138,13 +165,14 @@ func resolveTagsPath(tagsFlag, configDir string) string {
 }
 
 // serve indexes the asset root and runs the UI until interrupted.
-func serve(root, addr, cacheFlag string, reindex bool, tagsPath string) error {
-	cacheDir := config.ResolveCacheDir(cacheFlag)
+func serve(s settings) error {
+	cacheDir := config.ResolveCacheDir(s.CacheDir)
 	cachePath := filepath.Join(cacheDir, "index.json")
 
 	warn := func(m string) { fmt.Fprintln(os.Stderr, "warning:", m) }
-	fmt.Fprintf(os.Stderr, "indexing %s …\n", root)
-	ix, err := assetindex.LoadOrBuild(root, cacheDir, cachePath, reindex, warn)
+	fmt.Fprintf(os.Stderr, "indexing %s …\n", s.Root)
+	opt := assetindex.Options{Root: s.Root, CacheDir: cacheDir, FollowSymlinks: s.FollowSymlinks}
+	ix, err := assetindex.LoadOrBuild(opt, cachePath, s.Reindex, warn)
 	if err != nil {
 		return fmt.Errorf("build asset index: %w", err)
 	}
@@ -158,12 +186,12 @@ func serve(root, addr, cacheFlag string, reindex bool, tagsPath string) error {
 	}
 	// The user-wide store lives in the config dir, which need not exist yet on a
 	// machine that has never written a config.toml.
-	if err := os.MkdirAll(filepath.Dir(tagsPath), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(s.TagsPath), 0o755); err != nil {
 		return fmt.Errorf("prepare tag store dir: %w", err)
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	return browse.Serve(ctx, addr, ix, tagsPath)
+	return browse.Serve(ctx, s.Addr, ix, s.TagsPath)
 }
 
 func printVersion() {
@@ -185,6 +213,7 @@ flags:
   -reindex            rebuild the asset index from scratch
   -cache <dir>        index / unpacked-archive cache dir (default: $XDG_CACHE_HOME/quarry)
   -tags <path>        tag store path (default: nearest quarry.tags.toml, else the one in the config dir)
+  -follow-symlinks    index symlinked dirs pointing outside the scan root
   -config <dir>       user config dir with config.toml (default: $XDG_CONFIG_HOME/quarry or ~/.config/quarry)
 
 The scan root is the one setting with no default; set it once in config.toml. Tags

@@ -59,40 +59,81 @@ type libEntry struct {
 	size    int64  // loose only
 }
 
-// relTo renders p relative to the library root in slash form, for display.
-func relTo(absRoot, p string) string {
-	return filepath.ToSlash(strings.TrimPrefix(p, absRoot+string(filepath.Separator)))
-}
-
 // walkLibrary enumerates the browseable files under absRoot without opening any
 // archive, so callers can decide per archive whether to re-enumerate or reuse a
-// cached result. Dot-dirs (Synty working dirs) and engine sidecars are skipped.
+// cached result. Dot-dirs (Synty working dirs) and engine sidecars are skipped. It
+// also returns the resolved targets of every symlinked directory it followed, which
+// bound what serving will later hand out (see Index.underRoot).
 //
 // A directory or file the walk cannot read is reported as a skip and the walk goes
 // on: one unreadable corner of a large library must not cost the whole index, the
 // same bargain archiveAssets strikes for a damaged archive. An unreadable root is
 // the exception — that is not a partial library, it is no library — so it still
 // fails, rather than quietly indexing nothing.
-func walkLibrary(absRoot string) ([]libEntry, []SkippedFile, error) {
-	var entries []libEntry
-	var skipped []SkippedFile
-	note := func(p string, err error) {
-		skipped = append(skipped, SkippedFile{RelPath: relTo(absRoot, p), Reason: err.Error()})
+func walkLibrary(absRoot string, follow bool) ([]libEntry, []SkippedFile, []string, error) {
+	w := &walker{root: absRoot, follow: follow, visited: map[string]bool{}}
+	w.visited[resolve(absRoot)] = true
+	err := w.tree(absRoot, "")
+	return w.entries, w.skipped, w.linkRoots, err
+}
+
+// walker carries one walk's accumulated result. It exists because following a
+// symlinked directory means walking a second tree whose files must still be named
+// relative to the root, which a single WalkDir closure cannot express.
+type walker struct {
+	root      string
+	follow    bool
+	entries   []libEntry
+	skipped   []SkippedFile
+	linkRoots []string
+	// visited holds the resolved directories already walked, so a link back into a
+	// tree already covered — or into one covering it — terminates instead of looping.
+	visited map[string]bool
+}
+
+func (w *walker) skip(rel string, err error) {
+	w.skipped = append(w.skipped, SkippedFile{RelPath: rel, Reason: err.Error()})
+}
+
+// rel names a walked path as the user sees it: relative to the library root, through
+// whatever symlink led here rather than by the target's real location.
+func rel(dir, prefix, p string) string {
+	r, err := filepath.Rel(dir, p)
+	if err != nil {
+		r = filepath.Base(p)
 	}
-	err := filepath.WalkDir(absRoot, func(p string, d fs.DirEntry, err error) error {
+	r = filepath.ToSlash(r)
+	if r == "." {
+		r = ""
+	}
+	switch {
+	case prefix == "":
+		return r
+	case r == "":
+		return prefix
+	}
+	return prefix + "/" + r
+}
+
+// tree walks one directory. prefix is the root-relative path that led to it, empty
+// for the library root itself — which is also what marks the root's own read error
+// as fatal, where a followed link's is just a skip.
+func (w *walker) tree(dir, prefix string) error {
+	return filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+		r := rel(dir, prefix, p)
 		if err != nil {
-			if p == absRoot {
+			if p == dir && prefix == "" {
 				return err
 			}
-			note(p, err)
+			w.skip(r, err)
 			return nil
 		}
 		name := d.Name()
 		if d.Type()&fs.ModeSymlink != 0 {
-			return symlinkEntry(absRoot, p, note)
+			return w.symlink(p, r)
 		}
 		if d.IsDir() {
-			if p != absRoot && strings.HasPrefix(name, ".") {
+			if p != dir && strings.HasPrefix(name, ".") {
 				return filepath.SkipDir
 			}
 			return nil
@@ -100,54 +141,79 @@ func walkLibrary(absRoot string) ([]libEntry, []SkippedFile, error) {
 		if strings.HasPrefix(name, ".") {
 			return nil
 		}
-		ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(name), "."))
-		if isSidecar(ext) {
+		info, err := d.Info()
+		if err != nil {
+			w.skip(r, err)
 			return nil
 		}
-		rel := relTo(absRoot, p)
-		vendor, pack := vendorPack(rel)
-		e := libEntry{path: p, rel: rel, vendor: vendor, pack: pack, name: name}
-		switch ext {
-		case "zip":
-			e.kind, e.variant = SourceZip, deriveVariant(pack, name)
-		case "unitypackage":
-			e.kind, e.variant = SourceUnityPackage, deriveVariant(pack, name)
-		default:
-			info, err := d.Info()
-			if err != nil {
-				note(p, err)
-				return nil
-			}
-			e.kind, e.size = SourceLoose, info.Size()
-		}
-		entries = append(entries, e)
+		w.file(p, r, name, info)
 		return nil
 	})
-	return entries, skipped, err
 }
 
-// symlinkEntry decides what a symbolic link in the library becomes. filepath.WalkDir
-// does not follow links, and a link's own DirEntry describes the link (its Info size
-// is the length of the target path, and a link to a directory does not report itself
-// as one), so treating it like an ordinary file yields an asset with a fabricated
-// size whose target is never walked.
+// file records one browseable file. info is passed in because a symlinked file's own
+// DirEntry describes the link, whose size is the length of the target path.
+func (w *walker) file(p, r, name string, info os.FileInfo) {
+	ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(name), "."))
+	if isSidecar(ext) {
+		return
+	}
+	vendor, pack := vendorPack(r)
+	e := libEntry{path: p, rel: r, vendor: vendor, pack: pack, name: name}
+	switch ext {
+	case "zip":
+		e.kind, e.variant = SourceZip, deriveVariant(pack, name)
+	case "unitypackage":
+		e.kind, e.variant = SourceUnityPackage, deriveVariant(pack, name)
+	default:
+		e.kind, e.size = SourceLoose, info.Size()
+	}
+	w.entries = append(w.entries, e)
+}
+
+// symlink decides what a symbolic link in the library becomes. filepath.WalkDir does
+// not follow links, and a link's own DirEntry describes the link — it does not report
+// itself as a directory, and its size is the length of the target path — so treating
+// one as an ordinary file yields an asset with a fabricated size whose target is
+// never walked.
 //
 // A link into the library duplicates a file the walk reaches by its real path, so it
-// is dropped. A link out of the library is reported: Open resolves symlinks and
-// refuses anything landing outside the root, so indexing it would only produce cards
-// that cannot be served — and a whole pack behind one such link would otherwise
-// vanish with nothing said.
-func symlinkEntry(absRoot, p string, note func(string, error)) error {
+// is dropped. A link out of the library is followed only when asked: serving refuses
+// paths outside what the scan covered, and traversing wherever a link happens to
+// point is the kind of surprise `find` and `rg` also keep behind a flag. Unfollowed,
+// it is reported rather than dropped, because a whole pack behind one link would
+// otherwise leave the index with nothing said.
+func (w *walker) symlink(p, r string) error {
 	target, err := filepath.EvalSymlinks(p)
 	if err != nil {
-		note(p, err)
+		w.skip(r, err)
 		return nil
 	}
-	if underRootPath(absRoot, target) {
+	if underRootPath(w.root, target) {
 		return nil
 	}
-	note(p, fmt.Errorf("symlink to %s, which is outside the library root; quarry only serves files under the root", target))
-	return nil
+	if !w.follow {
+		w.skip(r, fmt.Errorf("symlink to %s, which is outside the library root; pass --follow-symlinks to index it", target))
+		return nil
+	}
+	info, err := os.Stat(target)
+	if err != nil {
+		w.skip(r, err)
+		return nil
+	}
+	if !info.IsDir() {
+		w.file(p, r, filepath.Base(p), info)
+		return nil
+	}
+	if w.visited[target] {
+		w.skip(r, fmt.Errorf("symlink to %s, which this scan has already walked", target))
+		return nil
+	}
+	w.visited[target] = true
+	w.linkRoots = append(w.linkRoots, target)
+	// The target, not the link: WalkDir lstats its argument, so handing it the link
+	// would visit the link itself and descend no further.
+	return w.tree(target, r)
 }
 
 // enumerateArchive opens one archive entry and returns its assets.
@@ -280,7 +346,7 @@ func readHead(r io.Reader) []byte {
 // the entries inside .zip / .unitypackage archives, de-duplicated (see dedup).
 // Unreadable archives are skipped; Build reports why in Index.Skipped.
 func Scan(root string) ([]Asset, error) {
-	ix, err := Build(root, "")
+	ix, err := Build(Options{Root: root})
 	if err != nil {
 		return nil, err
 	}

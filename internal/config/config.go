@@ -17,10 +17,14 @@ import (
 // rather than on any setting here.
 type Config struct {
 	Root string // asset scan root; empty until the user sets one
+	// FollowSymlinks indexes symlinked directories pointing outside the root, for a
+	// library assembled across several drives. Off unless asked for.
+	FollowSymlinks bool
 }
 
 type fileConfig struct {
-	Root string `toml:"root"`
+	Root           string `toml:"root"`
+	FollowSymlinks bool   `toml:"follow_symlinks"`
 }
 
 // ResolveDir picks the user config directory, which holds config.toml and the
@@ -75,6 +79,7 @@ func Load(dir string) (Config, error) {
 		if fc.Root != "" {
 			c.Root = fc.Root
 		}
+		c.FollowSymlinks = fc.FollowSymlinks
 	}
 	if v := os.Getenv("QUARRY_ROOT"); v != "" {
 		c.Root = v

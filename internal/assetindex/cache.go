@@ -42,6 +42,13 @@ type Index struct {
 	LoosePrint   map[string]string `json:"loosePrint"`   // abs loose path -> stat fingerprint
 	Skipped      []SkippedFile     `json:"skipped,omitempty"`
 
+	// FollowSymlinks is the setting this index was built under, kept because it
+	// changes what the scan covers: a cache built the other way describes a
+	// different library. LinkRoots are the resolved targets it followed, and with
+	// Root they bound every path serving will open.
+	FollowSymlinks bool     `json:"followSymlinks,omitempty"`
+	LinkRoots      []string `json:"linkRoots,omitempty"`
+
 	cacheDir string
 	byID     map[string]*Asset
 
@@ -63,14 +70,32 @@ func fingerprint(path string) (string, error) {
 	return hex.EncodeToString(sum[:12]), nil
 }
 
+// Options select what a scan covers and where its regenerable state lives. The
+// zero value plus a Root is the default scan.
+type Options struct {
+	Root     string
+	CacheDir string
+	// FollowSymlinks walks symlinked directories pointing outside the root, which is
+	// how a library assembled across several drives is presented as one tree. It is
+	// off by default: following wherever a link happens to point is a surprise worth
+	// asking for, the same call `find -L` and `rg --follow` make. Asking for it is
+	// also what authorises serving those files, since they sit outside the root that
+	// otherwise bounds what the content API will open.
+	FollowSymlinks bool
+}
+
 // Build scans a library from scratch into a fresh index. It is Refresh over an
 // empty index: with nothing cached to reuse, every entry takes the re-derive path.
-func Build(root, cacheDir string) (*Index, error) {
-	absRoot, err := filepath.Abs(root)
+func Build(opt Options) (*Index, error) {
+	absRoot, err := filepath.Abs(opt.Root)
 	if err != nil {
 		return nil, err
 	}
-	ix := &Index{Version: indexVersion, Root: absRoot, cacheDir: cacheDir, ArchivePrint: map[string]string{}, LoosePrint: map[string]string{}}
+	ix := &Index{
+		Version: indexVersion, Root: absRoot, cacheDir: opt.CacheDir,
+		FollowSymlinks: opt.FollowSymlinks,
+		ArchivePrint:   map[string]string{}, LoosePrint: map[string]string{},
+	}
 	if err := ix.Refresh(); err != nil {
 		return nil, err
 	}
@@ -91,10 +116,11 @@ func (ix *Index) Refresh() error {
 		ix.Assets, ix.ArchivePrint, ix.LoosePrint = nil, map[string]string{}, map[string]string{}
 		ix.Version = indexVersion
 	}
-	entries, skipped, err := walkLibrary(ix.Root)
+	entries, skipped, linkRoots, err := walkLibrary(ix.Root, ix.FollowSymlinks)
 	if err != nil {
 		return err
 	}
+	ix.LinkRoots = linkRoots
 	oldByArchive := map[string][]Asset{}
 	oldByLoose := map[string][]Asset{}
 	for _, a := range ix.Assets {
@@ -188,19 +214,23 @@ func (ix *Index) Save(cachePath string) error {
 }
 
 // LoadOrBuild returns a usable index: a fresh build when reindex is set or no valid
-// cache exists for this root, otherwise the cached index refreshed against the
+// cache exists for these options, otherwise the cached index refreshed against the
 // current tree. The result is written back to cachePath.
 // warn reports a non-fatal condition; nil discards.
-func LoadOrBuild(root, cacheDir, cachePath string, reindex bool, warn func(string)) (*Index, error) {
+func LoadOrBuild(opt Options, cachePath string, reindex bool, warn func(string)) (*Index, error) {
 	if warn == nil {
 		warn = func(string) {}
 	}
-	absRoot, err := filepath.Abs(root)
+	absRoot, err := filepath.Abs(opt.Root)
 	if err != nil {
 		return nil, err
 	}
+	opt.Root = absRoot
 	if !reindex {
-		if ix, err := Load(cachePath, cacheDir); err == nil && ix.Root == absRoot && ix.Version == indexVersion {
+		// FollowSymlinks is part of the match: it decides what the walk covers, so a
+		// cache built the other way is describing a different library.
+		if ix, err := Load(cachePath, opt.CacheDir); err == nil &&
+			ix.Root == absRoot && ix.Version == indexVersion && ix.FollowSymlinks == opt.FollowSymlinks {
 			if err := ix.Refresh(); err != nil {
 				return nil, err
 			}
@@ -208,7 +238,7 @@ func LoadOrBuild(root, cacheDir, cachePath string, reindex bool, warn func(strin
 			return ix, nil
 		}
 	}
-	ix, err := Build(absRoot, cacheDir)
+	ix, err := Build(opt)
 	if err != nil {
 		return nil, err
 	}

@@ -49,7 +49,12 @@ quarry --reindex                  # rebuild the index from scratch
 The index is cached and refreshed incrementally, so only the first run pays the full
 scan. Flags: `--addr <host:port>` (default `localhost:8788`), `--reindex`, `--cache
 <dir>` (index / unpacked-archive cache; default `~/.cache/quarry`), `--tags <path>`,
-`--config <dir>`.
+`--config <dir>`, `--follow-symlinks`.
+
+If your library is spread across several drives and stitched together with symlinks,
+pass `--follow-symlinks` (or set `follow_symlinks = true` in `config.toml`) so those
+packs are indexed and served. Without it they are listed as skips on startup rather
+than walked, since quarry otherwise stays inside the root you pointed it at.
 
 ## Browsing
 

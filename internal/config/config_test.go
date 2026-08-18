@@ -110,3 +110,25 @@ func TestResolveDir(t *testing.T) {
 		t.Errorf("home fallback: got %q", got)
 	}
 }
+
+func TestFollowSymlinksFromFile(t *testing.T) {
+	clearQuarryEnv(t)
+	dir := t.TempDir()
+
+	c, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.FollowSymlinks {
+		t.Error("following must be off unless asked for: it decides whether the scan leaves the root")
+	}
+
+	os.WriteFile(filepath.Join(dir, "config.toml"), []byte("root = \"/x\"\nfollow_symlinks = true\n"), 0o644)
+	c, err = Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.FollowSymlinks {
+		t.Error("follow_symlinks = true in config.toml was not read")
+	}
+}

@@ -64,11 +64,19 @@ skips and reported, because browse treats a build failure as fatal and would oth
 refuse to start over one bad corner of a large library. An unreadable root is still an
 error — that is not a partial library, it is no library.
 
-A symlink is not followed. One pointing inside the root duplicates a file the walk
-already reaches by its real path, so it is dropped; one pointing outside is recorded as
-a skip, because serving refuses any path resolving outside the root and indexing it
-would only produce cards that cannot load. Reporting it matters most for a symlinked
-pack directory, which would otherwise take its whole contents out of the index silently.
+A symlink pointing inside the root duplicates a file the walk already reaches by its
+real path, so it is dropped. One pointing outside is followed only under
+`--follow-symlinks` (`follow_symlinks` in `config.toml`), which is how a library
+assembled across several drives is presented as one tree. Off by default, because
+traversing wherever a link happens to point is a surprise `find` and `rg` also keep
+behind a flag — and because asking for it is what authorises serving files outside the
+root. Unfollowed, the link is recorded as a skip naming the flag: a symlinked pack
+would otherwise take its whole contents out of the index silently. Followed, its files
+are named through the link the user sees, the resolved target is recorded on the index,
+and `Open` accepts a path under the root **or** under one of those targets, so
+containment stays a real check rather than being switched off. Targets already walked
+are not walked again, so a cycle terminates. The setting is part of what a cached index
+matches on, since it changes what the scan covers.
 
 ## Tag store
 

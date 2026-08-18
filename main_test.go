@@ -114,8 +114,8 @@ func TestRootFlagBeatsEnvironment(t *testing.T) {
 	t.Setenv("QUARRY_ROOT", envRoot)
 
 	var got string
-	served = func(root, _, _ string, _ bool, _ string) error {
-		got = root
+	served = func(s settings) error {
+		got = s.Root
 		return nil
 	}
 	t.Cleanup(func() { served = serve })
@@ -133,5 +133,33 @@ func TestRootFlagBeatsEnvironment(t *testing.T) {
 	}
 	if got != envRoot {
 		t.Errorf("with no --root, resolved root = %q, want QUARRY_ROOT %q", got, envRoot)
+	}
+}
+
+// A bool flag's value cannot say whether it was passed, so config.toml has to win
+// until --follow-symlinks actually appears on the command line.
+func TestFollowSymlinksFlagOverridesConfig(t *testing.T) {
+	t.Setenv("QUARRY_ROOT", "")
+	cfgDir := t.TempDir()
+	root := t.TempDir()
+	os.WriteFile(filepath.Join(cfgDir, "config.toml"),
+		[]byte("root = "+strconv.Quote(root)+"\nfollow_symlinks = true\n"), 0o644)
+
+	var got settings
+	served = func(s settings) error { got = s; return nil }
+	t.Cleanup(func() { served = serve })
+
+	if err := run([]string{"--config", cfgDir, "--cache", t.TempDir()}); err != nil {
+		t.Fatal(err)
+	}
+	if !got.FollowSymlinks {
+		t.Error("config.toml's follow_symlinks was lost when the flag was absent")
+	}
+
+	if err := run([]string{"--config", cfgDir, "--cache", t.TempDir(), "--follow-symlinks=false"}); err != nil {
+		t.Fatal(err)
+	}
+	if got.FollowSymlinks {
+		t.Error("an explicit --follow-symlinks=false did not override config.toml")
 	}
 }

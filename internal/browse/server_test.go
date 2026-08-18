@@ -78,7 +78,7 @@ func serveLibrary(t *testing.T, tagsPath string, seed func(mk func(...string) st
 		return full
 	}
 	seed(mk)
-	ix, err := assetindex.Build(root, t.TempDir())
+	ix, err := assetindex.Build(assetindex.Options{Root: root, CacheDir: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}

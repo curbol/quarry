@@ -388,12 +388,19 @@ function stripRootMotion(clip, rootName, upAxis) {
   return changed ? new THREE.AnimationClip(clip.name, clip.duration, tracks) : clip;
 }
 
+// dispose releases what an object owns. CLAY is deliberately exempt: it is one
+// instance shared by every FBX mesh (and by every rig cloneRig hands out, since a
+// clone shares its source's materials), and disposing a material evicts the renderer's
+// compiled program for it. The thumbnail worker keeps one renderer for the life of the
+// page, so disposing CLAY per model made it recompile that shader for every FBX
+// thumbnail after the first.
 function dispose(object) {
   object.traverse((o) => {
     if (o.geometry) o.geometry.dispose();
     if (o.material) {
       const mats = Array.isArray(o.material) ? o.material : [o.material];
       for (const m of mats) {
+        if (m === CLAY) continue;
         for (const k in m) { if (m[k] && m[k].isTexture) m[k].dispose(); }
         m.dispose();
       }

@@ -58,8 +58,17 @@ async function fetchPage() {
   // while the new request does the same: duplicate cards and a wrong offset.
   const gen = state.gen;
   const p = query({ offset: state.offset, limit: PAGE });
-  const res = await fetch('/api/assets?' + p.toString());
-  const data = await res.json();
+  let data;
+  try {
+    const res = await fetch('/api/assets?' + p.toString());
+    data = await res.json();
+  } catch {
+    // Release the latch so the next scroll retries. Leaving it held — which is what a
+    // throw here used to do — stops the grid loading anything more for the rest of the
+    // session, with nothing on screen to say why.
+    if (gen === state.gen) state.loading = false;
+    return;
+  }
   if (gen !== state.gen) return;
   if (!state.facetsLoaded) { populateFacets(data.facets); state.facetsLoaded = true; }
   state.total = data.total;
@@ -222,12 +231,21 @@ async function loadPalette() {
 // apiAssign returns the set's resulting union tags, or null on failure so a caller
 // leaves the card's displayed tags untouched rather than wiping them.
 async function apiAssign(fingerprints, tag, on) {
-  const res = await fetch('/api/assign', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ fingerprints, tag, on }),
-  });
-  if (!res.ok) return null;
-  const data = await res.json();
+  let res;
+  try {
+    res = await fetch('/api/assign', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fingerprints, tag, on }),
+    });
+  } catch {
+    reportTagError(null);
+    return null;
+  }
+  const data = await res.json().catch(() => null);
+  if (!res.ok || !data) {
+    reportTagError(data);
+    return null;
+  }
   applyPalette(data.palette);
   return data.tags || [];
 }
@@ -566,10 +584,7 @@ function card(a) {
   copy.title = 'copy path';
   copy.addEventListener('click', (e) => {
     e.stopPropagation();
-    navigator.clipboard.writeText(a.copyPath).then(() => {
-      copy.classList.add('done');
-      setTimeout(() => copy.classList.remove('done'), 1000);
-    });
+    flashCopy(copy, a.copyPath);
   });
   thumb.appendChild(copy);
 
@@ -678,12 +693,22 @@ function fontSample(a) {
   return wrap;
 }
 
-function copyPath(text, btn) {
+// COPY_FEEDBACK_MS is how long a copy button shows it worked. One constant because
+// the icon buttons and the labelled ones are the same affordance and drifted apart
+// when each carried its own timeout.
+const COPY_FEEDBACK_MS = 1200;
+
+// flashCopy copies text and marks btn as done for a moment. Buttons whose label is
+// text (rather than an icon) also say "copied ✓" and get their label back after.
+function flashCopy(btn, text, { label = false } = {}) {
   navigator.clipboard.writeText(text).then(() => {
-    const label = btn.textContent;
-    btn.textContent = 'copied ✓';
+    const previous = label ? btn.textContent : null;
+    if (label) btn.textContent = 'copied ✓';
     btn.classList.add('done');
-    setTimeout(() => { btn.textContent = label; btn.classList.remove('done'); }, 1200);
+    setTimeout(() => {
+      if (previous !== null) btn.textContent = previous;
+      btn.classList.remove('done');
+    }, COPY_FEEDBACK_MS);
   });
 }
 
@@ -763,6 +788,7 @@ class ModelThumbnails {
     // refreshed on each hit.
     this.cache = new Map();   // asset.id -> object URL (a rendered blob)
     this.pending = new Map(); // asset.id -> holder awaiting its render
+    this.watch();
     this.worker = new Worker('/static/thumbworker.js', { type: 'module' });
     this.worker.onmessage = (e) => this.onResult(e.data);
     // Seed the worker's (localStorage-less) rig registry with the bodies the user has
@@ -770,16 +796,39 @@ class ModelThumbnails {
     // on the character the user chose in the lightbox.
     this.worker.postMessage({ type: 'seed', list: CharRegistry.list() });
   }
-  observe(holder, asset) { holder._asset = asset; lazyWork.when(holder, () => this.request(holder)); }
-  // release cancels the renders still queued for cards the grid is about to drop, so
-  // the worker does not work through a backlog for thumbnails nobody is looking at any
-  // more before it reaches the ones on screen.
+  // Unlike the one-shot lazyWork observer, this one keeps watching: a card that
+  // scrolls away before its turn in the worker's serial queue has its render cancelled,
+  // and asks again if it comes back. Without the cancel, a fast scroll leaves the queue
+  // grinding through cards nobody is looking at before it reaches the visible ones;
+  // without the re-request, a cancelled card would keep its icon forever.
+  watch() {
+    if (this.vis) this.vis.disconnect();
+    this.vis = new IntersectionObserver((entries) => {
+      for (const e of entries) {
+        if (e.isIntersecting) this.request(e.target);
+        else this.cancel(e.target);
+      }
+    }, { rootMargin: '200px' });
+  }
+  observe(holder, asset) { holder._asset = asset; this.vis.observe(holder); }
+  // release drops the renders queued for cards the grid is about to replace, and lets
+  // go of the cards themselves: an IntersectionObserver holds its targets, so keeping
+  // them observed would strand a batch of detached nodes on every filter change.
   release() {
     for (const id of this.pending.keys()) this.worker.postMessage({ type: 'cancel', id });
     this.pending.clear();
+    this.watch();
+  }
+  cancel(holder) {
+    const asset = holder._asset;
+    if (!asset || this.pending.get(asset.id) !== holder) return;
+    this.pending.delete(asset.id);
+    this.worker.postMessage({ type: 'cancel', id: asset.id });
+    holder.classList.remove('loading');
   }
   request(holder) {
     const asset = holder._asset;
+    if (this.pending.has(asset.id)) return;
     const cached = this.cache.get(asset.id);
     if (cached) { this.touch(asset.id); this.swap(holder, cached); return; }
     holder.classList.add('loading');
@@ -819,6 +868,9 @@ class ModelThumbnails {
       if (holder && holder.isConnected) this.swap(holder, url);
     } else if (holder && holder.isConnected) {
       holder.classList.remove('loading'); // no render (failed / mesh-less with no rig)
+      // Settled: there is nothing to draw for this asset, so stop watching rather than
+      // re-asking the worker every time the card scrolls back into view.
+      this.vis.unobserve(holder);
     }
   }
   async swap(holder, url) {
@@ -828,6 +880,7 @@ class ModelThumbnails {
     // blocks the main thread — the jank felt while many thumbnails streamed in during a
     // lightbox animation was the per-image decode on paint.
     try { await img.decode(); } catch { /* fall through and insert anyway */ }
+    this.vis.unobserve(holder);
     if (holder.isConnected) holder.replaceWith(img);
   }
 }
@@ -1022,7 +1075,7 @@ function renderCopies(a) {
     const all = document.createElement('button');
     all.className = 'lb-copyall';
     all.textContent = 'copy all';
-    all.addEventListener('click', () => copyPath(copies.map((c) => c.copyPath).join('\n'), all));
+    all.addEventListener('click', () => flashCopy(all, copies.map((c) => c.copyPath).join('\n'), { label: true }));
     head.appendChild(all);
   }
   lb.copies.appendChild(head);
@@ -1039,12 +1092,7 @@ function renderCopies(a) {
     btn.className = 'lb-copyicon';
     btn.title = 'copy path';
     btn.innerHTML = COPY_SVG;
-    btn.addEventListener('click', () => {
-      navigator.clipboard.writeText(c.copyPath).then(() => {
-        btn.classList.add('done');
-        setTimeout(() => btn.classList.remove('done'), 1000);
-      });
-    });
+    btn.addEventListener('click', () => flashCopy(btn, c.copyPath));
     row.append(label, code, btn);
     lb.copies.appendChild(row);
   }
@@ -1270,18 +1318,26 @@ function startViewer(container, asset) {
     playClip(0);
   };
 
+  // charSeq orders character selections. Loading and retargeting a body takes long
+  // enough to pick another one meanwhile, and without this the slower of the two wins
+  // whichever the user chose last. A superseded load reports success so its caller
+  // leaves the viewer alone for the selection that replaced it.
+  let charSeq = 0;
+
   // Load a chosen character and play the pending clip-only clips on it. Resolves
   // true on success, false if the character couldn't load — so callers can fall
   // back to another rig or the picker instead of leaving an empty viewer.
-  const useCharacter = (item) =>
-    loadModel(contentURL(item.id), item.ext).then(async (char) => {
-      if (stopped) { dispose(char); return true; }
+  const useCharacter = (item) => {
+    const mine = ++charSeq;
+    const superseded = () => stopped || mine !== charSeq;
+    return loadModel(contentURL(item.id), item.ext).then(async (char) => {
+      if (superseded()) { dispose(char); return true; }
       CharRegistry.add({ id: item.id, name: item.name, ext: item.ext, bones: boneNames(char), vendor: item.vendor });
       const clips = await Promise.all(soloClips.map((c) => retargetedFor(c, asset.vendor, char)));
       let rmCs = null;
       const rmRaw = await loadRMClips(asset); // travel sibling, retargeted onto the same body
       if (rmRaw) rmCs = await Promise.all(rmRaw.map((c) => retargetedFor(c, asset.vendor, char)));
-      if (stopped) { dispose(char); return true; }
+      if (superseded()) { dispose(char); return true; }
       clearOverlays(); ensureCanvas();
       if (obj) { scene.remove(obj); dispose(obj); }
       obj = char; scene.add(char);
@@ -1289,6 +1345,7 @@ function startViewer(container, asset) {
       buildPlayback(char, clips, { id: item.id, name: item.name }, asset.vendor === 'synty' ? null : soloRootRest, rmCs);
       return true;
     }).catch(() => false);
+  };
 
   // ---- character sidebar panel ----
 

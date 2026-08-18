@@ -32,17 +32,24 @@ the whole tool, with only `update` and `version` as subcommands. Layered `intern
 packages, each with a package doc comment stating its contract:
 
 - `config` — resolves settings by precedence: `config.toml` → env (`QUARRY_ROOT`) →
-  flags. Config dir and cache dir are XDG-resolved (`ResolveDir`, `ResolveCacheDir`).
-  The scan root has **no default**: an unset root is an error, never a guess at cwd.
+  flags. Config dir and cache dir are XDG-resolved (`ResolveDir`, `ResolveCacheDir`,
+  both of which report failure rather than falling back to a cwd-relative name). The
+  scan root has **no default**: an unset root is an error, never a guess at cwd. An
+  unreadable `config.toml`, or one setting a key this version does not know, is an
+  error too — a silently ignored `follow_symlinks` typo is a drive missing from the
+  index with nothing said about it.
 - `assetindex` — scans the library into a searchable index, seeing inside `.zip` and
   `.unitypackage` archives as well as loose files, and splitting a multi-animation
-  `.glb` (a Quaternius-style animation library) into one virtual per-clip asset
-  (`Source.Clip`) that shares the file's bytes; serves each asset's bytes and
+  `.glb` (a Quaternius-style animation library) into one virtual per-clip asset that
+  shares the file's bytes (`Source.Clip` is the disambiguated label the id and
+  fingerprint are built from; `Source.ClipIndex` is the position the preview looks
+  up, since the label need not name any animation in the file); serves each asset's bytes and
   thumbnail on demand. It also assembles Synty **Sidekick** modular characters: a
   Sidekick pack ships no whole-character mesh, so `sidekick.go` parses each `.sk`
   definition, upgrades its entry into a character asset (`ThumbSidekick`,
-  `Source.Parts` = the part FBX ids), and drops the per-character byproducts under
-  the pack's `Characters/` tree. HTTP-free — the `browse` server queries it.
+  `Source.Parts` = the part FBX ids), and drops the per-character byproducts — matched
+  by the character's own name as well as its directory, since two characters commonly
+  share one. HTTP-free — the `browse` server queries it.
 - `browse` — serves the web UI, querying an `assetindex.Index` and streaming asset
   bytes and thumbnails (three.js 3D previews, copy-path). `includeRelated=1` folds
   each tag match's linked companions into results; `/api/link` and `/api/related`
@@ -73,7 +80,10 @@ packages, each with a package doc comment stating its contract:
   archive extraction writes changes: it keys both the cached index and the unpacked
   tree, so stale state on either side rebuilds.
 - **The library is read-only.** The tag store is the only thing quarry writes inside
-  a user's tree; everything else it writes is regenerable state under the cache dir.
+  a user's tree; everything else it writes is regenerable state under the cache dir,
+  in `<cache>/roots/<hash of the scan root>/` — keyed by root so two roots sharing a
+  cache dir do not prune each other's extractions away. A cache dir inside the scan
+  root is refused.
 - **Tagging is never silently off.** With no project store discoverable, the
   user-wide store in the config dir is used. `browse.Serve` still honors an empty
   `tagsPath` as "disabled" so the package stays usable that way, but the CLI never

@@ -48,7 +48,8 @@ quarry --reindex                  # rebuild the index from scratch
 
 The index is cached and refreshed incrementally, so only the first run pays the full
 scan. Flags: `--addr <host:port>` (default `localhost:8788`), `--reindex`, `--cache
-<dir>` (index / unpacked-archive cache; default `~/.cache/quarry`), `--tags <path>`,
+<dir>` (index / unpacked-archive cache; default `~/.cache/quarry`, and it may not sit
+inside the scan root), `--tags <path>`,
 `--config <dir>`, `--follow-symlinks`.
 
 If your library is spread across several drives and stitched together with symlinks,
@@ -98,6 +99,11 @@ working directory, that project's store is used and travels with it in source
 control; otherwise quarry uses your user-wide store in the config dir, so tagging
 works from anywhere and is never silently off. `--tags <path>` overrides both.
 
+The file is yours to edit and to commit. Because a save rewrites it whole, quarry
+refuses to save over a file that changed since it loaded it — so an edit from your
+editor, a `git checkout`, or a second quarry is reported rather than silently
+overwritten. Restart, or reload the page, to pick the change up.
+
 Tags key on each asset's **content**, not its path or version, so a tag follows the
 file across packs and survives a re-download: an unchanged file keeps its tags, and a
 file the vendor re-exports starts fresh. The store is never pruned to whatever
@@ -116,15 +122,16 @@ vendor:kevdev -idle` works; a bare term matches name, pack, and path), repeatabl
 duplicates separate, `sort=path`, and `offset` / `limit`.
 
 Each asset carries its `source` locator (`kind`, `archivePath`, `entry`, `guid`,
-`pathname`, `hasPreview`, `clip`), pixel `width` / `height` for images, every
+`pathname`, `hasPreview`, `clip`, `clipIndex`), pixel `width` / `height` for images, every
 duplicate copy, its content `fingerprints`, current `tags`, and any linked `related`
 fingerprints; `includeRelated=1` folds each tag match's linked companions into the
 results.
 
 A multi-animation `.glb` (an animation library like Quaternius, one file holding ~120
 clips) is split into one card per clip: each shares the file's bytes and names its
-animation in `source.clip`, so the clips are individually searchable, taggable, and
-previewable. An animation that also ships a root-motion (`_RM`) variant collapses to
+animation in `source.clip`, with `source.clipIndex` giving its position in the file
+(glTF names are optional and need not be unique, so the label and the lookup key are
+separate fields). The clips are individually searchable, taggable, and previewable. An animation that also ships a root-motion (`_RM`) variant collapses to
 one card carrying `rootMotionId` (the travel variant's id); the RM card is hidden and
 the preview's toggle plays it to show the travel. `?guid=` resolves a scene or
 prefab's asset references (bare GUIDs) straight back to the owning asset, so

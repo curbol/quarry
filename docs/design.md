@@ -58,6 +58,21 @@ extraction made by older code from what the current code would write. Each pack 
 extracts under a new fingerprint, so a prune on startup drops both the extractions the
 current index no longer references and every tree from another version.
 
+All of it lives under `<cache>/roots/<hash of the scan root>/`, keyed by root because an
+index and its extractions describe one library. `--root` indexes somewhere else for a run
+and `--addr` lets two instances serve at once, so without that key each run's prune would
+delete the other root's extractions — including out from under a server still serving them.
+Where the state lives is derived inside `assetindex` from the options, so no caller can pair
+one root's index with another's path. The cache dir may not sit inside the scan root: the
+tree quarry promises not to write to is not somewhere to put the index and every unpacked
+archive, and the next run would index its own output.
+
+Reuse is keyed on a file's stat print alone, never on whether it left assets behind — an
+archive whose every entry is deduped away by an extracted twin contributes nothing, and
+demanding otherwise would re-decompress it on every run. A derivation that failed is
+deliberately *not* cached: the print describes the file, not whether reading it worked, so
+caching one would keep serving the degraded result long after the cause was fixed.
+
 One unreadable file or directory costs itself, not the run: a damaged archive, a
 directory the user cannot read, a file that disappears mid-walk are all recorded as
 skips and reported, because browse treats a build failure as fatal and would otherwise
@@ -108,10 +123,16 @@ set once applies to every copy and survives a re-download of an unchanged file.
 
 A multi-animation `.glb` (a Quaternius-style animation library, one file holding ~120 clips on a
 shared rig) is split at scan time into one virtual asset per embedded clip: `assetindex` reads
-only the GLB's JSON chunk for the animation names, then emits a per-clip asset whose `Source.Clip`
-names the animation and whose bytes are the whole file (`/api/content` serves the file; the
-preview plays `Source.Clip`). Each clip fingerprints as `<file-fingerprint>#<clipName>`, so clips
-tag independently and stably. A root-motion (`_RM`) GLB is left whole (its clips would duplicate
+only the GLB's JSON chunk for the animation names, then emits a per-clip asset whose bytes are
+the whole file (`/api/content` serves the file; the preview plays one animation out of it).
+Each clip fingerprints as `<file-fingerprint>#<clipName>`, so clips tag independently and stably.
+
+glTF animation names are optional and need not be unique, so the two jobs that name would have
+to do are split between two fields. `Source.Clip` carries a disambiguated label (`Walk (2)`,
+`clip 3`) and is the identity — it is what the id and the fingerprint are built from, so two
+same-named clips cannot collide. `Source.ClipIndex` is the animation's position in the file and
+is what the preview looks up, because the label it disambiguated to may be a name no animation
+in the file actually has. A root-motion (`_RM`) GLB is left whole (its clips would duplicate
 the base file's) and becomes the base clips' root-motion sibling (below).
 
 An animation that ships in two variants — one that travels (root motion baked in, an `_RM` file)
@@ -148,4 +169,17 @@ destroyed by an older version's next edit. quarry is otherwise read-only over th
 one write surface, guarded by a mutex and written atomically. Because there is no session,
 the write endpoints require an `application/json` content-type, which forces a CORS
 preflight the server does not answer and so keeps a page the user happens to have open from
-writing to the store; a failed save reloads from disk rather than leaving memory ahead of it.
+writing to the store; a failed save reloads from disk rather than leaving memory ahead of it,
+and a reload that itself fails is named in the response instead of leaving the UI showing an
+edit that is not real.
+
+That content-type only stops a *cross-origin* page, so a loopback listener also checks the
+`Host` header: a domain whose DNS is re-pointed at 127.0.0.1 is same-origin with quarry, gets
+no preflight, and can read every response — but the browser still sends the attacker's domain
+in `Host`. A listener bound to a routable interface is a deliberate choice to serve other
+machines, which have their own names for this one, so the check does not apply there.
+
+A save rewrites the whole file, so it first checks the file is still the one it loaded and
+returns `ErrStale` if not. The store is meant to be hand-edited and committed to source
+control, so an edit arriving from an editor, a `git checkout`, or a second quarry sharing the
+user-wide store is a real possibility, and overwriting it would be total and silent.

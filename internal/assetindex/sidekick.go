@@ -40,6 +40,25 @@ func parseSidekick(data []byte) (name string, parts []string) {
 	return name, parts
 }
 
+// maxSidekickBytes bounds a .sk read. A character definition is a name and a short
+// list of part names; anything approaching this is not one, and the .sk here was
+// picked out by extension alone from an archive this tool did not produce.
+const maxSidekickBytes = 256 << 10
+
+// partMesh is one candidate FBX for a .sk part name. reusable marks the ones sitting
+// where a package keeps its shared body parts, which is what settles a base name two
+// meshes answer to.
+type partMesh struct {
+	id       string
+	reusable bool
+}
+
+// isPartTree reports a mesh sitting where a Sidekick package keeps its reusable body
+// parts, rather than in a demo or showcase folder that happens to name one the same.
+func isPartTree(pathname string) bool {
+	return strings.Contains(pathname, "/Resources/")
+}
+
 // applySidekick upgrades the .sk entries of a Synty Sidekick modular-character package
 // into assembled-character assets. Each .sk lists the body parts of one character; those
 // parts are separate FBX meshes in the same package that share one skeleton. The upgraded
@@ -47,30 +66,31 @@ func parseSidekick(data []byte) (name string, parts []string) {
 // so the frontend can load and merge them. Its own id and fingerprint stay tied to the
 // .sk guid, so tags survive. Packages with no .sk entry are returned untouched (the
 // common case, so the extra decompress pass only runs for Sidekick packs).
-// maxSidekickBytes bounds a .sk read. A character definition is a name and a short
-// list of part names; anything approaching this is not one, and the .sk here was
-// picked out by extension alone from an archive this tool did not produce.
-const maxSidekickBytes = 256 << 10
-
 func applySidekick(archivePath string, assets []Asset) ([]Asset, *SkippedFile) {
 	// Driven off the surviving assets, not the raw enumeration: a part resolved from a
 	// guid the enumeration already dropped (no payload, unsafe path, a sidecar) would
 	// name an id the index cannot serve, and the frontend would silently render the
 	// character short a limb.
 	skGuids := map[string]bool{}
-	fbxByBase := map[string]string{}
-	byGuid := make(map[string]int, len(assets))
+	fbxByBase := map[string]partMesh{}
 	for i := range assets {
 		a := &assets[i]
 		if a.Source.Kind != SourceUnityPackage {
 			continue
 		}
-		byGuid[a.Source.Guid] = i
 		switch a.Ext {
 		case "sk":
 			skGuids[a.Source.Guid] = true
 		case "fbx":
-			fbxByBase[strings.TrimSuffix(a.Name, path.Ext(a.Name))] = a.ID
+			// A part name is matched on the base name alone, which a demo or showcase
+			// mesh elsewhere in the package can also carry. The parts tree wins, so the
+			// character is assembled from the meshes meant to be worn rather than from
+			// whichever copy the enumeration reached last.
+			base := strings.TrimSuffix(a.Name, path.Ext(a.Name))
+			cand := partMesh{id: a.ID, reusable: isPartTree(a.Source.Pathname)}
+			if prev, taken := fbxByBase[base]; !taken || (cand.reusable && !prev.reusable) {
+				fbxByBase[base] = cand
+			}
 		}
 	}
 	if len(skGuids) == 0 {
@@ -89,46 +109,54 @@ func applySidekick(archivePath string, assets []Asset) ([]Asset, *SkippedFile) {
 	// Every .sk in the package, assembled or not. An unassembled character still has
 	// to claim its own name below, or the assembled character whose name prefixes it
 	// would take the byproducts that are the unassembled one's only representation.
+	// Built by walking the assets rather than the guid set, so the order the claims are
+	// compared in is the scan's, not a map's.
 	var chars []sidekickChar
-	for g := range skGuids {
-		i, ok := byGuid[g]
-		if !ok {
+	charAt := make(map[string]int, len(skGuids))
+	for i := range assets {
+		a := &assets[i]
+		if a.Source.Kind != SourceUnityPackage || a.Ext != "sk" {
 			continue
 		}
-		p := assets[i].Source.Pathname
+		p := a.Source.Pathname
+		charAt[a.Source.Guid] = len(chars)
 		chars = append(chars, sidekickChar{
 			tree: path.Dir(p) + "/",
 			base: strings.TrimSuffix(path.Base(p), path.Ext(p)),
 		})
 	}
-	for g := range skGuids {
-		data, ok := skBytes[g]
+	for i := range assets {
+		a := &assets[i]
+		if a.Source.Kind != SourceUnityPackage || a.Ext != "sk" {
+			continue
+		}
+		data, ok := skBytes[a.Source.Guid]
 		if !ok {
 			continue
 		}
 		name, partNames := parseSidekick(data)
 		var partIDs []string
 		for _, pn := range partNames {
-			if partID, ok := fbxByBase[pn]; ok {
-				partIDs = append(partIDs, partID)
+			if m, ok := fbxByBase[pn]; ok {
+				partIDs = append(partIDs, m.id)
 			}
 		}
-		i, ok := byGuid[g]
-		if !ok || len(partIDs) == 0 {
+		if len(partIDs) == 0 {
 			continue
 		}
-		p := assets[i].Source.Pathname
 		if name != "" {
-			assets[i].Name = name
+			a.Name = name
 		}
-		assets[i].Category = CategoryModel
-		assets[i].Thumb = ThumbSidekick
-		assets[i].Source.Parts = partIDs
-		base := strings.TrimSuffix(path.Base(p), path.Ext(p))
-		for ci := range chars {
-			if chars[ci].tree == path.Dir(p)+"/" && chars[ci].base == base {
-				chars[ci].assembled = true
-			}
+		a.Category = CategoryModel
+		a.Thumb = ThumbSidekick
+		a.Source.Parts = partIDs
+		// Only a character every one of whose parts resolved supersedes its byproducts.
+		// A .sk naming a part this package does not hold assembles into a torso and one
+		// hand, and the prefab and combined mesh it would otherwise drop are the rows
+		// that still show the whole character — the same outcome readUnityAssetBytes
+		// refuses a truncated read to avoid.
+		if len(partIDs) == len(partNames) {
+			chars[charAt[a.Source.Guid]].assembled = true
 		}
 	}
 	kept := assets[:0]
@@ -182,11 +210,24 @@ func sidekickByproduct(a Asset, chars []sidekickChar) bool {
 		if !strings.HasPrefix(a.Source.Pathname, c.tree) || !namedFor(stem, c.base) {
 			continue
 		}
-		if best < 0 || len(c.base) > len(chars[best].base) {
+		if best < 0 || c.claimsOver(chars[best]) {
 			best = i
 		}
 	}
 	return best >= 0 && chars[best].assembled
+}
+
+// claimsOver reports whether c is the closer claim on a byproduct both characters
+// match. The longer name wins; between two of the same length the one whose .sk sits
+// deeper does, so "S/Sub/Hero.sk" keeps the files beside it from "S/Hero.sk". Two
+// characters cannot tie on both, since equal-length names that are each a prefix of
+// one stem are the same name, and equal-length trees that both prefix one path are
+// the same tree.
+func (c sidekickChar) claimsOver(best sidekickChar) bool {
+	if len(c.base) != len(best.base) {
+		return len(c.base) > len(best.base)
+	}
+	return len(c.tree) > len(best.tree)
 }
 
 // namedFor reports whether stem names a byproduct of base: base itself, or base

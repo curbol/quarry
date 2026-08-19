@@ -216,7 +216,11 @@ func TestScanImageDimensions(t *testing.T) {
 		}
 	}
 	// A non-image entry carries no dimensions.
-	if m := idx["Model.fbx"]; len(m) != 1 || m[0].Width != 0 || m[0].Height != 0 {
+	m := idx["Model.fbx"]
+	if len(m) != 1 {
+		t.Fatalf("Model.fbx count = %d, want 1", len(m))
+	}
+	if m[0].Width != 0 || m[0].Height != 0 {
 		t.Errorf("Model.fbx dims = %dx%d, want 0x0", m[0].Width, m[0].Height)
 	}
 }

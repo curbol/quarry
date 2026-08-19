@@ -3,6 +3,7 @@ package assetindex
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -10,8 +11,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/curbol/quarry/internal/safewrite"
 )
 
 // ErrNoThumbnail is returned by OpenThumbnail for an asset that has no dedicated
@@ -41,13 +40,29 @@ func (ix *Index) Open(a Asset) (io.ReadCloser, int64, error) {
 		if !ix.underRoot(a.Source.ArchivePath) {
 			return nil, 0, ErrOutsideRoot
 		}
-		dir, err := ix.ensureExtracted(a.Source.ArchivePath)
+		p, err := ix.unpackedEntry(a, "asset")
 		if err != nil {
 			return nil, 0, err
 		}
-		return openFile(filepath.Join(dir, a.Source.Guid, "asset"))
+		return openFile(p)
 	}
 	return nil, 0, errors.New("unknown source kind")
+}
+
+// unpackedEntry is where one extracted unitypackage member sits, with the guid
+// re-checked on the way. Every other branch of Open re-validates its locator before
+// building a path from it (see openZipEntry), and this one has the same reason to: an
+// Asset arriving here need not have come from this process's scan, since Open is
+// exported and a cached index is decoded from JSON without inspection.
+func (ix *Index) unpackedEntry(a Asset, member string) (string, error) {
+	if !safeGuid(a.Source.Guid) {
+		return "", fmt.Errorf("unsafe unitypackage guid %q", a.Source.Guid)
+	}
+	dir, err := ix.ensureExtracted(a.Source.ArchivePath)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, a.Source.Guid, member), nil
 }
 
 // OpenThumbnail streams a Unity preview.png for an asset that has one.
@@ -58,11 +73,11 @@ func (ix *Index) OpenThumbnail(a Asset) (io.ReadCloser, int64, error) {
 	if !ix.underRoot(a.Source.ArchivePath) {
 		return nil, 0, ErrOutsideRoot
 	}
-	dir, err := ix.ensureExtracted(a.Source.ArchivePath)
+	p, err := ix.unpackedEntry(a, "preview.png")
 	if err != nil {
 		return nil, 0, err
 	}
-	return openFile(filepath.Join(dir, a.Source.Guid, "preview.png"))
+	return openFile(p)
 }
 
 func openFile(p string) (io.ReadCloser, int64, error) {
@@ -107,14 +122,6 @@ func (ix *Index) stagingDir() string {
 // to race one.
 const staleStagingAge = 24 * time.Hour
 
-// PruneUnpacked removes extraction directories the current index no longer
-// references: every other index version's tree, plus, within this version's, every
-// archive fingerprint absent from the index. The fingerprint includes the archive's
-// mtime, so every pack update writes to a new directory and would otherwise strand
-// the previous extraction (hundreds of MB per Synty pack) in the cache forever.
-//
-// It deletes whatever it does not recognize, including an in-flight "unpack-*" temp
-// dir, so it must run before the server starts serving rather than alongside it.
 // isLegacyIndex reports whether path is a cache file quarry wrote, rather than a
 // file of the user's that happens to share the name. Only the head is read: the real
 // thing runs to hundreds of megabytes, and the fields that identify it are at the
@@ -130,6 +137,16 @@ func isLegacyIndex(path string) bool {
 	return bytes.Contains(head[:n], []byte(`"version"`)) && bytes.Contains(head[:n], []byte(`"root"`))
 }
 
+// PruneUnpacked removes extraction directories the current index no longer
+// references: every other index version's tree, plus, within this version's, every
+// archive fingerprint absent from the index. The fingerprint includes the archive's
+// mtime, so every pack update writes to a new directory and would otherwise strand
+// the previous extraction (hundreds of MB per Synty pack) in the cache forever.
+//
+// Inside the swept tree it deletes whatever it does not recognise, which is why an
+// extraction under way is assembled in stagingDir instead — outside that tree, where
+// only one left behind long enough to be nobody's is cleared. A second quarry sharing
+// this cache dir sweeps every time it starts, so the two have to be able to overlap.
 func (ix *Index) PruneUnpacked() error {
 	if ix.cacheDir == "" {
 		return nil
@@ -151,7 +168,7 @@ func (ix *Index) PruneUnpacked() error {
 	// index.json is.
 	legacyUnpacked := filepath.Join(ix.cacheDir, "unpacked")
 	legacyIndex := filepath.Join(ix.cacheDir, "index.json")
-	if legacyUnpacked != filepath.Join(ix.stateDir(), "unpacked") && isLegacyIndex(legacyIndex) {
+	if isLegacyIndex(legacyIndex) {
 		if fi, err := os.Stat(legacyUnpacked); err == nil && fi.IsDir() {
 			remove(legacyUnpacked)
 			remove(legacyIndex)
@@ -165,17 +182,6 @@ func (ix *Index) PruneUnpacked() error {
 		for _, e := range entries {
 			if fi, err := e.Info(); err == nil && time.Since(fi.ModTime()) > staleStagingAge {
 				remove(filepath.Join(ix.stagingDir(), e.Name()))
-			}
-		}
-	}
-
-	// A run killed mid-Save leaves a 100MB-plus temp beside the cache file, which
-	// nothing else ever cleans up. Age separates that from a save another instance
-	// sharing this cache dir has in flight, whose rename would otherwise fail.
-	if stale, err := filepath.Glob(filepath.Join(ix.stateDir(), ".browse-index-*")); err == nil {
-		for _, p := range stale {
-			if fi, err := os.Stat(p); err == nil && time.Since(fi.ModTime()) > safewrite.StaleTempAge {
-				remove(p)
 			}
 		}
 	}

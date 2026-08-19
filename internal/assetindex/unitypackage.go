@@ -35,13 +35,25 @@ func (e *unityEntry) setDims(head []byte, ext string) {
 	e.head = nil
 }
 
-// splitUnityName splits a tar member name into its GUID dir and member, tolerating
-// a leading "./". It returns ok=false for names that aren't a two-part
-// <guid>/<member> or whose guid is unsafe.
 // maxPathnameBytes bounds the `pathname` member, which holds one asset path. The
 // tar comes from a downloaded archive, so it is not trusted to be small.
 const maxPathnameBytes = 64 << 10
 
+// safeGuid reports a GUID directory that can be joined to an extraction dir without
+// leaving it, and that names one entry rather than the tree holding them. "." is
+// rejected on both counts: it would extract a member to the package's own root, and
+// as a fingerprint it is the same "uguid:." for every archive that carries one, which
+// would tag two unrelated assets together.
+//
+// It is one predicate rather than two because extraction and serving have to agree:
+// a guid the scan wrote is read back out of a JSON cache before Open joins it.
+func safeGuid(guid string) bool {
+	return guid != "" && guid != "." && guid != ".." && !strings.ContainsAny(guid, `/\`)
+}
+
+// splitUnityName splits a tar member name into its GUID dir and member, tolerating
+// a leading "./". It returns ok=false for names that aren't a two-part
+// <guid>/<member> or whose guid is unsafe.
 func splitUnityName(name string) (guid, member string, ok bool) {
 	name = strings.TrimPrefix(name, "./")
 	parts := strings.SplitN(name, "/", 2)
@@ -49,7 +61,7 @@ func splitUnityName(name string) (guid, member string, ok bool) {
 		return "", "", false
 	}
 	guid, member = parts[0], parts[1]
-	if guid == "" || guid == ".." || strings.ContainsAny(guid, `/\`) {
+	if !safeGuid(guid) {
 		return "", "", false
 	}
 	return guid, member, true

@@ -44,6 +44,12 @@ func isSidecar(ext string) bool {
 // indexes differently depending on whether it shipped packed or extracted.
 func skipEntry(name string) bool {
 	for _, seg := range strings.Split(name, "/") {
+		// "." is path noise, not a name: a writer that emits "./Models/Heart.fbx" would
+		// otherwise lose the entry to the dot-file rule, and an archive written entirely
+		// that way would enumerate to nothing with no error to report.
+		if seg == "." {
+			continue
+		}
 		if strings.HasPrefix(seg, ".") {
 			return true
 		}
@@ -463,19 +469,32 @@ func vendorPack(rel string) (vendor, pack string) {
 // the survivors would reuse the suppression along with them and lose the asset.
 func dedup(assets []Asset) (kept, dropped []Asset) {
 	looseKeys := make(map[string]struct{})
+	// An assembled character has no bytes of its own and reaches its part meshes by id,
+	// which only resolves for an asset the index kept. Suppressing a part in favour of a
+	// loose twin trades one duplicate card for a limb that cannot load.
+	partIDs := make(map[string]struct{})
 	for i := range assets {
 		if assets[i].Source.Kind == SourceLoose {
 			looseKeys[looseDedupKey(assets[i])] = struct{}{}
 		}
+		for _, p := range assets[i].Source.Parts {
+			partIDs[p] = struct{}{}
+		}
 	}
 	for _, a := range assets {
-		if a.Source.Kind != SourceLoose {
-			if _, ok := looseKeys[archiveDedupKey(a)]; ok {
-				dropped = append(dropped, a)
-				continue
-			}
+		if a.Source.Kind == SourceLoose {
+			kept = append(kept, a)
+			continue
 		}
-		kept = append(kept, a)
+		if _, twinned := looseKeys[archiveDedupKey(a)]; !twinned {
+			kept = append(kept, a)
+			continue
+		}
+		if _, isPart := partIDs[a.ID]; isPart {
+			kept = append(kept, a)
+			continue
+		}
+		dropped = append(dropped, a)
 	}
 	return kept, dropped
 }

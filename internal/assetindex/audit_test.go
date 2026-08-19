@@ -11,6 +11,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,9 +31,6 @@ func libRoot(t *testing.T) (root string, mk func(...string) string) {
 	}
 }
 
-// cacheFileFor is where LoadOrBuild keeps one root's index. Tests that reach for the
-// cache file go through this rather than assembling a path, so the layout stays a
-// single decision inside the package.
 // writeFile creates path's parents and writes content. libRoot's mk covers fixtures
 // inside the library; this covers the ones a symlink points at, which are outside it.
 func writeFile(t *testing.T, path, content string) {
@@ -45,6 +43,9 @@ func writeFile(t *testing.T, path, content string) {
 	}
 }
 
+// cacheFileFor is where LoadOrBuild keeps one root's index. Tests that reach for the
+// cache file go through this rather than assembling a path, so the layout stays a
+// single decision inside the package.
 func cacheFileFor(t *testing.T, cacheDir, root string) string {
 	t.Helper()
 	abs, err := filepath.Abs(root)
@@ -207,51 +208,6 @@ func TestLoadOrBuildRebuildsFromCorruptCache(t *testing.T) {
 	}
 }
 
-// A Sidekick character whose part meshes are not in this archive cannot be
-// assembled, so its prefab/material/mesh must stay browseable — dropping them as
-// superseded byproducts leaves the character with no representation at all.
-func TestUnassembledSidekickKeepsItsByproducts(t *testing.T) {
-	root, mk := libRoot(t)
-	writeUnityPackage(t, mk("synty", "SIDEKICK_X", "SIDEKICK_X_Unity_2021_3_v1_0_0.unitypackage"), []unityGUID{
-		{guid: "sk1", pathname: "Assets/S/Characters/Warrior/Warrior_01.sk", asset: "Name: Warrior_01\nParts:\n- Name: SK_ABSENT\n"},
-		{guid: "pf1", pathname: "Assets/S/Characters/Warrior/Warrior_01.prefab", asset: "PREFAB", preview: true},
-		{guid: "mt1", pathname: "Assets/S/Characters/Warrior/Warrior_01.mat", asset: "MAT"},
-	})
-	assets, err := Scan(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	byExt := map[string]bool{}
-	for _, a := range assets {
-		byExt[a.Ext] = true
-		if a.Ext == "sk" && a.Thumb == ThumbSidekick {
-			t.Error("a character with no resolvable part was still upgraded to an assembled one")
-		}
-	}
-	if !byExt["prefab"] {
-		t.Errorf("the unassembled character lost its prefab; kept only %v", byExt)
-	}
-}
-
-// The assembled case still supersedes its byproducts.
-func TestAssembledSidekickDropsItsByproducts(t *testing.T) {
-	root, mk := libRoot(t)
-	writeUnityPackage(t, mk("synty", "SIDEKICK_Y", "SIDEKICK_Y_Unity_2021_3_v1_0_0.unitypackage"), []unityGUID{
-		{guid: "sk1", pathname: "Assets/S/Characters/Warrior/Warrior_01.sk", asset: "Name: Warrior_01\nParts:\n- Name: SK_HEAD\n"},
-		{guid: "pf1", pathname: "Assets/S/Characters/Warrior/Warrior_01.prefab", asset: "PREFAB", preview: true},
-		{guid: "hd1", pathname: "Assets/S/Resources/SK_HEAD.fbx", asset: "HEADFBX", preview: true},
-	})
-	assets, err := Scan(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, a := range assets {
-		if a.Ext == "prefab" {
-			t.Errorf("assembled character kept its superseded prefab: %s", a.RelPath)
-		}
-	}
-}
-
 // glTF animation names are optional and not required to be unique. Two clips with
 // the same name build identical Sources, so they collide on both the id the content
 // API resolves and the fingerprint tags key on — one card's tag would land on the
@@ -306,9 +262,32 @@ func TestArchiveEntryNamesAreRejected(t *testing.T) {
 			t.Errorf("ordinary zip entry %q rejected", ok)
 		}
 	}
-	for _, name := range []string{"../x/asset", "../asset", "a/b/asset", `..\\x/asset`, `a\\b/asset`} {
-		if guid, _, ok := splitUnityName(name); ok && (guid == ".." || strings.ContainsAny(guid, `/\`)) {
-			t.Errorf("unitypackage name %q yielded an escaping guid %q", name, guid)
+	// Asserted by outcome, not by re-stating splitUnityName's own reject condition: a
+	// test that only checks "if it was accepted, the guid is safe" holds for an
+	// implementation that rejects everything, and never shows an ordinary name works.
+	for _, tc := range []struct {
+		in, guid, member string
+		ok               bool
+	}{
+		{in: "a/b/asset", guid: "a", member: "b/asset", ok: true},
+		{in: "./g/asset", guid: "g", member: "asset", ok: true}, // Unity writes some members this way
+		{in: "../x/asset", ok: false},
+		{in: "../asset", ok: false},
+		{in: `..\x/asset`, ok: false},
+		{in: `a\b/asset`, ok: false},
+		{in: "asset", ok: false},   // no guid dir at all
+		{in: "//asset", ok: false}, // empty guid
+		// "." would extract to the package's own root, and as a fingerprint it is the
+		// same "uguid:." for every archive that carries one.
+		{in: "././asset", ok: false},
+	} {
+		guid, member, ok := splitUnityName(tc.in)
+		if ok != tc.ok {
+			t.Errorf("splitUnityName(%q) ok = %v, want %v", tc.in, ok, tc.ok)
+			continue
+		}
+		if ok && (guid != tc.guid || member != tc.member) {
+			t.Errorf("splitUnityName(%q) = %q,%q; want %q,%q", tc.in, guid, member, tc.guid, tc.member)
 		}
 	}
 }
@@ -511,10 +490,6 @@ func TestDedupWithAndWithoutAPackDir(t *testing.T) {
 	}
 }
 
-// Extraction is single-flighted, so a failure has many callers waiting on it. Each
-// has to be told what went wrong: re-reading the outcome from a shared map handed a
-// nil error — indistinguishable from success — to everyone who arrived after the
-// first waiter cleared the entry to re-arm the retry.
 // safeEntry is a predicate, and the thing that matters is that a hostile name never
 // reaches an Asset at all. The unitypackage side has that end to end; the zip side had
 // only the predicate, so a scan that stopped consulting it would still have passed.
@@ -625,6 +600,10 @@ func TestExtractionRetriesAfterATransientFailure(t *testing.T) {
 	}
 }
 
+// Extraction is single-flighted, so a failure has many callers waiting on it. Each
+// has to be told what went wrong: re-reading the outcome from a shared map handed a
+// nil error — indistinguishable from success — to everyone who arrived after the
+// first waiter cleared the entry to re-arm the retry.
 func TestFailedExtractionReachesEveryWaiter(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root ignores permission bits")
@@ -1194,6 +1173,173 @@ func TestCacheDirInsideASymlinkedRootIsRefused(t *testing.T) {
 		refused := err != nil && strings.Contains(err.Error(), "inside the scan root")
 		if refused != c.want {
 			t.Errorf("%s: refused = %v, want %v (err = %v)", c.name, refused, c.want, err)
+		}
+	}
+}
+
+// A "." path segment is noise a writer emits, not a hidden name. Read as one, an
+// archive written entirely that way enumerates to nothing — and because no error is
+// raised, the empty enumeration is cached against the archive's stat print and never
+// re-read. The whole pack disappears with nothing said.
+func TestDotSegmentedArchiveEntriesStillIndex(t *testing.T) {
+	root, mk := libRoot(t)
+	writeZip(t, mk("v", "Pack", "Pack_SourceFiles_v1.zip"), map[string]string{
+		"./Models/Heart.fbx": "FBXHEART",
+		"Models/Rock.fbx":    "FBXROCK",
+		// Still hidden: a real dot-name anywhere in the path.
+		"./.git/config":              "GIT",
+		"./Models/.DS_Store":         "DS",
+		"./Models/.hidden/Ghost.fbx": "GHOST",
+	})
+	writeUnityPackage(t, mk("v", "Pack", "Pack_Unity_v1.unitypackage"), []unityGUID{
+		{guid: "aaa", pathname: "./Assets/Sword.fbx", asset: "FBXSWORD"},
+	})
+
+	ix, err := Build(Options{Root: root, CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, a := range ix.Assets {
+		got[a.Name] = true
+	}
+	for _, want := range []string{"Heart.fbx", "Rock.fbx", "Sword.fbx"} {
+		if !got[want] {
+			t.Errorf("%s was dropped; indexed %v", want, names(ix.Assets))
+		}
+	}
+	for _, hidden := range []string{"config", ".DS_Store", "Ghost.fbx"} {
+		if got[hidden] {
+			t.Errorf("%s was indexed; a real dot-segment is still hidden", hidden)
+		}
+	}
+	if len(ix.Skipped) != 0 {
+		t.Errorf("skipped %v; nothing here is unreadable", ix.Skipped)
+	}
+}
+
+// Splitting a multi-clip .glb is the headline behaviour of the loose path, and every
+// run after the first reaches it through the cache instead: refresh reuses whatever
+// the previous index held for an unchanged file. A change that reused one asset per
+// path rather than all of them would collapse a 120-card animation library to a single
+// card on the second run, with every other test still green.
+func TestRefreshKeepsEveryClipOfASplitGLB(t *testing.T) {
+	root, mk := libRoot(t)
+	glb := mk("quaternius", "UAL", "UAL1.glb")
+	writeGLB(t, glb, "Walk", "Run", "Idle")
+	cacheDir := t.TempDir()
+
+	clips := func(ix *Index) map[string]string {
+		t.Helper()
+		out := map[string]string{}
+		for _, a := range ix.Assets {
+			if a.Source.Clip != "" {
+				out[a.Source.Clip] = a.Fingerprint
+			}
+		}
+		return out
+	}
+
+	first, err := LoadOrBuild(Options{Root: root, CacheDir: cacheDir}, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := clips(first)
+	if len(want) != 3 {
+		t.Fatalf("first build produced %d clips, want 3", len(want))
+	}
+
+	// Twice, because the first refresh writes the cache the second one reads back.
+	for pass := 1; pass <= 2; pass++ {
+		again, err := LoadOrBuild(Options{Root: root, CacheDir: cacheDir}, false, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := clips(again); !reflect.DeepEqual(got, want) {
+			t.Fatalf("refresh %d gave clips %v, want %v", pass, got, want)
+		}
+	}
+
+	// Editing the file re-derives them: the clip fingerprints carry the file's, so a
+	// reuse that ignored the stat print would hand back the old ones.
+	writeGLB(t, glb, "Walk", "Run", "Sprint")
+	edited, err := LoadOrBuild(Options{Root: root, CacheDir: cacheDir}, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := clips(edited)
+	if _, stale := got["Idle"]; stale || len(got) != 3 {
+		t.Errorf("after an edit clips = %v, want Walk/Run/Sprint", got)
+	}
+	if got["Walk"] == want["Walk"] {
+		t.Error("Walk kept its old fingerprint; the file's bytes changed")
+	}
+}
+
+// The archive side of refresh has two tests that make reuse observable. The loose side
+// had none, and a miss there is invisible in the output while costing a re-read and a
+// CRC32 of every loose file in the library on every startup.
+//
+// Made observable the same way: the file is unreadable after the first build but its
+// size and mtime are untouched, so a refresh that consults the cache never opens it and
+// one that re-derives records a skip and loses the asset.
+func TestRefreshReusesCachedLooseFingerprints(t *testing.T) {
+	root, mk := libRoot(t)
+	loose := mk("synty", "Pack", "Sword.glb")
+	writeFile(t, loose, "GLBBYTES")
+	cacheDir := t.TempDir()
+
+	first, err := LoadOrBuild(Options{Root: root, CacheDir: cacheDir}, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first.Assets) != 1 {
+		t.Fatalf("first build = %v, want the one loose file", names(first.Assets))
+	}
+	want := first.Assets[0].Fingerprint
+
+	unreadable(t, loose)
+	again, err := LoadOrBuild(Options{Root: root, CacheDir: cacheDir}, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(again.Skipped) != 0 {
+		t.Errorf("refresh re-read the file instead of reusing its cached fingerprint: %v", again.Skipped)
+	}
+	if len(again.Assets) != 1 || again.Assets[0].Fingerprint != want {
+		t.Errorf("refresh gave %v, want the cached asset with fingerprint %s", names(again.Assets), want)
+	}
+}
+
+// An assembled character has no bytes of its own: the frontend loads each part by id
+// through /api/content, which only resolves for an asset the index kept. applySidekick
+// resolves the parts from what survived its own pass, but dedup runs after it — so a
+// part with a loose twin was suppressed and the character rendered short that limb.
+func TestSidekickPartIDsResolveAfterDedup(t *testing.T) {
+	root, mk := libRoot(t)
+	writeUnityPackage(t, mk("synty", "SIDEKICK_D", "SIDEKICK_D_Unity_v1.unitypackage"), []unityGUID{
+		{guid: "sk1", pathname: "Assets/S/Characters/Hero.sk", asset: "Name: Hero\nParts:\n- Name: SK_HEAD\n"},
+		{guid: "hd1", pathname: "Assets/S/Resources/SK_HEAD.fbx", asset: "HEADFBX"},
+	})
+	// The same bytes at the same pack-relative subpath, extracted beside the package.
+	writeFile(t, mk("synty", "SIDEKICK_D", "Assets", "S", "Resources", "SK_HEAD.fbx"), "HEADFBX")
+
+	ix, err := Build(Options{Root: root, CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parts []string
+	for i := range ix.Assets {
+		if ix.Assets[i].Thumb == ThumbSidekick {
+			parts = ix.Assets[i].Source.Parts
+		}
+	}
+	if len(parts) == 0 {
+		t.Fatal("the character did not assemble")
+	}
+	for _, pid := range parts {
+		if _, ok := ix.Lookup(pid); !ok {
+			t.Errorf("part id %s does not resolve through Lookup; dedup suppressed a mesh the character serves", pid)
 		}
 	}
 }

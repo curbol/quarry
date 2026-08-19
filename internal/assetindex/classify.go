@@ -5,10 +5,14 @@ import (
 	"strings"
 )
 
-// Classify maps a lowercased, dotless file extension to its browse category and
+// classify maps a lowercased, dotless file extension to its browse category and
 // the kind of thumbnail the frontend can render for it. A Unity preview.png, when
 // present, overrides the thumbnail to ThumbPreview at scan time (see newAsset).
-func Classify(ext string) (Category, ThumbKind) {
+//
+// Unexported because the lowercased-and-dotless part is a precondition with no way to
+// report a breach: ".PNG" comes back as CategoryOther with nothing said. newAsset is
+// the one caller and derives the extension itself.
+func classify(ext string) (Category, ThumbKind) {
 	switch ext {
 	case "glb", "gltf":
 		return CategoryModel, ThumbGLB

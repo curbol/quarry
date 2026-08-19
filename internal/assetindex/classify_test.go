@@ -37,9 +37,9 @@ func TestClassify(t *testing.T) {
 		{"xyz", CategoryOther, ThumbNone},
 	}
 	for _, c := range cases {
-		gotCat, gotThumb := Classify(c.ext)
+		gotCat, gotThumb := classify(c.ext)
 		if gotCat != c.cat || gotThumb != c.thumb {
-			t.Errorf("Classify(%q) = (%s,%s), want (%s,%s)", c.ext, gotCat, gotThumb, c.cat, c.thumb)
+			t.Errorf("classify(%q) = (%s,%s), want (%s,%s)", c.ext, gotCat, gotThumb, c.cat, c.thumb)
 		}
 	}
 }

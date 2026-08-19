@@ -181,18 +181,27 @@ func TestFollowSymlinksStopsOnACycle(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	done := make(chan *Index, 1)
+	// The error travels with the index rather than being logged from the goroutine: a
+	// nil index reaching the receive arm below is a panic, and a t.Error racing the
+	// timeout arm's t.Fatal is a "log after test completed" panic. Either way the
+	// failure that gets reported is not the one the test is about.
+	cacheDir := t.TempDir()
+	type built struct {
+		ix  *Index
+		err error
+	}
+	done := make(chan built, 1)
 	go func() {
-		ix, err := Build(Options{Root: root, CacheDir: t.TempDir(), FollowSymlinks: true})
-		if err != nil {
-			t.Error(err)
-		}
-		done <- ix
+		ix, err := Build(Options{Root: root, CacheDir: cacheDir, FollowSymlinks: true})
+		done <- built{ix, err}
 	}()
 	select {
-	case ix := <-done:
-		if len(ix.Assets) != 2 {
-			t.Errorf("assets = %v, want the two real files exactly once", names(ix.Assets))
+	case b := <-done:
+		if b.err != nil {
+			t.Fatal(b.err)
+		}
+		if len(b.ix.Assets) != 2 {
+			t.Errorf("assets = %v, want the two real files exactly once", names(b.ix.Assets))
 		}
 	case <-time.After(20 * time.Second):
 		t.Fatal("the scan did not terminate on a symlink cycle")

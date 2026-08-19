@@ -170,7 +170,7 @@ func copyPath(s Source) string {
 // the content identity the caller has computed for this source kind.
 func newAsset(s Source, name, relPath, vendor, pack, variant string, size int64, fingerprint string) Asset {
 	ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(name), "."))
-	cat, thumb := Classify(ext)
+	cat, thumb := classify(ext)
 	if cat == CategoryImage {
 		cat = refineImage(relPath, vendor, pack)
 	}

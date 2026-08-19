@@ -3,6 +3,7 @@ package assetindex
 import (
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -70,138 +71,66 @@ func TestScanSidekickCharacter(t *testing.T) {
 	if ch.Fingerprint != unityFingerprint("sk1") {
 		t.Errorf("fingerprint = %q, want the .sk guid print (stable identity)", ch.Fingerprint)
 	}
-	// Parts resolve to the two present FBX ids, in .sk order; the missing part is dropped.
-	want := []string{
-		id(Source{Kind: SourceUnityPackage, ArchivePath: ch.Source.ArchivePath, Guid: "hd1"}),
-		id(Source{Kind: SourceUnityPackage, ArchivePath: ch.Source.ArchivePath, Guid: "to1"}),
-	}
-	if !reflect.DeepEqual(ch.Source.Parts, want) {
-		t.Errorf("parts = %v, want %v", ch.Source.Parts, want)
-	}
-}
-
-// Within a Sidekick package, the per-character byproducts under the Characters/ tree
-// (the magenta prefab, its material, the combined-mesh and avatar .asset data) are
-// dropped in favour of the assembled .sk character. The reusable parts (Resources/)
-// and the character's textures stay browseable.
-func TestScanSidekickDeclutter(t *testing.T) {
-	root, mk := libRoot(t)
-	base := "Assets/Synty/SidekickCharacters/"
-	writeUnityPackage(t, mk("synty", "SIDEKICK_X", "SIDEKICK_X_Unity_2021_3_v1_0_0.unitypackage"), []unityGUID{
-		{guid: "sk1", pathname: base + "Characters/W/W_01/W_01.sk", asset: "Name: W_01\nParts:\n- Name: SK_HEAD\n"},
-		{guid: "hd1", pathname: base + "Resources/Meshes/SK_HEAD.fbx", asset: "HEADFBX"},
-		{guid: "pf1", pathname: base + "Characters/W/W_01/W_01.prefab", asset: "PREFAB", preview: true},
-		{guid: "mt1", pathname: base + "Characters/W/W_01/Materials/W_01.mat", asset: "MAT", preview: true},
-		{guid: "av1", pathname: base + "Characters/W/W_01/Meshes/W_01-avatar.asset", asset: "AVATAR"},
-		{guid: "tx1", pathname: base + "Characters/W/W_01/Textures/T_W_01ColorMap.png", asset: "PNG"},
-	})
-
-	assets, err := Scan(root)
+	// Parts resolve to the two present FBX meshes, in .sk order; the missing part is
+	// dropped. Resolved through the index rather than recomputed with id(): the
+	// frontend fetches /api/content per part, so what matters is that each id reaches
+	// an asset the index can serve, which calling id() on both sides cannot show.
+	ix, err := Build(Options{Root: root, CacheDir: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}
-	present := map[string]Asset{}
-	for _, a := range assets {
-		present[a.Name] = a
-	}
-	for _, gone := range []string{"W_01.prefab", "W_01.mat", "W_01-avatar.asset"} {
-		if _, ok := present[gone]; ok {
-			t.Errorf("%s should have been dropped as a Sidekick byproduct", gone)
+	var got []string
+	for _, pid := range ch.Source.Parts {
+		part, ok := ix.Lookup(pid)
+		if !ok {
+			t.Errorf("part id %s does not resolve through the index; the frontend would 404 that limb", pid)
+			continue
 		}
+		got = append(got, part.Name)
 	}
-	if _, ok := present["W_01"]; !ok {
-		t.Error("the assembled character W_01 should remain")
-	}
-	if _, ok := present["SK_HEAD.fbx"]; !ok {
-		t.Error("a Resources/ part should remain browseable")
-	}
-	if _, ok := present["T_W_01ColorMap.png"]; !ok {
-		t.Error("the character texture should remain browseable")
+	if want := []string{"SK_HEAD.fbx", "SK_TORS.fbx"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("parts resolved to %v, want %v", got, want)
 	}
 }
 
-// Byproduct suppression is bounded to the character it belongs to, not to the directory
-// its .sk sits in. Two characters commonly share a directory, and scoping by directory
-// meant a character that failed to assemble lost its byproducts to its neighbour's tree
-// — the exact opposite of what sidekickByproduct promises.
-func TestSidekickSuppressionIsBoundedToItsOwnCharacter(t *testing.T) {
+// A part name is matched on the base name alone, and a package's demo or showcase
+// meshes can carry the same one. The parts tree wins, so a character is assembled from
+// the meshes meant to be worn rather than from whichever copy was enumerated last.
+func TestSidekickPrefersThePartsTreeMesh(t *testing.T) {
 	root, mk := libRoot(t)
-	writeUnityPackage(t, mk("synty", "SIDEKICK_X", "SIDEKICK_X_Unity_2021_3_v1_0_0.unitypackage"), []unityGUID{
-		{guid: "sk1", pathname: "Assets/S/Characters/Warrior_01.sk", asset: "Name: Warrior_01\nParts:\n- Name: SK_HEAD\n"},
-		{guid: "sk2", pathname: "Assets/S/Characters/Warrior_02.sk", asset: "Name: Warrior_02\nParts:\n- Name: SK_ABSENT\n"},
-		{guid: "hd1", pathname: "Assets/S/Resources/Meshes/SK_HEAD.fbx", asset: "HEADFBX"},
-		{guid: "p1", pathname: "Assets/S/Characters/Warrior_01.prefab", asset: "PREFAB1"},
-		{guid: "p2", pathname: "Assets/S/Characters/Warrior_02.prefab", asset: "PREFAB2"},
-	})
-
-	assets, err := Scan(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	kept := map[string]bool{}
-	for _, a := range assets {
-		kept[a.Name] = true
-	}
-	if !kept["Warrior_01"] {
-		t.Error("Warrior_01 did not assemble")
-	}
-	if kept["Warrior_01.prefab"] {
-		t.Error("the assembled character's own prefab survived; it is superseded")
-	}
-	if !kept["Warrior_02.prefab"] {
-		t.Error("Warrior_02 failed to assemble, so its prefab is the only representation it has left — and it was dropped")
-	}
-}
-
-// A .sk exported to the top of a package makes its directory the whole package. Scoping
-// suppression by directory then claimed every prefab, material and .asset in it.
-func TestSidekickAtThePackageRootDoesNotClaimEverything(t *testing.T) {
-	root, mk := libRoot(t)
-	writeUnityPackage(t, mk("synty", "SIDEKICK_Y", "SIDEKICK_Y_Unity_2021_3_v1_0_0.unitypackage"), []unityGUID{
-		{guid: "sk1", pathname: "Assets/Hero.sk", asset: "Name: Hero\nParts:\n- Name: SK_HEAD\n"},
-		{guid: "hd1", pathname: "Assets/Resources/Meshes/SK_HEAD.fbx", asset: "HEADFBX"},
-		{guid: "u1", pathname: "Assets/Totally/Unrelated/Rock.prefab", asset: "ROCK"},
-		{guid: "u2", pathname: "Assets/Totally/Unrelated/Rock.mat", asset: "ROCKMAT"},
-		{guid: "u3", pathname: "Assets/Other/Tree.asset", asset: "TREE"},
-	})
-
-	assets, err := Scan(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	kept := map[string]bool{}
-	for _, a := range assets {
-		kept[a.Name] = true
-	}
-	if !kept["Hero"] {
-		t.Error("Hero did not assemble")
-	}
-	for _, n := range []string{"Rock.prefab", "Rock.mat", "Tree.asset"} {
-		if !kept[n] {
-			t.Errorf("%s was dropped as a Sidekick byproduct; it has nothing to do with the character", n)
-		}
-	}
-}
-
-// Two characters whose names share a prefix. Synty joins a byproduct's suffix to the
-// character name with the same "_" the names themselves contain, so only the longer
-// claim tells "Hero_Alt.prefab" (Hero_Alt's) apart from "Hero_CombinedMesh.asset"
-// (Hero's). Hero_Alt failed to assemble here, so its byproducts are all it has left.
-func TestSidekickDoesNotClaimALongerNamedNeighbour(t *testing.T) {
-	root, mk := libRoot(t)
-	writeUnityPackage(t, mk("synty", "SIDEKICK_Z", "SIDEKICK_Z_Unity_2021_3_v1_0_0.unitypackage"), []unityGUID{
+	writeUnityPackage(t, mk("synty", "SIDEKICK_P", "SIDEKICK_P_Unity_2021_3_v1_0_0.unitypackage"), []unityGUID{
 		{guid: "sk1", pathname: "Assets/S/Characters/Hero.sk", asset: "Name: Hero\nParts:\n- Name: SK_HEAD\n"},
-		{guid: "hd1", pathname: "Assets/S/Resources/Meshes/SK_HEAD.fbx", asset: "HEADFBX"},
-		{guid: "sk2", pathname: "Assets/S/Characters/Hero_Alt.sk", asset: "Name: Hero_Alt\nParts:\n- Name: SK_ABSENT\n"},
-		{guid: "p2", pathname: "Assets/S/Characters/Hero_Alt.prefab", asset: "PREFAB2"},
-		{guid: "m2", pathname: "Assets/S/Characters/Hero_Alt.mat", asset: "MAT2"},
-		// Hero's own byproducts, which it does supersede.
-		{guid: "p1", pathname: "Assets/S/Characters/Hero.prefab", asset: "PREFAB1"},
-		{guid: "c1", pathname: "Assets/S/Characters/Hero_CombinedMesh.asset", asset: "MESH1"},
-		// A neighbour that merely starts with the character name is not a byproduct.
-		{guid: "u1", pathname: "Assets/S/Characters/HeroicBanner.prefab", asset: "BANNER"},
+		{guid: "hd1", pathname: "Assets/S/Resources/Meshes/SK_HEAD.fbx", asset: "REALPART"},
+		// Enumerated after the real one, so last-write-wins would pick this.
+		{guid: "sh1", pathname: "Assets/S/Demo/Showcase/SK_HEAD.fbx", asset: "SHOWCASE"},
 	})
+	ix, err := Build(Options{Root: root, CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range ix.Assets {
+		if ix.Assets[i].Thumb != ThumbSidekick {
+			continue
+		}
+		for _, pid := range ix.Assets[i].Source.Parts {
+			part, ok := ix.Lookup(pid)
+			if !ok {
+				t.Fatalf("part id %s does not resolve", pid)
+			}
+			if !strings.Contains(part.Source.Pathname, "/Resources/") {
+				t.Errorf("part resolved to %s, want the mesh under Resources/", part.Source.Pathname)
+			}
+		}
+	}
+}
 
+// scanPackage writes one unitypackage into a fresh library and reports the display
+// names it indexed. Every byproduct case is the same shape — a package in, a set of
+// surviving rows out — so they read as one table rather than six near-identical tests.
+func scanPackage(t *testing.T, entries []unityGUID) map[string]bool {
+	t.Helper()
+	root, mk := libRoot(t)
+	writeUnityPackage(t, mk("synty", "SIDEKICK", "SIDEKICK_Unity_2021_3_v1_0_0.unitypackage"), entries)
 	assets, err := Scan(root)
 	if err != nil {
 		t.Fatal(err)
@@ -210,21 +139,122 @@ func TestSidekickDoesNotClaimALongerNamedNeighbour(t *testing.T) {
 	for _, a := range assets {
 		kept[a.Name] = true
 	}
-	if !kept["Hero"] {
-		t.Fatal("Hero did not assemble")
-	}
-	for _, n := range []string{"Hero_Alt.prefab", "Hero_Alt.mat"} {
-		if !kept[n] {
-			t.Errorf("%s was dropped, but it belongs to Hero_Alt, which failed to assemble and has no other representation", n)
-		}
-	}
-	if !kept["HeroicBanner.prefab"] {
-		t.Error("HeroicBanner.prefab was dropped; it only shares a prefix with the character name")
-	}
-	for _, n := range []string{"Hero.prefab", "Hero_CombinedMesh.asset"} {
-		if kept[n] {
-			t.Errorf("%s survived; the assembled character supersedes its own byproducts", n)
-		}
+	return kept
+}
+
+// Which per-character byproducts an assembled .sk supersedes, and which it must leave
+// alone. The rule is that the longest character name matching the file wins the claim,
+// and only then does that character's assembly decide — so everything here turns on
+// scoping the claim correctly and on what counts as assembled.
+func TestSidekickByproductSuppression(t *testing.T) {
+	head := unityGUID{guid: "hd1", pathname: "Assets/S/Resources/Meshes/SK_HEAD.fbx", asset: "HEADFBX"}
+	for _, tc := range []struct {
+		name    string
+		entries []unityGUID
+		kept    []string
+		gone    []string
+	}{
+		{
+			// The magenta prefab, its material and the combined-mesh / avatar data are
+			// what the assembled character replaces. The reusable part under Resources/
+			// and the character's own textures are not byproducts.
+			name: "an assembled character supersedes its own byproducts",
+			entries: []unityGUID{
+				{guid: "sk1", pathname: "Assets/S/Characters/W_01/W_01.sk", asset: "Name: W_01\nParts:\n- Name: SK_HEAD\n"},
+				head,
+				{guid: "pf1", pathname: "Assets/S/Characters/W_01/W_01.prefab", asset: "PREFAB", preview: true},
+				{guid: "mt1", pathname: "Assets/S/Characters/W_01/Materials/W_01.mat", asset: "MAT", preview: true},
+				{guid: "av1", pathname: "Assets/S/Characters/W_01/Meshes/W_01-avatar.asset", asset: "AVATAR"},
+				{guid: "tx1", pathname: "Assets/S/Characters/W_01/Textures/T_W_01ColorMap.png", asset: "PNG"},
+			},
+			kept: []string{"W_01", "SK_HEAD.fbx", "T_W_01ColorMap.png"},
+			gone: []string{"W_01.prefab", "W_01.mat", "W_01-avatar.asset"},
+		},
+		{
+			// A character whose parts are not in this archive has its prefab and material
+			// as its only representation, and it must not be upgraded either.
+			name: "a character that could not assemble keeps everything",
+			entries: []unityGUID{
+				{guid: "sk1", pathname: "Assets/S/Characters/Warrior_01.sk", asset: "Name: Warrior_01\nParts:\n- Name: SK_ABSENT\n"},
+				{guid: "pf1", pathname: "Assets/S/Characters/Warrior_01.prefab", asset: "PREFAB", preview: true},
+				{guid: "mt1", pathname: "Assets/S/Characters/Warrior_01.mat", asset: "MAT"},
+			},
+			kept: []string{"Warrior_01.sk", "Warrior_01.prefab", "Warrior_01.mat"},
+			gone: []string{"Warrior_01"},
+		},
+		{
+			// Two characters in one directory: scoping the claim by directory alone let
+			// the one that assembled take the other's byproducts.
+			name: "an assembled character does not claim its neighbour's byproducts",
+			entries: []unityGUID{
+				{guid: "sk1", pathname: "Assets/S/Characters/Warrior_01.sk", asset: "Name: Warrior_01\nParts:\n- Name: SK_HEAD\n"},
+				{guid: "sk2", pathname: "Assets/S/Characters/Warrior_02.sk", asset: "Name: Warrior_02\nParts:\n- Name: SK_ABSENT\n"},
+				head,
+				{guid: "p1", pathname: "Assets/S/Characters/Warrior_01.prefab", asset: "PREFAB1"},
+				{guid: "p2", pathname: "Assets/S/Characters/Warrior_02.prefab", asset: "PREFAB2"},
+			},
+			kept: []string{"Warrior_01", "Warrior_02.prefab"},
+			gone: []string{"Warrior_01.prefab"},
+		},
+		{
+			// One part of two resolved. The character is still worth showing, but the
+			// combined mesh and prefab are the rows that show it whole — the same
+			// outcome readUnityAssetBytes refuses a truncated .sk read to avoid.
+			name: "a partly assembled character keeps its byproducts",
+			entries: []unityGUID{
+				{guid: "sk1", pathname: "Assets/S/Characters/Hero.sk", asset: "Name: Hero\nParts:\n- Name: SK_HEAD\n- Name: SK_ABSENT\n"},
+				head,
+				{guid: "p1", pathname: "Assets/S/Characters/Hero.prefab", asset: "PREFAB"},
+				{guid: "c1", pathname: "Assets/S/Characters/Hero_CombinedMesh.asset", asset: "MESH"},
+			},
+			kept: []string{"Hero", "Hero.prefab", "Hero_CombinedMesh.asset"},
+		},
+		{
+			// A .sk exported to the top of a package makes its directory the whole
+			// package, so the name has to carry the claim on its own.
+			name: "a character at the package root claims nothing by directory",
+			entries: []unityGUID{
+				{guid: "sk1", pathname: "Assets/Hero.sk", asset: "Name: Hero\nParts:\n- Name: SK_HEAD\n"},
+				{guid: "hd1", pathname: "Assets/Resources/Meshes/SK_HEAD.fbx", asset: "HEADFBX"},
+				{guid: "u1", pathname: "Assets/Totally/Unrelated/Rock.prefab", asset: "ROCK"},
+				{guid: "u2", pathname: "Assets/Totally/Unrelated/Rock.mat", asset: "ROCKMAT"},
+				{guid: "u3", pathname: "Assets/Other/Tree.asset", asset: "TREE"},
+			},
+			kept: []string{"Hero", "Rock.prefab", "Rock.mat", "Tree.asset"},
+		},
+		{
+			// Synty joins a byproduct's suffix to the character name with the same "_"
+			// the names themselves contain, so "Hero_Alt.prefab" is Hero_Alt's only
+			// because Hero_Alt is the longer claim on it. "HeroicBanner" merely shares a
+			// prefix and is nobody's byproduct.
+			name: "the longer character name wins the claim",
+			entries: []unityGUID{
+				{guid: "sk1", pathname: "Assets/S/Characters/Hero.sk", asset: "Name: Hero\nParts:\n- Name: SK_HEAD\n"},
+				head,
+				{guid: "sk2", pathname: "Assets/S/Characters/Hero_Alt.sk", asset: "Name: Hero_Alt\nParts:\n- Name: SK_ABSENT\n"},
+				{guid: "p2", pathname: "Assets/S/Characters/Hero_Alt.prefab", asset: "PREFAB2"},
+				{guid: "m2", pathname: "Assets/S/Characters/Hero_Alt.mat", asset: "MAT2"},
+				{guid: "p1", pathname: "Assets/S/Characters/Hero.prefab", asset: "PREFAB1"},
+				{guid: "c1", pathname: "Assets/S/Characters/Hero_CombinedMesh.asset", asset: "MESH1"},
+				{guid: "u1", pathname: "Assets/S/Characters/HeroicBanner.prefab", asset: "BANNER"},
+			},
+			kept: []string{"Hero", "Hero_Alt.prefab", "Hero_Alt.mat", "HeroicBanner.prefab"},
+			gone: []string{"Hero.prefab", "Hero_CombinedMesh.asset"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			kept := scanPackage(t, tc.entries)
+			for _, n := range tc.kept {
+				if !kept[n] {
+					t.Errorf("%s was dropped; want it kept", n)
+				}
+			}
+			for _, n := range tc.gone {
+				if kept[n] {
+					t.Errorf("%s survived; want it superseded", n)
+				}
+			}
+		})
 	}
 }
 

@@ -3,9 +3,9 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { FBXLoader } from 'three/addons/loaders/FBXLoader.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import {
-  contentURL, loadModel, loadSidekick, normalizeClip, boneNames, clipBones, clipsForAsset, loadRMClips,
+  contentURL, loadModel, loadSidekick, normalizeClip, clipBones, clipsForAsset, loadRMClips,
   coversBones, posedBox, frameBox, isRenderable, captureRootRest, uprightRig,
-  prepareClipRig, cloneRig, poseAt, retargetedFor, stripRootMotion, dispose, CharRegistry, CLAY, _posedV,
+  prepareClipRig, cloneRig, poseAt, retargetedFor, stripRootMotion, dispose, CharRegistry, rigEntry, rigCandidates, CLAY, _posedV,
 } from '/static/scene.js';
 
 const PAGE = 200;
@@ -837,7 +837,7 @@ class ModelThumbnails {
     this.worker.postMessage({
       id: asset.id,
       asset: {
-        id: asset.id, ext: asset.ext, vendor: asset.vendor, thumb: asset.thumb,
+        id: asset.id, ext: asset.ext, vendor: asset.vendor, pack: asset.pack, thumb: asset.thumb,
         source: {
           clip: asset.source && asset.source.clip,
           filePath: asset.source && asset.source.filePath,
@@ -1332,7 +1332,8 @@ function startViewer(container, asset) {
     const superseded = () => stopped || mine !== charSeq;
     return loadModel(contentURL(item.id), item.ext).then(async (char) => {
       if (superseded()) { dispose(char); return true; }
-      CharRegistry.add({ id: item.id, name: item.name, ext: item.ext, bones: boneNames(char), vendor: item.vendor });
+      const entry = rigEntry(item, char);
+      if (entry) CharRegistry.add(entry);
       const clips = await Promise.all(soloClips.map((c) => retargetedFor(c, asset.vendor, char)));
       let rmCs = null;
       const rmRaw = await loadRMClips(asset); // travel sibling, retargeted onto the same body
@@ -1395,10 +1396,8 @@ function startViewer(container, asset) {
     const run = async (q) => {
       const my = ++seq;
       if (!q) { items = suggestKnown(); active = -1; render(); return; }
-      try {
-        const d = await (await fetch('/api/assets?type=model&limit=8&q=' + encodeURIComponent(q))).json();
-        if (my === seq) { items = d.items || []; active = -1; render(); }
-      } catch { /* ignore */ }
+      const found = await rigCandidates(q, null, 8, ['model', 'animation']);
+      if (my === seq) { items = found; active = -1; render(); }
     };
     let t;
     input.addEventListener('input', () => { clearTimeout(t); t = setTimeout(() => run(input.value.trim()), 180); });
@@ -1504,7 +1503,8 @@ function startViewer(container, asset) {
       // A sidekick group is many part meshes each on its own copy of the skeleton;
       // registering it as a rig would pollute the registry with duplicate bone names.
       if (asset.thumb !== 'sidekick') {
-        CharRegistry.add({ id: asset.id, name: asset.name, ext: asset.ext, bones: boneNames(root), vendor: asset.vendor });
+        const entry = rigEntry(asset, root);
+        if (entry) CharRegistry.add(entry);
       }
       // buildPlayback corrects orientation and frames from the reference box; do the same
       // for a static (clip-less) renderable so a Z-up model still stands upright and framed.
@@ -1535,7 +1535,7 @@ function startViewer(container, asset) {
     };
     if (await playOnMatch()) return;
     if (stopped) return;
-    await CharRegistry.discoverForVendor(asset.vendor, bones);
+    await CharRegistry.discoverForVendor(asset.vendor, bones, asset.pack);
     if (await playOnMatch()) return;
     if (stopped) return;
     showPlaceholder('Animation clip — pick a character in the sidebar →');

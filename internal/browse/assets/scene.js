@@ -313,6 +313,41 @@ function prepareClipRig(rig, rootRest) {
 // the hierarchy, then rebind each SkinnedMesh to a cloned skeleton whose bones point at the
 // cloned nodes. Lets the thumbnails reuse one loaded body but pose each clip on a fresh
 // skeleton, matching the lightbox's fresh-load pipeline.
+// hideAlternates hides the versions a file stacks in one place, keeping the first of
+// each. A prop ships as a variant sheet — Synty's bow rig carries eight complete bows
+// at one origin — and borrowing that to play a clip draws all eight at once.
+//
+// Two meshes are versions of each other when they sit in the same place at the same
+// level of detail. Position alone would be wrong: a bowstring sits inside the bow it
+// belongs to. Detail alone would be wrong too: a character's sword and helmet are
+// modelled as finely as each other. Together they separate the cases with room to
+// spare — measured across that bow sheet and a character carrying a sword, shield and
+// helmet, versions drift at most 0.21 of the smaller mesh's own extent while real
+// parts start at 0.94, and a string carries 72 vertices against a bow's 16,000.
+//
+// Hidden rather than removed: a file's bone hierarchy can hang off a mesh, and
+// removing that would take the rig with it.
+function hideAlternates(root) {
+  root.updateMatrixWorld(true);
+  const kept = [];
+  root.traverse((n) => {
+    if (!n.isMesh || !n.visible) return;
+    const box = new THREE.Box3().setFromObject(n);
+    const verts = n.geometry && n.geometry.attributes.position ? n.geometry.attributes.position.count : 0;
+    const version = (k) => centreDrift(k.box, box) < 0.5 && Math.max(k.verts, verts) <= 8 * Math.max(Math.min(k.verts, verts), 1);
+    if (kept.some(version)) n.visible = false;
+    else kept.push({ box, verts });
+  });
+  return root;
+}
+
+// centreDrift is how far apart two boxes sit, measured against the smaller one's own
+// diagonal so it reads the same at any scale.
+function centreDrift(a, b) {
+  const span = Math.min(a.getSize(_posedV).length(), b.getSize(_posedV).length());
+  return a.getCenter(new THREE.Vector3()).distanceTo(b.getCenter(new THREE.Vector3())) / Math.max(span, 1e-3);
+}
+
 function cloneRig(source) {
   const srcLookup = new Map(), cloneLookup = new Map();
   const clone = source.clone();
@@ -649,6 +684,6 @@ const CharRegistry = {
 export {
   loadModel, loadSidekick, normalizeClip, boneNames, clipBones, clipsForAsset, loadRMClips, isSynty,
   coversBones, posedBox, frameBox, isRenderable, captureRootRest, uprightRig, prepareClipRig,
-  cloneRig, poseAt, retargetedFor, stripRootMotion, dispose, disposeClone, CharRegistry, rigEntry, rigCandidates, CLAY, _posedV,
+  cloneRig, hideAlternates, poseAt, retargetedFor, stripRootMotion, dispose, disposeClone, CharRegistry, rigEntry, rigCandidates, CLAY, _posedV,
   rootBone, rootBoneName,
 };

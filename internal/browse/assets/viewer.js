@@ -13,7 +13,7 @@ import {
   contentURL, thumbURL, loadModel, loadSidekick, normalizeClip, clipBones, clipsForAsset,
   loadRMClips, isSynty, coversBones, posedBox, frameBox, isRenderable, captureRootRest,
   uprightRig, prepareClipRig, poseAt, retargetedFor, stripRootMotion, dispose, CharRegistry,
-  rigEntry, rigCandidates, rootBoneName, CLAY, _posedV,
+  rigEntry, rigCandidates, rootBoneName, hideAlternates, CLAY, _posedV,
 } from '/static/scene.js';
 import { iconEl } from '/static/icons.js';
 
@@ -241,6 +241,7 @@ export function startViewer(container, asset, panels) {
       if (superseded()) { dispose(char); return true; }
       const entry = rigEntry(item, char);
       if (entry) CharRegistry.add(entry);
+      hideAlternates(char);
       const clips = await Promise.all(soloClips.map((c) => retargetedFor(c, asset.vendor, char)));
       let rmCs = null;
       const rmRaw = await loadRMClips(asset); // travel sibling, retargeted onto the same body

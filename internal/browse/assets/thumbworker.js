@@ -30,7 +30,7 @@ if (typeof window === 'undefined') {
 import * as THREE from '/static/vendor/three/three.module.min.js';
 import {
   loadModel, loadSidekick, clipsForAsset, prepareClipRig, poseAt, stripRootMotion, isRenderable, isSynty,
-  captureRootRest, cloneRig, retargetedFor, dispose, disposeClone, CharRegistry, frameBox, contentURL, clipBones,
+  captureRootRest, cloneRig, hideAlternates, retargetedFor, dispose, disposeClone, CharRegistry, frameBox, contentURL, clipBones,
   rootBoneName,
 } from '/static/scene.js';
 import { JobTracker } from '/static/jobtracker.js';
@@ -181,7 +181,7 @@ async function buildPosed(clip, asset, rootRest) {
   const vendor = asset.vendor;
   const template = await rigFor(clip, asset);
   if (!template) return false;
-  const rig = cloneRig(template);
+  const rig = hideAlternates(cloneRig(template));
   const refBox = prepareClipRig(rig, isSynty(vendor) ? null : rootRest);
   const posed = stripRootMotion(await retargetedFor(clip, vendor, rig), rootBoneName(rig), rig.userData.upAxis);
   const mixer = poseAt(rig, posed);

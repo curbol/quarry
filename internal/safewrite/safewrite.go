@@ -9,7 +9,14 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"time"
 )
+
+// StaleTempAge is how old a temp file an interrupted write abandoned must be before
+// the next write clears it. Anything younger could belong to another process writing
+// the same file right now, and the point of the sweep is to leave one less thing
+// behind rather than to race one.
+const StaleTempAge = 24 * time.Hour
 
 // Atomic writes what encode produces to path through a temp file in path's own
 // directory, renamed into place. A reader therefore never sees a half-written file,
@@ -23,6 +30,10 @@ import (
 // gone" with nothing reporting an error.
 func Atomic(path, tmpPattern string, encode func(io.Writer) error) error {
 	path = resolveLinks(path)
+	// Swept here rather than by the caller, which knows the path it asked for but not
+	// the one a symlink resolved it to — and the temp is created in the resolved
+	// directory, so that is the only place an abandoned one can be.
+	sweepStaleTemps(filepath.Dir(path), tmpPattern)
 	tmp, err := os.CreateTemp(filepath.Dir(path), tmpPattern)
 	if err != nil {
 		return err
@@ -145,4 +156,20 @@ func Stream(dst string, src io.Reader, perm os.FileMode) error {
 		return err
 	}
 	return nil
+}
+
+// sweepStaleTemps removes temp files an interrupted write abandoned. Destinations
+// like the tag store sit in a user's project directory, often under source control,
+// where a leftover is one more thing to notice and explain; failures are ignored
+// because this is tidying, not part of the write.
+func sweepStaleTemps(dir, tmpPattern string) {
+	matches, err := filepath.Glob(filepath.Join(dir, tmpPattern))
+	if err != nil {
+		return
+	}
+	for _, m := range matches {
+		if fi, err := os.Stat(m); err == nil && !fi.IsDir() && time.Since(fi.ModTime()) > StaleTempAge {
+			os.Remove(m)
+		}
+	}
 }

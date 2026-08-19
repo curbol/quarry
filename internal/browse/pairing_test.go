@@ -1,36 +1,55 @@
 package browse
 
 import (
+	"path"
+	"strings"
 	"testing"
 
 	"github.com/curbol/quarry/internal/assetindex"
 )
 
+// zipAnim is one animation inside a zip, the shape most pairing cases are built from.
+func zipAnim(id, vendor, pack, archive, entry string) assetindex.Asset {
+	return assetindex.Asset{
+		ID: id, Ext: strings.TrimPrefix(path.Ext(entry), "."), Vendor: vendor, Pack: pack,
+		Category: assetindex.CategoryAnimation,
+		Source:   assetindex.Source{Kind: assetindex.SourceZip, ArchivePath: archive, Entry: entry},
+	}
+}
+
+// looseAnim is one animation in a loose file, where a clip name disambiguates the
+// several a single file can hold. Ext follows the path in both helpers, as the scan
+// sets it, so a case cannot pair on an extension its own filename contradicts.
+func looseAnim(id, vendor, pack, file, clip string) assetindex.Asset {
+	return assetindex.Asset{
+		ID: id, Ext: strings.TrimPrefix(path.Ext(file), "."), Vendor: vendor, Pack: pack,
+		Category: assetindex.CategoryAnimation,
+		Source:   assetindex.Source{Kind: assetindex.SourceLoose, FilePath: file, Clip: clip},
+	}
+}
+
+// as returns the asset with another category, for the cases that turn on a group
+// holding more than one kind.
+func as(a assetindex.Asset, cat assetindex.Category) assetindex.Asset {
+	a.Category = cat
+	return a
+}
+
 func TestBuildRootMotionPairs(t *testing.T) {
-	animZip := func(id, entry, clip, ext string) assetindex.Asset {
-		return assetindex.Asset{ID: id, Ext: ext, Vendor: "synty", Pack: "Loco", Category: assetindex.CategoryAnimation,
-			Source: assetindex.Source{Kind: assetindex.SourceZip, ArchivePath: "a.zip", Entry: entry, Clip: clip}}
-	}
-	loose := func(id, fp, clip, ext string, cat assetindex.Category) assetindex.Asset {
-		return assetindex.Asset{ID: id, Ext: ext, Vendor: "quaternius", Pack: "UAL", Category: cat,
-			Source: assetindex.Source{Kind: assetindex.SourceLoose, FilePath: fp, Clip: clip}}
-	}
-	kevdev := func(id, fp string) assetindex.Asset {
-		return assetindex.Asset{ID: id, Ext: "fbx", Vendor: "kevdev", Pack: "HBM", Category: assetindex.CategoryAnimation,
-			Source: assetindex.Source{Kind: assetindex.SourceLoose, FilePath: fp}}
-	}
 	assets := []assetindex.Asset{
-		animZip("n1", "SF/Turn_Masc.fbx", "", "fbx"),                              // Synty non-RM
-		animZip("r1", "SF/Turn_RM_Masc.fbx", "", "fbx"),                           // its RM sibling
-		loose("g1", "/lib/UAL1.glb", "Walk", "glb", assetindex.CategoryAnimation), // GLB non-RM clips
-		loose("g2", "/lib/UAL1.glb", "Run", "glb", assetindex.CategoryAnimation),
-		loose("grf", "/lib/UAL1_RM.fbx", "", "fbx", assetindex.CategoryModel),      // wrong-ext RM, listed first (as Unity/ sorts before Unreal-Godot/)
-		loose("gr", "/lib/UAL1_RM.glb", "", "glb", assetindex.CategoryModel),       // the glb RM sibling
-		loose("solo", "/lib/Idle.glb", "Sit", "glb", assetindex.CategoryAnimation), // no RM sibling
-		kevdev("kv", "/lib/Walk/HumanF@Walk_Fwd.fbx"),                              // kevdev in-place
-		kevdev("kvrm", "/lib/Walk/RootMotion/HumanF@Walk_Fwd [RM].fbx"),            // kevdev bracket RM, in a RootMotion/ subfolder
-		animZip("sp", "SF/A_Dodge_L_Sword.fbx", "", "fbx"),                         // Synty Polygon in-place
-		animZip("sprm", "SF/A_Dodge_L_RootMotion_Sword.fbx", "", "fbx"),            // its RootMotion sibling
+		zipAnim("n1", "synty", "Loco", "a.zip", "SF/Turn_Masc.fbx"),    // Synty non-RM
+		zipAnim("r1", "synty", "Loco", "a.zip", "SF/Turn_RM_Masc.fbx"), // its RM sibling
+		looseAnim("g1", "quaternius", "UAL", "/lib/UAL1.glb", "Walk"),  // GLB non-RM clips
+		looseAnim("g2", "quaternius", "UAL", "/lib/UAL1.glb", "Run"),
+		// wrong-ext RM, listed first (as Unity/ sorts before Unreal-Godot/)
+		as(looseAnim("grf", "quaternius", "UAL", "/lib/UAL1_RM.fbx", ""), assetindex.CategoryModel),
+		// the glb RM sibling
+		as(looseAnim("gr", "quaternius", "UAL", "/lib/UAL1_RM.glb", ""), assetindex.CategoryModel),
+		looseAnim("solo", "quaternius", "UAL", "/lib/Idle.glb", "Sit"),                  // no RM sibling
+		looseAnim("kv", "kevdev", "HBM", "/lib/Walk/HumanF@Walk_Fwd.fbx", ""),           // kevdev in-place
+		looseAnim("kvrm", "kevdev", "HBM", "/lib/Walk/RM/HumanF@Walk_Fwd [RM].fbx", ""), // kevdev bracket RM, in its own subfolder
+		zipAnim("sp", "synty", "Loco", "a.zip", "SF/A_Dodge_L_Sword.fbx"),               // Synty Polygon in-place
+		zipAnim("sprm", "synty", "Loco", "a.zip", "SF/A_Dodge_L_RootMotion_Sword.fbx"),  // its RootMotion sibling
 	}
 
 	sibling, suppressed := buildRootMotionPairs(assets)
@@ -66,15 +85,98 @@ func TestBuildRootMotionPairs(t *testing.T) {
 	}
 }
 
+// splitEntry is where the platform enters pairing, so it is checked over both
+// separator sets directly: a Unix host leaves a backslash alone, which would leave
+// the Windows half of this untested everywhere it can actually be run.
+func TestSplitEntry(t *testing.T) {
+	tests := []struct {
+		name, path, seps  string
+		wantDir, wantBase string
+	}{
+		{"slash path, slash seps", "Anims/Goblin/Walk.fbx", "/", "Anims/Goblin", "Walk.fbx"},
+		{"no separator", "Walk.fbx", "/", "", "Walk.fbx"},
+		{"backslash path read as Windows", `lib\Walk\RM\Fwd [RM].fbx`, `/\`, `lib\Walk\RM`, "Fwd [RM].fbx"},
+		{"backslash path read as slash-only", `lib\Walk\Fwd.fbx`, "/", "", `lib\Walk\Fwd.fbx`},
+		{"mixed separators read as Windows", `lib/Walk\Fwd.fbx`, `/\`, `lib/Walk`, "Fwd.fbx"},
+		{"trailing separator", "Anims/", "/", "Anims", ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir, base := splitEntry(tc.path, tc.seps)
+			if dir != tc.wantDir || base != tc.wantBase {
+				t.Errorf("splitEntry(%q, %q) = (%q, %q), want (%q, %q)", tc.path, tc.seps, dir, base, tc.wantDir, tc.wantBase)
+			}
+		})
+	}
+}
+
+func TestSeparatorsForFollowsThePlatform(t *testing.T) {
+	if got := separatorsFor('\\'); got != `/\` {
+		t.Errorf("windows separators = %q, want %q", got, `/\`)
+	}
+	if got := separatorsFor('/'); got != "/" {
+		t.Errorf("unix separators = %q, want %q", got, "/")
+	}
+}
+
+// windowsPaths installs the Windows separator set for one test. A loose file's path
+// is whatever the filesystem handed the scan, so on Windows it holds backslashes
+// while a zip entry and a unity pathname never do; a Unix host cannot produce that
+// input on its own, and this is the behaviour that has to be pinned.
+func windowsPaths(t *testing.T) {
+	t.Helper()
+	prev := osSeparators
+	osSeparators = separatorsFor('\\')
+	t.Cleanup(func() { osSeparators = prev })
+}
+
+// Splitting a loose path with "/" alone left the directory inside the base name, so a
+// pack keeping its root-motion files in their own folder stopped pairing entirely: no
+// toggle on the card, and the RM file showing as a card of its own beside it.
+func TestPairingPairsAcrossDirectoriesOnWindows(t *testing.T) {
+	windowsPaths(t)
+	at := func(id string, parts ...string) assetindex.Asset {
+		return looseAnim(id, "kevdev", "HBM", strings.Join(parts, `\`), "")
+	}
+	sibling, suppressed := buildRootMotionPairs([]assetindex.Asset{
+		at("kv", "lib", "Walk", "HumanF@Walk_Fwd.fbx"),
+		at("kvrm", "lib", "Walk", "RootMotion", "HumanF@Walk_Fwd [RM].fbx"),
+	})
+	if sibling["kv"] != "kvrm" {
+		t.Errorf("kv -> %q, want kvrm", sibling["kv"])
+	}
+	if !suppressed["kvrm"] {
+		t.Error("the RM file was not suppressed, so it shows as a card beside the pair")
+	}
+}
+
+// The same-directory preference is a tie-break between candidates, so it has to read
+// a real directory. Taking every loose asset's directory as the same empty string made
+// it fire for every candidate at once, leaving the pick to whichever RM came first.
+func TestPickRMPrefersTheSameDirectoryOnWindows(t *testing.T) {
+	windowsPaths(t)
+	at := func(id string, parts ...string) assetindex.Asset {
+		return looseAnim(id, "synty", "P", strings.Join(parts, `\`), "")
+	}
+	// Orc's RM is listed first, so a directory term that does not work leaves the
+	// goblin card holding it.
+	sibling, _ := buildRootMotionPairs([]assetindex.Asset{
+		at("orcRM", "Anims", "Orc", "Walk_RM.fbx"),
+		at("goblin", "Anims", "Goblin", "Walk.fbx"),
+		at("goblinRM", "Anims", "Goblin", "Walk_RM.fbx"),
+	})
+	if got := sibling["goblin"]; got != "goblinRM" {
+		t.Errorf("goblin paired with %q, want goblinRM (its own directory)", got)
+	}
+}
+
 // The RM sibling has to be the same container. A pack that ships the in-place clip
 // as one format and the root-motion file as another offers no sibling: pairing them
 // would point the toggle at a file the viewer cannot load, and suppressing the RM
 // would drop a card for a file that is right there on disk.
 func TestRootMotionPairingRequiresTheSameContainer(t *testing.T) {
-	clip := assetindex.Asset{ID: "g1", Ext: "glb", Vendor: "quaternius", Pack: "UAL", Category: assetindex.CategoryAnimation,
-		Source: assetindex.Source{Kind: assetindex.SourceLoose, FilePath: "/lib/UAL1.glb", Clip: "Walk"}}
-	otherFormatRM := assetindex.Asset{ID: "rmf", Ext: "fbx", Vendor: "quaternius", Pack: "UAL", Category: assetindex.CategoryModel,
-		Source: assetindex.Source{Kind: assetindex.SourceLoose, FilePath: "/lib/UAL1_RM.fbx"}}
+	clip := looseAnim("g1", "quaternius", "UAL", "/lib/UAL1.glb", "Walk")
+	otherFormatRM := as(looseAnim("rmf", "quaternius", "UAL", "/lib/UAL1_RM.fbx", ""), assetindex.CategoryModel)
 
 	sibling, suppressed := buildRootMotionPairs([]assetindex.Asset{clip, otherFormatRM})
 	if got, ok := sibling["g1"]; ok {
@@ -89,10 +191,8 @@ func TestRootMotionPairingRequiresTheSameContainer(t *testing.T) {
 // merely share a Foo / Foo_RM name — "_RM" is also how a roughness-metallic texture
 // is labelled — must not collapse into one card with the second hidden behind it.
 func TestRootMotionPairingIgnoresGroupsWithNoAnimation(t *testing.T) {
-	base := assetindex.Asset{ID: "m1", Ext: "png", Vendor: "synty", Pack: "Kit", Category: assetindex.CategoryTexture,
-		Source: assetindex.Source{Kind: assetindex.SourceLoose, FilePath: "/lib/T_Sword.png"}}
-	rm := assetindex.Asset{ID: "m2", Ext: "png", Vendor: "synty", Pack: "Kit", Category: assetindex.CategoryTexture,
-		Source: assetindex.Source{Kind: assetindex.SourceLoose, FilePath: "/lib/T_Sword_RM.png"}}
+	base := as(looseAnim("m1", "synty", "Kit", "/lib/T_Sword.png", ""), assetindex.CategoryTexture)
+	rm := as(looseAnim("m2", "synty", "Kit", "/lib/T_Sword_RM.png", ""), assetindex.CategoryTexture)
 
 	sibling, suppressed := buildRootMotionPairs([]assetindex.Asset{base, rm})
 	if len(sibling) != 0 || len(suppressed) != 0 {
@@ -107,17 +207,13 @@ func TestRootMotionPairingIgnoresGroupsWithNoAnimation(t *testing.T) {
 // that card's toggle fetched a different archive than the one it was displaying.
 func TestPairingKeepsEachArchiveToItsOwnRootMotionSibling(t *testing.T) {
 	const zipPath, uniPath = "/lib/synty/POLYGON_X/POLYGON_X_SourceFiles_v3.zip", "/lib/synty/POLYGON_X/POLYGON_X_Unity_2022_3_v1.unitypackage"
-	zipAsset := func(id, entry string) assetindex.Asset {
-		return assetindex.Asset{ID: id, Ext: "fbx", Vendor: "synty", Pack: "POLYGON_X", Category: assetindex.CategoryAnimation,
-			Source: assetindex.Source{Kind: assetindex.SourceZip, ArchivePath: zipPath, Entry: entry}}
-	}
 	uniAsset := func(id, pathname string) assetindex.Asset {
 		return assetindex.Asset{ID: id, Ext: "fbx", Vendor: "synty", Pack: "POLYGON_X", Category: assetindex.CategoryAnimation,
 			Source: assetindex.Source{Kind: assetindex.SourceUnityPackage, ArchivePath: uniPath, Guid: id, Pathname: pathname}}
 	}
 	sibling, suppressed := buildRootMotionPairs([]assetindex.Asset{
-		zipAsset("zip-walk", "SF/A_Walk_Masc.fbx"),
-		zipAsset("zip-walk-rm", "SF/A_Walk_RM_Masc.fbx"),
+		zipAnim("zip-walk", "synty", "POLYGON_X", zipPath, "SF/A_Walk_Masc.fbx"),
+		zipAnim("zip-walk-rm", "synty", "POLYGON_X", zipPath, "SF/A_Walk_RM_Masc.fbx"),
 		uniAsset("uni-walk", "Assets/Anim/A_Walk_Masc.fbx"),
 		uniAsset("uni-walk-rm", "Assets/Anim/A_Walk_RM_Masc.fbx"),
 	})
@@ -139,15 +235,11 @@ func TestPairingKeepsEachArchiveToItsOwnRootMotionSibling(t *testing.T) {
 // "_RM" is also the conventional suffix for a roughness-metallic map. Testing the group
 // as a whole let one animation's presence hide a texture nothing will ever play.
 func TestPairingLeavesANonAnimationRMAlone(t *testing.T) {
-	mk := func(id, entry, ext string, cat assetindex.Category) assetindex.Asset {
-		return assetindex.Asset{ID: id, Ext: ext, Vendor: "v", Pack: "P", Category: cat,
-			Source: assetindex.Source{Kind: assetindex.SourceZip, ArchivePath: "a.zip", Entry: entry}}
-	}
 	sibling, suppressed := buildRootMotionPairs([]assetindex.Asset{
-		mk("anim", "SF/Sword.fbx", "fbx", assetindex.CategoryAnimation),
-		mk("anim-rm", "SF/Sword_RM.fbx", "fbx", assetindex.CategoryAnimation),
-		mk("tex", "SF/Sword.png", "png", assetindex.CategoryTexture),
-		mk("tex-rm", "SF/Sword_RM.png", "png", assetindex.CategoryTexture),
+		zipAnim("anim", "v", "P", "a.zip", "SF/Sword.fbx"),
+		zipAnim("anim-rm", "v", "P", "a.zip", "SF/Sword_RM.fbx"),
+		as(zipAnim("tex", "v", "P", "a.zip", "SF/Sword.png"), assetindex.CategoryTexture),
+		as(zipAnim("tex-rm", "v", "P", "a.zip", "SF/Sword_RM.png"), assetindex.CategoryTexture),
 	})
 
 	if sibling["anim"] != "anim-rm" || !suppressed["anim-rm"] {
@@ -166,18 +258,11 @@ func TestPairingLeavesANonAnimationRMAlone(t *testing.T) {
 // directory term both cards took the same first RM: one toggle played the wrong
 // character's travel, and the other RM was never suppressed.
 func TestPickRMPrefersASiblingInTheSameDirectory(t *testing.T) {
-	zipAt := func(id, entry string) assetindex.Asset {
-		return assetindex.Asset{
-			ID: id, Ext: "fbx", Vendor: "synty", Pack: "P",
-			Category: assetindex.CategoryAnimation,
-			Source:   assetindex.Source{Kind: assetindex.SourceZip, ArchivePath: "/p.zip", Entry: entry},
-		}
-	}
 	assets := []assetindex.Asset{
-		zipAt("goblin", "Anims/Goblin/Walk.fbx"),
-		zipAt("goblinRM", "Anims/Goblin/Walk_RM.fbx"),
-		zipAt("orc", "Anims/Orc/Walk.fbx"),
-		zipAt("orcRM", "Anims/Orc/Walk_RM.fbx"),
+		zipAnim("goblin", "synty", "P", "/p.zip", "Anims/Goblin/Walk.fbx"),
+		zipAnim("goblinRM", "synty", "P", "/p.zip", "Anims/Goblin/Walk_RM.fbx"),
+		zipAnim("orc", "synty", "P", "/p.zip", "Anims/Orc/Walk.fbx"),
+		zipAnim("orcRM", "synty", "P", "/p.zip", "Anims/Orc/Walk_RM.fbx"),
 	}
 
 	sibling, suppressed := buildRootMotionPairs(assets)
@@ -197,16 +282,9 @@ func TestPickRMPrefersASiblingInTheSameDirectory(t *testing.T) {
 // A vendor shipping its root-motion variants in their own subfolder still pairs, so
 // the directory has to stay a preference rather than part of the group key.
 func TestPickRMStillPairsAcrossDirectoriesWhenThatIsAllThereIs(t *testing.T) {
-	zipAt := func(id, entry string) assetindex.Asset {
-		return assetindex.Asset{
-			ID: id, Ext: "fbx", Vendor: "kevdev", Pack: "P",
-			Category: assetindex.CategoryAnimation,
-			Source:   assetindex.Source{Kind: assetindex.SourceZip, ArchivePath: "/p.zip", Entry: entry},
-		}
-	}
 	assets := []assetindex.Asset{
-		zipAt("walk", "Animations/Walk.fbx"),
-		zipAt("walkRM", "Animations/RootMotion/Walk_RM.fbx"),
+		zipAnim("walk", "kevdev", "P", "/p.zip", "Animations/Walk.fbx"),
+		zipAnim("walkRM", "kevdev", "P", "/p.zip", "Animations/RootMotion/Walk_RM.fbx"),
 	}
 	sibling, suppressed := buildRootMotionPairs(assets)
 	if got := sibling["walk"]; got != "walkRM" {

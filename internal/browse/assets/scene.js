@@ -166,18 +166,27 @@ async function loadRMClips(asset) {
   } catch { return null; }
 }
 
-// coversBones reports whether a rig can actually play a clip: the clip must drive
-// most of the rig (≥60% of the rig's bones — so nearly the whole body animates) AND
-// cover a good part of the clip (≥45% of its bones). Requiring both rejects the
-// small/partial rigs that share a handful of names but pose a full clip into garbage
-// (the shredded animation thumbnails), and superset showcase rigs, while still
-// letting a body play a richer clip.
+// coversBones reports how many bone names a rig and a clip share when the rig can
+// actually play the clip, and 0 when it cannot: the clip must drive most of the rig
+// (≥60% of the rig's bones — so nearly the whole body animates) AND cover a good part
+// of the clip (≥45% of its bones). Requiring both rejects the small/partial rigs that
+// share a handful of names but pose a full clip into garbage (the shredded animation
+// thumbnails), and superset showcase rigs, while still letting a body play a richer
+// clip.
+//
+// The shared count is returned rather than a bare true because ranking candidates
+// wants it too, and a call site that recomputed the overlap to get it would end up
+// holding a second copy of these thresholds. Names are counted distinct on both sides:
+// a cached entry can repeat a name per bone instance, and coverage is about which
+// bones are driven, not how many times.
 function coversBones(have, want) {
-  if (!have || !have.length || !want || !want.length) return false;
-  const set = new Set(have);
+  if (!have || !have.length || !want || !want.length) return 0;
+  const rig = new Set(have);
+  const clip = new Set(want);
   let hit = 0;
-  for (const b of want) if (set.has(b)) hit++;
-  return hit / have.length >= 0.6 && hit / want.length >= 0.45;
+  for (const b of clip) if (rig.has(b)) hit++;
+  if (hit / rig.size < 0.6 || hit / clip.size < 0.45) return 0;
+  return hit;
 }
 
 // posedBox returns the object's bounds from its posed skeleton (bone world positions), not
@@ -313,6 +322,41 @@ function prepareClipRig(rig, rootRest) {
 // the hierarchy, then rebind each SkinnedMesh to a cloned skeleton whose bones point at the
 // cloned nodes. Lets the thumbnails reuse one loaded body but pose each clip on a fresh
 // skeleton, matching the lightbox's fresh-load pipeline.
+// hideAlternates hides the versions a file stacks in one place, keeping the first of
+// each. A prop ships as a variant sheet — Synty's bow rig carries eight complete bows
+// at one origin — and borrowing that to play a clip draws all eight at once.
+//
+// Two meshes are versions of each other when they sit in the same place at the same
+// level of detail. Position alone would be wrong: a bowstring sits inside the bow it
+// belongs to. Detail alone would be wrong too: a character's sword and helmet are
+// modelled as finely as each other. Together they separate the cases with room to
+// spare — measured across that bow sheet and a character carrying a sword, shield and
+// helmet, versions drift at most 0.21 of the smaller mesh's own extent while real
+// parts start at 0.94, and a string carries 72 vertices against a bow's 16,000.
+//
+// Hidden rather than removed: a file's bone hierarchy can hang off a mesh, and
+// removing that would take the rig with it.
+function hideAlternates(root) {
+  root.updateMatrixWorld(true);
+  const kept = [];
+  root.traverse((n) => {
+    if (!n.isMesh || !n.visible) return;
+    const box = new THREE.Box3().setFromObject(n);
+    const verts = n.geometry && n.geometry.attributes.position ? n.geometry.attributes.position.count : 0;
+    const version = (k) => centreDrift(k.box, box) < 0.5 && Math.max(k.verts, verts) <= 8 * Math.max(Math.min(k.verts, verts), 1);
+    if (kept.some(version)) n.visible = false;
+    else kept.push({ box, verts });
+  });
+  return root;
+}
+
+// centreDrift is how far apart two boxes sit, measured against the smaller one's own
+// diagonal so it reads the same at any scale.
+function centreDrift(a, b) {
+  const span = Math.min(a.getSize(_posedV).length(), b.getSize(_posedV).length());
+  return a.getCenter(new THREE.Vector3()).distanceTo(b.getCenter(new THREE.Vector3())) / Math.max(span, 1e-3);
+}
+
 function cloneRig(source) {
   const srcLookup = new Map(), cloneLookup = new Map();
   const clone = source.clone();
@@ -508,6 +552,37 @@ async function rigCandidates({ q, vendor, limit, types, sort }) {
   try { return (await (await fetch('/api/assets?' + p)).json()).items || []; } catch { return []; }
 }
 
+// resolveRig finds a rig a clip can play on: the best registry match, the next one if
+// that fails to load, then vendor discovery, then whatever that turns up. A cached
+// entry goes stale when a re-index changes its id, so a failed load evicts the entry
+// and the search continues rather than ending there.
+//
+// tryLoad is handed a registry entry and returns whatever the caller wants to keep —
+// a loaded rig, or true for a caller that only cares that it played — or a falsy value
+// when that entry could not be loaded. cancelled lets a caller that can be torn down
+// mid-await stop between attempts.
+//
+// The lightbox and the thumbnail worker both search this way, and the order matters to
+// what each of them shows: written out twice, one of them fell through to discovery
+// once every known entry had failed and the other gave up there.
+async function resolveRig(bones, asset, tryLoad, cancelled = () => false) {
+  const attempt = async () => {
+    for (let m = CharRegistry.match(bones, asset.vendor); m && !cancelled(); m = CharRegistry.match(bones, asset.vendor)) {
+      const got = await tryLoad(m);
+      if (got) return got;
+      CharRegistry.remove(m.id);
+    }
+    return null;
+  };
+  await CharRegistry.seed();
+  if (cancelled()) return null;
+  const known = await attempt();
+  if (known || cancelled()) return known;
+  await CharRegistry.discoverForVendor(asset, bones);
+  if (cancelled()) return null;
+  return attempt();
+}
+
 // nameSeries is a file name's leading word — "A" in A_POLY_BOW_Cmp_Idle, "Paladin" in
 // Paladin WProp J Nordstrom. Files a vendor generates as one series share it.
 const nameSeries = (name) => (name || '').split(/[_@\-. ]/)[0].toLowerCase();
@@ -553,16 +628,13 @@ const CharRegistry = {
   // shredded/T-posed garbage still. A legacy entry with no recorded vendor is a wildcard
   // until it is re-registered (see register), so old caches keep working.
   match(bones, vendor) {
-    const want = new Set(bones);
-    if (!want.size) return null;
+    if (!bones || !bones.length) return null;
     let best = null, bestScore = -1, bestPinned = false;
     for (const e of this.list()) {
       if (vendor && e.vendor && e.vendor !== vendor) continue;
       if (e.bones.length > new Set(e.bones).size * 1.4) continue; // legacy cache: skip multi-skeleton showcase meshes, whose bones repeat per character (register now rejects them)
-      const have = new Set(e.bones);
-      let hit = 0;
-      for (const b of want) if (have.has(b)) hit++;
-      if (hit / have.size < 0.6 || hit / want.size < 0.45) continue; // rig must fit the clip
+      const hit = coversBones(e.bones, bones);
+      if (!hit) continue; // rig must fit the clip
       const pinned = !!e.pinned;
       // Rank by absolute shared bones: prefer the fullest matching body.
       if ((pinned && !bestPinned) || (pinned === bestPinned && hit > bestScore)) {
@@ -648,7 +720,7 @@ const CharRegistry = {
 
 export {
   loadModel, loadSidekick, normalizeClip, boneNames, clipBones, clipsForAsset, loadRMClips, isSynty,
-  coversBones, posedBox, frameBox, isRenderable, captureRootRest, uprightRig, prepareClipRig,
-  cloneRig, poseAt, retargetedFor, stripRootMotion, dispose, disposeClone, CharRegistry, rigEntry, rigCandidates, CLAY, _posedV,
+  coversBones, resolveRig, posedBox, frameBox, isRenderable, captureRootRest, uprightRig, prepareClipRig,
+  cloneRig, hideAlternates, poseAt, retargetedFor, stripRootMotion, dispose, disposeClone, CharRegistry, rigEntry, rigCandidates, CLAY, _posedV,
   rootBone, rootBoneName,
 };

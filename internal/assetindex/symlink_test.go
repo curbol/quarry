@@ -314,29 +314,57 @@ func TestFollowedFileSymlinkIsServable(t *testing.T) {
 }
 
 // Two links into overlapping trees (a drive, and a pack inside it) reach the nested
-// tree twice. Cycle detection compared resolved paths for equality, so the inner tree
-// was walked again and every file in it indexed twice under the same id.
+// tree twice. The link to the inner tree is refused when the outer one was followed
+// first, and the inner tree is pruned from the outer walk when it was not — either
+// way the shared file is indexed once, under one id, and the outer link keeps the
+// files only it reaches.
 func TestOverlappingSymlinkTargetsAreWalkedOnce(t *testing.T) {
-	outside := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(outside, "synty", "Pack"), 0o755); err != nil {
-		t.Fatal(err)
+	// The two links are named so that the one listed first is walked first: the walk
+	// is lexical, and which of the pair leads decides which mechanism has to catch the
+	// overlap.
+	tests := []struct {
+		name        string
+		first, last [2]string // link name under the root, and what it points at
+	}{
+		{"outer link first", [2]string{"driveA", ""}, [2]string{"driveB", "synty"}},
+		{"inner link first", [2]string{"driveA", "synty"}, [2]string{"driveB", ""}},
 	}
-	if err := os.WriteFile(filepath.Join(outside, "synty", "Pack", "Sword.glb"), []byte("GLBBYTES"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	root, mk := libRoot(t)
-	if err := os.Symlink(outside, mk("driveA", "all")); err != nil {
-		t.Skipf("symlinks unavailable: %v", err)
-	}
-	if err := os.Symlink(filepath.Join(outside, "synty"), mk("driveB", "just-synty")); err != nil {
-		t.Fatal(err)
-	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			outside := t.TempDir()
+			// Sword sits in the tree both links reach; Axe only in the one the outer
+			// link adds, so refusing that link outright would lose it.
+			writeFile(t, filepath.Join(outside, "synty", "Pack", "Sword.glb"), "GLBBYTES")
+			writeFile(t, filepath.Join(outside, "other", "Axe.glb"), "GLBBYTES2")
 
-	ix, err := Build(Options{Root: root, CacheDir: t.TempDir(), FollowSymlinks: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(ix.Assets) != 1 {
-		t.Errorf("assets = %v, want one: the second link covers a tree the first already walked", names(ix.Assets))
+			root, mk := libRoot(t)
+			for _, l := range [][2]string{tc.first, tc.last} {
+				if err := os.Symlink(filepath.Join(outside, l[1]), mk(l[0], "link")); err != nil {
+					t.Skipf("symlinks unavailable: %v", err)
+				}
+			}
+
+			ix, err := Build(Options{Root: root, CacheDir: t.TempDir(), FollowSymlinks: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			seen := map[string]int{}
+			ids := map[string]int{}
+			for _, a := range ix.Assets {
+				seen[a.Name]++
+				ids[a.ID]++
+			}
+			if seen["Sword.glb"] != 1 || seen["Axe.glb"] != 1 || len(ix.Assets) != 2 {
+				t.Errorf("assets = %v, want Sword.glb and Axe.glb exactly once each", names(ix.Assets))
+			}
+			for id, n := range ids {
+				if n > 1 {
+					// Two cards for one file collide in the byID lookup, so one of them
+					// resolves to the other's bytes.
+					t.Errorf("id %s indexed %d times", id, n)
+				}
+			}
+		})
 	}
 }

@@ -11,9 +11,9 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import {
   contentURL, thumbURL, loadModel, loadSidekick, normalizeClip, clipBones, clipsForAsset,
-  loadRMClips, isSynty, coversBones, posedBox, frameBox, isRenderable, captureRootRest,
+  loadRMClips, isSynty, coversBones, resolveRig, posedBox, frameBox, isRenderable, captureRootRest,
   uprightRig, prepareClipRig, poseAt, retargetedFor, stripRootMotion, dispose, CharRegistry,
-  rigEntry, rigCandidates, rootBoneName, CLAY, _posedV,
+  rigEntry, rigCandidates, rootBoneName, hideAlternates, CLAY, _posedV,
 } from '/static/scene.js';
 import { iconEl } from '/static/icons.js';
 
@@ -241,6 +241,7 @@ export function startViewer(container, asset, panels) {
       if (superseded()) { dispose(char); return true; }
       const entry = rigEntry(item, char);
       if (entry) CharRegistry.add(entry);
+      hideAlternates(char);
       const clips = await Promise.all(soloClips.map((c) => retargetedFor(c, asset.vendor, char)));
       let rmCs = null;
       const rmRaw = await loadRMClips(asset); // travel sibling, retargeted onto the same body
@@ -439,22 +440,9 @@ export function startViewer(container, asset, panels) {
     soloRootRest = captureRootRest(root); // the clip file's root axis, for uprightRig
     const bones = clipBones(cs[0]);
     dispose(root);
-    await CharRegistry.seed();
-    if (stopped) return;
-    // Play on the best-matching rig; a cached entry can go stale (its id changes
-    // after a re-index), so a failed load evicts it and falls through to the next
-    // match, then vendor discovery, then the manual picker — never a blank viewer.
-    const playOnMatch = async () => {
-      for (let m = CharRegistry.match(bones, asset.vendor); m && !stopped; m = CharRegistry.match(bones, asset.vendor)) {
-        if (await useCharacter(m)) return true;
-        CharRegistry.remove(m.id);
-      }
-      return false;
-    };
-    if (await playOnMatch()) return;
-    if (stopped) return;
-    await CharRegistry.discoverForVendor(asset, bones);
-    if (await playOnMatch()) return;
+    // Play on the best-matching rig, falling through to the manual picker rather than
+    // to a blank viewer when the registry and vendor discovery both come up empty.
+    if (await resolveRig(bones, asset, useCharacter, () => stopped)) return;
     if (stopped) return;
     showPlaceholder('Animation clip — pick a character in the sidebar →');
     showCharacterChooser(bones);

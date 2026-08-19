@@ -3,6 +3,7 @@ package selfupdate
 import (
 	"archive/zip"
 	"bytes"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -277,6 +278,92 @@ func TestReplaceBinaryClearsAStaleAside(t *testing.T) {
 	}
 }
 
+// The rename that installs the new binary fails on a cross-device staging dir, and
+// the copy fallback that covers it was the one path in the whole update no test
+// reached. It has to land the new bytes and leave nothing behind, exactly as the
+// rename does.
+func TestReplaceBinaryFallsBackToACopy(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "quarry")
+	if err := os.WriteFile(exe, fakeBinary("OLD"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	staged := filepath.Join(dir, "staged")
+	if err := os.WriteFile(staged, fakeBinary("NEW"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	forceInstallRenameFailure(t)
+
+	if err := replaceBinary(staged, exe); err != nil {
+		t.Fatalf("replaceBinary: %v", err)
+	}
+	got, err := os.ReadFile(exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, fakeBinary("NEW")) {
+		t.Errorf("binary content = %q, want the new one", got)
+	}
+	fi, err := os.Stat(exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm()&0o100 == 0 {
+		t.Errorf("mode = %v, want the owner execute bit: the copy installed a binary nothing can run", fi.Mode().Perm())
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.Name() != "quarry" && e.Name() != "staged" {
+			t.Errorf("left %q behind", e.Name())
+		}
+	}
+}
+
+// The install failed and the previous binary was moved aside, so a failed restore is
+// the case where nothing is runnable at all. The error has to say so and name where
+// the working binary is, or the next invocation is "command not found" with no lead.
+func TestRestoreAsideNamesAFailedRestore(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "quarry")
+	missing := filepath.Join(dir, "nothing-was-moved-aside")
+	cause := errors.New("installing the new binary: disk full")
+
+	err := restoreAside(missing, exe, cause)
+	if !errors.Is(err, cause) {
+		t.Errorf("error = %v, want it to wrap the original cause", err)
+	}
+	if !strings.Contains(err.Error(), missing) {
+		t.Errorf("error = %v, want it to name %s, where the working binary still is", err, missing)
+	}
+}
+
+// A restore that works reports only what actually went wrong, so the common failure
+// does not read as if the install had also destroyed the installed binary.
+func TestRestoreAsidePutsTheBinaryBack(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "quarry")
+	aside := exe + ".old"
+	if err := os.WriteFile(aside, fakeBinary("OLD"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cause := errors.New("installing the new binary: disk full")
+
+	err := restoreAside(aside, exe, cause)
+	if err != cause {
+		t.Errorf("error = %v, want exactly the cause", err)
+	}
+	got, readErr := os.ReadFile(exe)
+	if readErr != nil {
+		t.Fatalf("the previous binary was not put back: %v", readErr)
+	}
+	if !bytes.Equal(got, fakeBinary("OLD")) {
+		t.Errorf("binary content = %q, want the previous one", got)
+	}
+}
+
 // The gh CLI is the last tier of token resolution and the one most likely to break,
 // and it was the only tier with no coverage. A stub gh on PATH exercises both the
 // success path and the "gh present but not logged in" path.
@@ -475,4 +562,13 @@ func TestExtractRefusesAnOversizeEntryRatherThanTruncatingIt(t *testing.T) {
 	if !strings.Contains(err.Error(), "limit") {
 		t.Errorf("error = %v, want one naming the limit", err)
 	}
+}
+
+// forceInstallRenameFailure makes the install rename fail for one test, which is how
+// the cross-device copy fallback is reached on a filesystem that has no such boundary.
+func forceInstallRenameFailure(t *testing.T) {
+	t.Helper()
+	prev := installRename
+	installRename = func(string, string) error { return errors.New("invalid cross-device link") }
+	t.Cleanup(func() { installRename = prev })
 }

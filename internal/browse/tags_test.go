@@ -279,6 +279,29 @@ func TestTagWritesBoundTheRequestBody(t *testing.T) {
 
 // When the save fails the mutation must not survive in memory: the UI would keep
 // reporting a tag that does not exist on disk until a restart silently undid it.
+// The one case where memory and disk genuinely diverge: the save was refused, and the
+// reload meant to undo the in-memory edit was refused too. Nothing can put that right,
+// so it has to be named in the response — the client has just been told the write did
+// not land, and the UI would otherwise keep showing an edit that is not real with no
+// way to know. Rewriting the file under the server does both at once: the save sees a
+// file that changed since it was loaded, and the reload sees content Load refuses.
+func TestAFailedReloadAfterARefusedSaveIsNamed(t *testing.T) {
+	srv, tagsPath := enabledServer(t)
+	post(t, srv, "/api/assign", `{"fingerprints":["crc32:1:1"],"tag":"hero","on":true}`, http.StatusOK)
+
+	if err := os.WriteFile(tagsPath, []byte("unknown_key = true\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	body := post(t, srv, "/api/assign", `{"fingerprints":["crc32:1:1"],"tag":"villain","on":true}`, http.StatusConflict)
+	if !strings.Contains(string(body), "reloading the store from disk failed") {
+		t.Errorf("response = %s, want it to say the store could not be reloaded either", body)
+	}
+	if !strings.Contains(string(body), "may be ahead of the file") {
+		t.Errorf("response = %s, want it to warn that what is shown is not what is stored", body)
+	}
+}
+
 func TestFailedSaveDoesNotLeaveMemoryAheadOfDisk(t *testing.T) {
 	srv, tagsPath := enabledServer(t)
 	post(t, srv, "/api/assign", `{"fingerprints":["crc32:1:1"],"tag":"hero","on":true}`, http.StatusOK)
@@ -304,7 +327,9 @@ func TestFailedSaveDoesNotLeaveMemoryAheadOfDisk(t *testing.T) {
 	}
 }
 
-func post(t *testing.T, srv *httptest.Server, path, body string, wantStatus int) {
+// post returns the response body, so a test can assert on what a rejection actually
+// told the client rather than only on its status.
+func post(t *testing.T, srv *httptest.Server, path, body string, wantStatus int) []byte {
 	t.Helper()
 	req, err := http.NewRequest(http.MethodPost, srv.URL+path, strings.NewReader(body))
 	if err != nil {
@@ -316,8 +341,9 @@ func post(t *testing.T, srv *httptest.Server, path, body string, wantStatus int)
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != wantStatus {
-		b, _ := io.ReadAll(resp.Body)
 		t.Fatalf("POST %s = %d, want %d: %s", path, resp.StatusCode, wantStatus, b)
 	}
+	return b
 }

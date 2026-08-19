@@ -275,6 +275,12 @@ func checkExecutable(path string) error {
 	return fmt.Errorf("downloaded file is not a %s executable", runtime.GOOS)
 }
 
+// installRename is the rename that puts the new binary in place. It is a variable so
+// a test can reach the copy fallback below: both paths are in one directory, where a
+// rename does not fail on a working filesystem, and that fallback is precisely what
+// has to keep a binary in place when it does.
+var installRename = os.Rename
+
 // replaceBinary puts newPath at exe, which is the image currently executing.
 // Windows refuses to rename over a running .exe but does permit renaming it aside,
 // so the current binary is moved out of the way first and restored if the install
@@ -285,17 +291,35 @@ func replaceBinary(newPath, exe string) error {
 	if err := os.Rename(exe, aside); err != nil {
 		return fmt.Errorf("moving the current binary aside: %w", err)
 	}
-	if err := os.Rename(newPath, exe); err != nil {
-		// Cross-device or an exotic mount: copy instead, and put the original back if
-		// even that fails, so the user is never left without a binary.
-		if copyErr := copyFile(newPath, exe); copyErr != nil {
-			os.Rename(aside, exe)
-			return fmt.Errorf("installing the new binary: %w", copyErr)
+	if err := installRename(newPath, exe); err != nil {
+		// Cross-device or an exotic mount. The copy lands beside exe and is renamed
+		// on, rather than written over exe directly: a copy interrupted by a signal or
+		// a power cut would otherwise leave a half-written binary that looks whole.
+		staged := exe + ".new"
+		if err := copyFile(newPath, staged); err != nil {
+			os.Remove(staged)
+			return restoreAside(aside, exe, fmt.Errorf("installing the new binary: %w", err))
+		}
+		if err := os.Rename(staged, exe); err != nil {
+			os.Remove(staged)
+			return restoreAside(aside, exe, fmt.Errorf("installing the new binary: %w", err))
 		}
 	}
 	// Removing the running image fails on Windows; the next update clears it.
 	os.Remove(aside)
 	return nil
+}
+
+// restoreAside puts the binary moved out of the way back, and reports cause. A
+// restore that itself fails is the one case that leaves nothing runnable, so it is
+// named along with where the working binary actually is: the next invocation is
+// otherwise "command not found", with the error the user already saw saying only that
+// the install failed.
+func restoreAside(aside, exe string, cause error) error {
+	if err := os.Rename(aside, exe); err != nil {
+		return fmt.Errorf("%w; the previous binary could not be put back either (%v) and is still at %s", cause, err, aside)
+	}
+	return cause
 }
 
 func download(token, url, dst string) error {

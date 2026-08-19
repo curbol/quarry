@@ -1006,7 +1006,7 @@ class ModelThumbnails {
     // otherwise accumulate every PNG it ever drew. Insertion order is eviction order,
     // refreshed on each hit.
     this.cache = new Map();   // asset.id -> object URL (a rendered blob)
-    this.pending = new Map(); // asset.id -> { holder, seq } awaiting its render
+    this.pending = new Map(); // asset.id -> { holders, seq } awaiting one render
     this.seq = 0;
     this.watch();
     this.dead = false;
@@ -1046,9 +1046,11 @@ class ModelThumbnails {
     if (this.dead) return;
     this.dead = true;
     console.error('thumbnail worker stopped; 3D previews in the grid are unavailable', message || '');
-    for (const { holder } of this.pending.values()) {
-      if (holder.isConnected) holder.classList.remove('loading');
-      this.vis.unobserve(holder);
+    for (const { holders } of this.pending.values()) {
+      for (const holder of holders) {
+        if (holder.isConnected) holder.classList.remove('loading');
+        this.vis.unobserve(holder);
+      }
     }
     this.pending.clear();
     this.vis.disconnect();
@@ -1065,22 +1067,33 @@ class ModelThumbnails {
   cancel(holder) {
     const asset = holder._asset;
     const p = asset && this.pending.get(asset.id);
-    if (!p || p.holder !== holder) return;
+    if (!p || !p.holders.has(holder)) return;
+    p.holders.delete(holder);
+    holder.classList.remove('loading');
+    // Still wanted while another card on screen shows the same asset: cancelling on
+    // the first one to scroll away would leave the rest spinning for a render nobody
+    // is going to ask for again.
+    if (p.holders.size) return;
     this.pending.delete(asset.id);
     this.worker.postMessage({ type: 'cancel', id: asset.id });
-    holder.classList.remove('loading');
   }
   request(holder) {
     const asset = holder._asset;
-    if (this.dead || this.pending.has(asset.id)) return;
+    if (this.dead) return;
     const cached = this.cache.get(asset.id);
     if (cached) { this.touch(asset.id); this.swap(holder, cached); return; }
     holder.classList.add('loading');
+    // One asset can be on screen twice — a grid card, and the same asset in the
+    // lightbox's "parts of this set" strip — and one render answers both. Joining the
+    // request already in flight is what keeps the second holder from sitting on its
+    // category icon until it happens to scroll back into view.
+    const inFlight = this.pending.get(asset.id);
+    if (inFlight) { inFlight.holders.add(holder); return; }
     // Each request carries a sequence number the worker echoes back, so a result for a
     // request that was since cancelled and re-made is recognisable as stale. Matching on
     // the id alone let a superseded job's result land on the current card's entry.
     const seq = ++this.seq;
-    this.pending.set(asset.id, { holder, seq });
+    this.pending.set(asset.id, { holders: new Set([holder]), seq });
     // Only the fields the worker's build needs — DTOs aren't structured-clone-friendly wholesale.
     this.worker.postMessage({
       id: asset.id,
@@ -1120,16 +1133,20 @@ class ModelThumbnails {
     // displaced URL from escaping the cache bound unrevoked.
     if (!p || p.seq !== seq) return;
     this.pending.delete(id);
-    const holder = p.holder;
     if (blob) {
       const url = URL.createObjectURL(blob);
       this.remember(id, url);
-      if (holder && holder.isConnected) this.swap(holder, url);
-    } else if (holder && holder.isConnected) {
-      holder.classList.remove('loading'); // no render (failed / mesh-less with no rig)
-      // Settled: there is nothing to draw for this asset, so stop watching rather than
-      // re-asking the worker every time the card scrolls back into view.
-      this.vis.unobserve(holder);
+      for (const holder of p.holders) {
+        if (holder.isConnected) this.swap(holder, url);
+      }
+    } else {
+      for (const holder of p.holders) {
+        if (!holder.isConnected) continue;
+        holder.classList.remove('loading'); // no render (failed / mesh-less with no rig)
+        // Settled: there is nothing to draw for this asset, so stop watching rather than
+        // re-asking the worker every time the card scrolls back into view.
+        this.vis.unobserve(holder);
+      }
     }
   }
   async swap(holder, url) {

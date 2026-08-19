@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func libRoot(t *testing.T) (root string, mk func(...string) string) {
@@ -32,6 +33,18 @@ func libRoot(t *testing.T) (root string, mk func(...string) string) {
 // cacheFileFor is where LoadOrBuild keeps one root's index. Tests that reach for the
 // cache file go through this rather than assembling a path, so the layout stays a
 // single decision inside the package.
+// writeFile creates path's parents and writes content. libRoot's mk covers fixtures
+// inside the library; this covers the ones a symlink points at, which are outside it.
+func writeFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func cacheFileFor(t *testing.T, cacheDir, root string) string {
 	t.Helper()
 	abs, err := filepath.Abs(root)
@@ -293,7 +306,7 @@ func TestArchiveEntryNamesAreRejected(t *testing.T) {
 			t.Errorf("ordinary zip entry %q rejected", ok)
 		}
 	}
-	for _, name := range []string{"../x/asset", "../asset", "a/b/asset"} {
+	for _, name := range []string{"../x/asset", "../asset", "a/b/asset", `..\\x/asset`, `a\\b/asset`} {
 		if guid, _, ok := splitUnityName(name); ok && (guid == ".." || strings.ContainsAny(guid, `/\`)) {
 			t.Errorf("unitypackage name %q yielded an escaping guid %q", name, guid)
 		}
@@ -356,6 +369,53 @@ func TestPruneUnpackedDropsStaleExtractions(t *testing.T) {
 		if _, err := os.Stat(p); !os.IsNotExist(err) {
 			t.Errorf("stale extraction %s survived the prune (err=%v)", p, err)
 		}
+	}
+}
+
+// A second quarry over the same root runs its own prune whenever it starts, and the
+// prune removes whatever it does not recognise. An extraction assembled inside the
+// swept tree was therefore deleted mid-write, and the rename that followed published
+// a package missing whatever had not been written yet — cached as complete from then
+// on. Staging lives outside that tree, and only an abandoned one is swept.
+func TestPruneLeavesAnExtractionInFlight(t *testing.T) {
+	root, mk := libRoot(t)
+	os.WriteFile(mk("v", "Pack", "Sword.glb"), []byte("GLBBYTES"), 0o644)
+
+	ix, err := Build(Options{Root: root, CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The guarantee is structural: staging is not somewhere the sweep walks.
+	if strings.HasPrefix(ix.stagingDir(), ix.unpackedDir()) {
+		t.Fatalf("staging %s sits inside the swept tree %s", ix.stagingDir(), ix.unpackedDir())
+	}
+	if err := os.MkdirAll(ix.stagingDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	inFlight, err := os.MkdirTemp(ix.stagingDir(), "unpack-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(inFlight, "asset"), []byte("half"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	abandoned, err := os.MkdirTemp(ix.stagingDir(), "unpack-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-2 * staleStagingAge)
+	if err := os.Chtimes(abandoned, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ix.PruneUnpacked(); err != nil {
+		t.Fatalf("PruneUnpacked: %v", err)
+	}
+	if _, err := os.Stat(inFlight); err != nil {
+		t.Errorf("the prune deleted an extraction being written right now: %v", err)
+	}
+	if _, err := os.Stat(abandoned); !os.IsNotExist(err) {
+		t.Errorf("an abandoned staging dir survived the prune (err=%v)", err)
 	}
 }
 
@@ -455,6 +515,116 @@ func TestDedupWithAndWithoutAPackDir(t *testing.T) {
 // has to be told what went wrong: re-reading the outcome from a shared map handed a
 // nil error — indistinguishable from success — to everyone who arrived after the
 // first waiter cleared the entry to re-arm the retry.
+// safeEntry is a predicate, and the thing that matters is that a hostile name never
+// reaches an Asset at all. The unitypackage side has that end to end; the zip side had
+// only the predicate, so a scan that stopped consulting it would still have passed.
+func TestScanDropsAZipEntryThatWouldEscape(t *testing.T) {
+	root, mk := libRoot(t)
+	writeZip(t, mk("v", "Pack", "Pack_Unity_v1.zip"), map[string]string{
+		"../escape.png":       "ESCAPED",
+		"a/../../escape2.png": "ESCAPED",
+		"Assets/Sword.fbx":    "FBXBYTES",
+	})
+
+	ix, err := Build(Options{Root: root, CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range ix.Assets {
+		if strings.Contains(a.Source.Entry, "..") || strings.Contains(a.RelPath, "..") {
+			t.Errorf("indexed an escaping entry: %+v", a.Source)
+		}
+	}
+	if len(ix.Assets) != 1 || ix.Assets[0].Name != "Sword.fbx" {
+		t.Errorf("assets = %v, want only the one ordinary entry", names(ix.Assets))
+	}
+}
+
+// A failure partway through extraction is the one os.RemoveAll(tmp) exists for: some
+// members are already written when the read gives out, and publishing those would
+// cache a package short whatever was never reached, with nothing ever re-reading it.
+func TestExtractionFailingPartwayPublishesNothing(t *testing.T) {
+	root, mk := libRoot(t)
+	pkg := mk("synty", "Pack", "Pack_Unity_v1.unitypackage")
+	guids := make([]unityGUID, 0, 24)
+	for i := 0; i < 24; i++ {
+		id := fmt.Sprintf("guid%02d", i)
+		guids = append(guids, unityGUID{guid: id, pathname: "Assets/" + id + ".fbx", asset: strings.Repeat("FBXBYTES", 64)})
+	}
+	writeUnityPackage(t, pkg, guids)
+
+	ix, err := Build(Options{Root: root, CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Cut the archive off mid-stream: the extraction gets underway and then the read
+	// fails, which is what a damaged download looks like.
+	full, err := os.ReadFile(pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(pkg, full[:len(full)*2/3], 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := ix.ensureExtracted(pkg); err == nil {
+		t.Fatal("a truncated archive extracted without error")
+	}
+	published, err := os.ReadDir(ix.unpackedDir())
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	for _, e := range published {
+		t.Errorf("a failed extraction published %s", e.Name())
+	}
+	staged, err := os.ReadDir(ix.stagingDir())
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	for _, e := range staged {
+		t.Errorf("a failed extraction left %s staged", e.Name())
+	}
+}
+
+// A derivation that failed is deliberately not remembered: the archive's print says
+// what the file is, not whether reading it worked, so a transient disk-full must not
+// poison the package for the rest of the process.
+func TestExtractionRetriesAfterATransientFailure(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores permission bits")
+	}
+	root, mk := libRoot(t)
+	pkg := mk("synty", "Pack", "Pack_Unity_v1.unitypackage")
+	writeUnityPackage(t, pkg, []unityGUID{
+		{guid: "aaa111", pathname: "Assets/One.fbx", asset: "FBXBYTES-1"},
+		{guid: "bbb222", pathname: "Assets/Two.fbx", asset: "FBXBYTES-2"},
+	})
+
+	cacheDir := t.TempDir()
+	ix, err := Build(Options{Root: root, CacheDir: cacheDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(cacheDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(cacheDir, 0o755) })
+	if _, err := ix.ensureExtracted(pkg); err == nil {
+		t.Fatal("extraction into an unwritable cache reported success")
+	}
+
+	os.Chmod(cacheDir, 0o755)
+	dir, err := ix.ensureExtracted(pkg)
+	if err != nil {
+		t.Fatalf("extraction stayed poisoned after the cause was fixed: %v", err)
+	}
+	for _, guid := range []string{"aaa111", "bbb222"} {
+		if _, err := os.Stat(filepath.Join(dir, guid, "asset")); err != nil {
+			t.Errorf("the retry published an incomplete extraction, %s is missing: %v", guid, err)
+		}
+	}
+}
+
 func TestFailedExtractionReachesEveryWaiter(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root ignores permission bits")

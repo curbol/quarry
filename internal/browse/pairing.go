@@ -1,6 +1,7 @@
 package browse
 
 import (
+	"os"
 	"path"
 	"strings"
 
@@ -13,10 +14,50 @@ import (
 // root-motion toggle loads the RM sibling to show the travel. Which file base names are
 // root-motion variants is decided by assetindex.RootMotionVariant, the shared recognizer.
 
+// osSeparators is what divides one path element from the next on this platform. A
+// loose file's path is the filesystem's own, so it is split by these; an archive
+// entry is split by "/" whatever the host is, because that is what the format stores.
+// Naming the set rather than reaching for filepath is what lets splitEntry's Windows
+// behaviour be reached from a test on a Unix host, where a backslash is an ordinary
+// filename character and filepath would leave it alone.
+var osSeparators = separatorsFor(os.PathSeparator)
+
+func separatorsFor(sep rune) string {
+	if sep == '\\' {
+		return `/\`
+	}
+	return "/"
+}
+
+// splitEntry divides a path into the directory holding it and its base name, exactly
+// as path.Split does but over a chosen separator set. dir is "" for a path with no
+// separator in it, so two such paths compare equal — they are in the same place.
+func splitEntry(p, seps string) (dir, base string) {
+	if i := strings.LastIndexAny(p, seps); i >= 0 {
+		return p[:i], p[i+1:]
+	}
+	return "", p
+}
+
+// entryParts splits where an asset lives into its directory and its base name. Which
+// characters separate the two follows from where the path came from rather than from
+// the host: a zip entry and a unity pathname are slash-delimited by their formats,
+// while a loose file's path arrives with backslashes on Windows. Reading a backslash
+// path with "/" alone left the whole path in the base name and every directory equal
+// to "", so cross-directory siblings never paired and the directory preference fired
+// for every candidate at once.
+func entryParts(s assetindex.Source) (dir, base string) {
+	seps := "/"
+	if s.Kind == assetindex.SourceLoose {
+		seps = osSeparators
+	}
+	return splitEntry(s.EntryPath(), seps)
+}
+
 // assetFileBase is the extension-less base name of the file an asset lives in (the
 // archive entry, unity pathname, or loose path), where the root-motion token appears.
 func assetFileBase(s assetindex.Source) string {
-	name := path.Base(s.EntryPath())
+	_, name := entryParts(s)
 	return strings.TrimSuffix(name, path.Ext(name))
 }
 
@@ -95,7 +136,8 @@ func pickRM(assets []assetindex.Asset, rm []int, nonRM assetindex.Asset) string 
 			continue
 		}
 		score := 0
-		if path.Dir(r.Source.EntryPath()) == path.Dir(nonRM.Source.EntryPath()) {
+		rDir, _ := entryParts(r.Source)
+		if nonDir, _ := entryParts(nonRM.Source); rDir == nonDir {
 			score += 4
 		}
 		if r.Source.ArchivePath == nonRM.Source.ArchivePath {

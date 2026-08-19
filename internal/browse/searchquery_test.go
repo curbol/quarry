@@ -145,7 +145,7 @@ func TestSearchQueryEmptyIsNil(t *testing.T) {
 func TestMalformedQueriesDoNotMatchEverything(t *testing.T) {
 	unrelated := assetindex.Asset{Name: "barrel", Pack: "polygon-dungeon", Category: "props"}
 	// A real term OR'd with an empty branch must not widen to everything.
-	for _, q := range []string{"sword OR ", "sword |", "sword OR", "(sword OR )", "sword OR ()"} {
+	for _, q := range []string{"sword OR ", "sword |", "sword OR", "(sword OR )", "sword OR ()", "sword OR (", "(sword OR "} {
 		if parseQuery(q).match(unrelated) {
 			t.Errorf("query %q matched an unrelated asset", q)
 		}
@@ -227,18 +227,6 @@ func TestPathologicalQueriesDoNotBlowTheStack(t *testing.T) {
 			q := parseQuery(tc.q) // must return, not recurse without bound
 			q.match(asset)        // and must be evaluable
 		})
-	}
-}
-
-// A half-typed query must not widen to everything on its way to being finished: an
-// empty AND branch is the identity, so "sword OR " would otherwise compile to
-// "sword OR everything".
-func TestPartialQueriesDoNotMatchEverything(t *testing.T) {
-	rock := assetindex.Asset{Name: "Rock", Pack: "Nature", RelPath: "n/rock.fbx"}
-	for _, q := range []string{"sword OR ", "sword OR (", "sword |", "(sword OR "} {
-		if parseQuery(q).match(rock) {
-			t.Errorf("parseQuery(%q) matched an unrelated asset", q)
-		}
 	}
 }
 

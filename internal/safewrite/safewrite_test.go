@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // dirEntries lists a directory's entries by name, so a test can assert that nothing
@@ -313,4 +314,57 @@ func readFile(t *testing.T, path string) string {
 		t.Fatalf("reading %s: %v", path, err)
 	}
 	return string(b)
+}
+
+// A killed write leaves its temp file behind, and the next write clears it. The temp
+// is created in the directory the destination resolves to, so a sweep run against the
+// path as given never finds it when that path is a symlink pointing elsewhere — the
+// leftover then sits in a real project directory forever, under a name .gitignore
+// does not cover.
+func TestAtomicSweepsAnAbandonedTempInTheResolvedDirectory(t *testing.T) {
+	write := func(path string) error {
+		return Atomic(path, ".t-*", func(w io.Writer) error {
+			_, err := io.WriteString(w, "body")
+			return err
+		})
+	}
+	aged := func(t *testing.T, path string, age time.Duration) string {
+		t.Helper()
+		if err := os.WriteFile(path, []byte("abandoned"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		when := time.Now().Add(-age)
+		if err := os.Chtimes(path, when, when); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	dir := t.TempDir()
+	realDir := filepath.Join(dir, "real")
+	if err := os.MkdirAll(realDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "store.toml")
+	if err := os.Symlink(filepath.Join(realDir, "store.toml"), link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	stale := aged(t, filepath.Join(realDir, ".t-stale"), 2*StaleTempAge)
+	// Young enough to belong to another process writing this file right now.
+	fresh := aged(t, filepath.Join(realDir, ".t-fresh"), time.Minute)
+	unrelated := aged(t, filepath.Join(realDir, "notes.txt"), 2*StaleTempAge)
+
+	if err := write(link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Errorf("an abandoned temp survived beside the resolved file (err=%v)", err)
+	}
+	if _, err := os.Stat(fresh); err != nil {
+		t.Errorf("a temp another writer may still be using was removed: %v", err)
+	}
+	if _, err := os.Stat(unrelated); err != nil {
+		t.Errorf("a file that does not match the temp pattern was removed: %v", err)
+	}
 }

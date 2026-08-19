@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"sync"
 
 	"github.com/curbol/quarry/internal/safewrite"
@@ -101,31 +100,6 @@ type Options struct {
 	FollowSymlinks bool
 }
 
-// resolvePath normalizes a path for containment comparison, resolving symlinks as
-// far as the filesystem allows and re-appending the part that does not exist yet.
-//
-// EvalSymlinks fails outright on a missing path, and a cache dir does not exist on
-// the run that creates it — which is the run the containment check has to catch. A
-// plain fallback to Abs would then compare a symlink-resolved root against an
-// unresolved cache dir and call a directory plainly inside the root outside it.
-func resolvePath(p string) string {
-	if abs, err := filepath.Abs(p); err == nil {
-		p = abs
-	}
-	rest := ""
-	for {
-		if r, err := filepath.EvalSymlinks(p); err == nil {
-			return filepath.Join(r, rest)
-		}
-		parent := filepath.Dir(p)
-		if parent == p {
-			return filepath.Join(p, rest)
-		}
-		rest = filepath.Join(filepath.Base(p), rest)
-		p = parent
-	}
-}
-
 // checkCacheDir refuses a cache dir inside the scan root. The tree quarry promises
 // not to write to is not somewhere to put the index and every unpacked archive, and
 // the next run would index its own output.
@@ -137,11 +111,7 @@ func checkCacheDir(root, cacheDir string) error {
 	if cacheDir == "" {
 		return nil
 	}
-	rel, err := filepath.Rel(resolvePath(root), resolvePath(cacheDir))
-	if err != nil {
-		return nil
-	}
-	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+	if !contains(resolve(root), resolve(cacheDir)) {
 		return nil
 	}
 	return fmt.Errorf("cache dir %s is inside the scan root %s; pick one outside it with --cache", cacheDir, root)

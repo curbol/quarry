@@ -9,6 +9,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
+
+	"github.com/curbol/quarry/internal/safewrite"
 )
 
 // ErrNoThumbnail is returned by OpenThumbnail for an asset that has no dedicated
@@ -88,6 +91,22 @@ func (ix *Index) unpackedDir() string {
 	return filepath.Join(ix.stateDir(), "unpacked", strconv.Itoa(indexVersion))
 }
 
+// stagingDir is where an extraction is assembled before it is renamed into place. It
+// deliberately sits outside the tree PruneUnpacked sweeps, because that sweep deletes
+// whatever it does not recognise and a second quarry sharing this cache dir runs one
+// every time it starts. Assembled inside that tree, a half-written extraction is
+// removed out from under the run writing it, and the rename then publishes a package
+// missing whatever had not been written yet — cached as complete from then on.
+func (ix *Index) stagingDir() string {
+	return filepath.Join(ix.stateDir(), "staging")
+}
+
+// staleStagingAge is how old an abandoned staging directory must be before a prune
+// clears it. Anything younger could be an extraction another instance is writing
+// right now, and the point of the sweep is to leave one less thing behind rather than
+// to race one.
+const staleStagingAge = 24 * time.Hour
+
 // PruneUnpacked removes extraction directories the current index no longer
 // references: every other index version's tree, plus, within this version's, every
 // archive fingerprint absent from the index. The fingerprint includes the archive's
@@ -139,11 +158,25 @@ func (ix *Index) PruneUnpacked() error {
 		}
 	}
 
+	// A run killed mid-extraction leaves its staging directory behind, and nothing
+	// else ever clears it. Age is the only thing separating that from an extraction
+	// another instance has in flight.
+	if entries, err := os.ReadDir(ix.stagingDir()); err == nil {
+		for _, e := range entries {
+			if fi, err := e.Info(); err == nil && time.Since(fi.ModTime()) > staleStagingAge {
+				remove(filepath.Join(ix.stagingDir(), e.Name()))
+			}
+		}
+	}
+
 	// A run killed mid-Save leaves a 100MB-plus temp beside the cache file, which
-	// nothing else ever cleans up.
+	// nothing else ever cleans up. Age separates that from a save another instance
+	// sharing this cache dir has in flight, whose rename would otherwise fail.
 	if stale, err := filepath.Glob(filepath.Join(ix.stateDir(), ".browse-index-*")); err == nil {
 		for _, p := range stale {
-			remove(p)
+			if fi, err := os.Stat(p); err == nil && time.Since(fi.ModTime()) > safewrite.StaleTempAge {
+				remove(p)
+			}
 		}
 	}
 
@@ -229,7 +262,13 @@ func (ix *Index) ensureExtracted(archivePath string) (string, error) {
 			ex.err = err
 			return
 		}
-		tmp, err := os.MkdirTemp(filepath.Dir(dest), "unpack-*")
+		if err := os.MkdirAll(ix.stagingDir(), 0o755); err != nil {
+			ex.err = err
+			return
+		}
+		// Staged under the same state dir as dest, so the publishing rename stays on
+		// one filesystem.
+		tmp, err := os.MkdirTemp(ix.stagingDir(), "unpack-*")
 		if err != nil {
 			ex.err = err
 			return
@@ -302,15 +341,28 @@ func contains(root, p string) bool {
 	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
-// resolve returns the symlink-resolved absolute path, falling back to a lexical
-// clean when the path (or a parent) can't be resolved.
+// resolve normalizes a path for containment comparison, following symlinks as far as
+// the filesystem allows and re-appending the part that does not exist yet.
+//
+// EvalSymlinks fails outright on a missing path, and the run a containment check has
+// to catch is sometimes exactly the one where the path is not there — a cache dir
+// does not exist until the run that creates it. Falling back to Abs for the whole
+// path would then compare a symlink-resolved root against an unresolved candidate and
+// call a directory plainly inside the root outside it.
 func resolve(p string) string {
-	if r, err := filepath.EvalSymlinks(p); err == nil {
-		return r
+	if abs, err := filepath.Abs(p); err == nil {
+		p = abs
 	}
-	abs, err := filepath.Abs(p)
-	if err != nil {
-		return filepath.Clean(p)
+	rest := ""
+	for {
+		if r, err := filepath.EvalSymlinks(p); err == nil {
+			return filepath.Join(r, rest)
+		}
+		parent := filepath.Dir(p)
+		if parent == p {
+			return filepath.Join(p, rest)
+		}
+		rest = filepath.Join(filepath.Base(p), rest)
+		p = parent
 	}
-	return abs
 }

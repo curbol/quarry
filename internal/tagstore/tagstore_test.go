@@ -325,6 +325,41 @@ func TestFailedSaveLeavesNoTempFile(t *testing.T) {
 			t.Errorf("failed save left %s behind", e.Name())
 		}
 	}
+	if got := s.TagsFor("crc32:aa:1"); len(got) != 1 || got[0] != "hero" {
+		t.Errorf("TagsFor = %v after the failed save, want the edit still in memory for the caller to Reload away", got)
+	}
+}
+
+// Reload is the recovery every failed write goes through, so its own failure has to
+// leave the store exactly as it was: browse reports that case to the user rather than
+// swallowing it, and a half-applied reload would make what it reports untrue.
+func TestFailedReloadLeavesTheStoreUntouched(t *testing.T) {
+	p := filepath.Join(t.TempDir(), FileName)
+	s := New()
+	s.Define("hero", "#112233")
+	s.Assign("crc32:aa:1", "hero")
+	s.Link([]string{"crc32:aa:1", "crc32:bb:2"})
+	if err := s.Save(p); err != nil {
+		t.Fatal(err)
+	}
+
+	// A key this version does not know is one of the things Load refuses outright.
+	if err := os.WriteFile(p, []byte("unknown_key = true\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Reload(p); err == nil {
+		t.Fatal("Reload accepted a file Load refuses")
+	}
+
+	if _, ok := s.Color("hero"); !ok {
+		t.Error("the palette lost a tag to a reload that failed")
+	}
+	if got := s.TagsFor("crc32:aa:1"); len(got) != 1 || got[0] != "hero" {
+		t.Errorf("TagsFor = %v, want the assignment untouched by a reload that failed", got)
+	}
+	if got := s.Related("crc32:aa:1"); len(got) != 1 || got[0] != "crc32:bb:2" {
+		t.Errorf("Related = %v, want the link untouched by a reload that failed", got)
+	}
 }
 
 // Save rewrites the file whole from what Load produced, so a key Load quietly
@@ -524,6 +559,12 @@ func TestSaveRefusesToClobberAnEditMadeSinceLoad(t *testing.T) {
 	err = mine.Save(p)
 	if !errors.Is(err, ErrStale) {
 		t.Fatalf("Save = %v, want ErrStale: the other edit would have been destroyed", err)
+	}
+	// Save does not roll back, which is exactly why the caller has to Reload: the
+	// browse server's recovery is written against this, and a Save that quietly undid
+	// its own mutation would make that recovery look unnecessary.
+	if got := mine.TagsFor("fp-a"); len(got) != 1 || got[0] != "hero" {
+		t.Errorf("TagsFor(fp-a) = %v right after the refused save, want the unsaved edit still in memory", got)
 	}
 	after, err := Load(p)
 	if err != nil {

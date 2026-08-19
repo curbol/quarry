@@ -30,8 +30,8 @@ if (typeof window === 'undefined') {
 import * as THREE from '/static/vendor/three/three.module.min.js';
 import {
   loadModel, loadSidekick, clipsForAsset, prepareClipRig, poseAt, stripRootMotion, isRenderable, isSynty,
-  captureRootRest, cloneRig, retargetedFor, dispose, disposeClone, CharRegistry, frameBox, contentURL, clipBones,
-  rootBoneName,
+  captureRootRest, cloneRig, hideAlternates, retargetedFor, dispose, disposeClone, CharRegistry, frameBox, contentURL, clipBones,
+  rootBoneName, resolveRig,
 } from '/static/scene.js';
 import { JobTracker } from '/static/jobtracker.js';
 
@@ -151,37 +151,48 @@ function evictFiles() {
   }
 }
 
+// A rig template is a whole character — geometry, materials, textures — kept so every
+// clip on that skeleton clones it instead of reloading it. A library spanning several
+// vendors' animation packs supplies a distinct one per character matched, so the set
+// is bounded like the file cache above. The template owns what it holds (a clone
+// shares it), so an evicted one is disposed outright rather than as a clone. Jobs are
+// serialized and each disposes its clone before returning, so nothing evicted here is
+// still on screen.
+function evictRigs() {
+  const CAP = 4;
+  while (rigs.size > CAP) {
+    const oldest = rigs.keys().next().value;
+    const rig = rigs.get(oldest);
+    rigs.delete(oldest);
+    dispose(rig);
+  }
+}
+
 // rigFor finds a character mesh that can wear this clip. A registry entry that fails
 // to load is dropped and the search continues, the same recovery the lightbox makes:
 // entries are cached across page loads, so a re-index leaves stale ids behind, and
 // remembering the failure instead would make every clip thumbnail for that vendor fail
 // for the rest of the session.
 async function rigFor(clip, asset) {
-  const vendor = asset.vendor;
-  const bones = clipBones(clip);
-  await CharRegistry.seed();
-  let m = CharRegistry.match(bones, vendor);
-  if (!m) { await CharRegistry.discoverForVendor(asset, bones); m = CharRegistry.match(bones, vendor); }
-  while (m) {
-    if (rigs.has(m.id)) return rigs.get(m.id);
+  return resolveRig(clipBones(clip), asset, async (m) => {
+    const cached = rigs.get(m.id);
+    if (cached) return cached;
     const rig = await loadModel(contentURL(m.id), m.ext)
       .then((r) => (isRenderable(r) ? r : (dispose(r), null)))
       .catch(() => null);
     if (rig) {
       rigs.set(m.id, rig);
-      return rig;
+      evictRigs();
     }
-    CharRegistry.remove(m.id);
-    m = CharRegistry.match(bones, vendor);
-  }
-  return null;
+    return rig;
+  });
 }
 
 async function buildPosed(clip, asset, rootRest) {
   const vendor = asset.vendor;
   const template = await rigFor(clip, asset);
   if (!template) return false;
-  const rig = cloneRig(template);
+  const rig = hideAlternates(cloneRig(template));
   const refBox = prepareClipRig(rig, isSynty(vendor) ? null : rootRest);
   const posed = stripRootMotion(await retargetedFor(clip, vendor, rig), rootBoneName(rig), rig.userData.upAxis);
   const mixer = poseAt(rig, posed);

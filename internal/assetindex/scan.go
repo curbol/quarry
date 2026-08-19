@@ -98,9 +98,13 @@ type walker struct {
 	entries   []libEntry
 	skipped   []SkippedFile
 	linkRoots []string
-	// visited holds the resolved directories already walked, so a link back into a
-	// tree already covered — or into one covering it — terminates instead of looping.
-	// Membership is tested by containment, not equality; see covered.
+	// visited holds the resolved roots of the walks already made, so a link back into
+	// a tree already covered — or into one covering it — terminates instead of
+	// looping. A link is refused by containment (see covered); an ordinary descent
+	// that lands on one of these roots is pruned by equality (see tree). The plain
+	// lookup is enough there because WalkDir hands a symlinked directory to the
+	// symlink branch rather than descending it, so every directory a walk descends
+	// into is real and every walk starts at a resolved root.
 	visited map[string]bool
 }
 
@@ -169,6 +173,14 @@ func (w *walker) tree(dir, prefix string) error {
 			return w.symlink(p, r)
 		}
 		if d.IsDir() {
+			// A tree another walk already covered is reached again by ordinary descent
+			// when one link points inside another's target: the link to the inner tree
+			// is followed first, so the outer one is not yet in visited to refuse it.
+			// Pruning the subtree here rather than refusing the outer link keeps the
+			// files that link alone reaches.
+			if p != dir && w.visited[p] {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 		info, err := d.Info()

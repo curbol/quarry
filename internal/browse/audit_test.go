@@ -294,6 +294,16 @@ func TestEveryWriteEndpointRequiresJSONContentType(t *testing.T) {
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("%s %s with application/json = %d, want 200", e.method, e.path, resp.StatusCode)
 		}
+
+		// A charset parameter is what a fetch with an explicit encoding sends, so the
+		// gate has to admit it: tightening the check to an exact match would reject real
+		// clients and still ship green. Asserted as "the gate let it through" rather
+		// than on the outcome, because these bodies are spent by the call above.
+		resp = request(t, srv, e.method, e.path, "application/json; charset=utf-8", e.body)
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusUnsupportedMediaType {
+			t.Errorf("%s %s with a charset parameter was refused as the wrong media type", e.method, e.path)
+		}
 	}
 }
 
@@ -480,5 +490,163 @@ func TestAssetsPagingOverALibraryBiggerThanTheLimits(t *testing.T) {
 				t.Errorf("items = %d, want %d", len(got.Items), tc.wantItems)
 			}
 		})
+	}
+}
+
+// Pairing groups by (vendor, pack, base) while cards group by name and size, so one
+// card spans packs and the copy owning the RM sibling need not be the representative.
+// Reading the sibling off the representative alone left the card with no toggle while
+// its RM stayed hidden — the file unreachable in browse from any card.
+func TestGroupedCardKeepsTheRootMotionSiblingOfAnyCopy(t *testing.T) {
+	srv := serverWith(t, func(mk func(...string) string) {
+		// Pack A ships the in-place animation and its RM sibling.
+		writeZip(t, mk("synty", "A_Animations", "A_SourceFiles.zip"), map[string]string{
+			"SourceFiles/Walk.fbx":    "WALKBYTES",
+			"SourceFiles/Walk_RM.fbx": "WALKRMBYTE",
+		})
+		// Pack B ships the same in-place animation only, as a unitypackage whose
+		// preview outranks pack A's copy for the representative slot.
+		writeUnity(t, mk("synty", "B_Animations", "B_Unity_2022_3.unitypackage"), []unityMember{
+			{guid: "aaa", pathname: "Assets/B/Walk.fbx", asset: "WALKBYTES", preview: true},
+		})
+	})
+
+	out := getAssets(t, srv, "limit=200")
+	visible := map[string]bool{}
+	walk := -1
+	for i, it := range out.Items {
+		visible[it.Name] = true
+		if it.Name == "Walk.fbx" {
+			walk = i
+		}
+	}
+	if walk < 0 {
+		t.Fatal("no Walk.fbx card")
+	}
+	if got := out.Items[walk].Count; got != 2 {
+		t.Fatalf("Walk.fbx card has %d copies, want 2 (the fixture must group them)", got)
+	}
+	if out.Items[walk].RootMotionID == "" {
+		t.Error("the card carries no rootMotionId, so the lightbox shows no root-motion toggle")
+		if !visible["Walk_RM.fbx"] {
+			t.Error("and Walk_RM.fbx is suppressed from the grid, so the file is unreachable in browse")
+		}
+	}
+}
+
+// The facet counts and the type filter have to agree about what one card is. Category
+// comes from a file's path, so a card's copies can classify differently; counting only
+// the representative's advertised a zero that ?type= returned results for.
+func TestFacetCategoryCountsCoverEveryCopy(t *testing.T) {
+	srv := serverWith(t, func(mk func(...string) string) {
+		writeZip(t, mk("synty", "P", "P_SourceFiles.zip"), map[string]string{
+			"SourceFiles/Icons/Gem.png": "PNGBYTES",
+		})
+		writeUnity(t, mk("synty", "P", "P_Unity_2022_3.unitypackage"), []unityMember{
+			{guid: "aaa", pathname: "Assets/P/Textures/Gem.png", asset: "PNGBYTES"},
+		})
+	})
+
+	counts := map[string]int{}
+	for _, f := range getAssets(t, srv, "limit=200").Facets.Categories {
+		counts[f.Value] = f.Count
+	}
+	for _, typ := range []string{"ui", "texture"} {
+		if got := getAssets(t, srv, "limit=200&type="+typ).Total; counts[typ] != got {
+			t.Errorf("facet advertises %s:%d but ?type=%s returns %d", typ, counts[typ], typ, got)
+		}
+	}
+}
+
+// The store is meant to be hand-edited and committed, so an edit arriving from an
+// editor, a git checkout, or a second quarry sharing the user-wide store is real. A
+// save that would overwrite one is refused, and the refusal has to reach the client:
+// the rejected edit must be gone from what the UI then renders, not merely absent
+// from disk while memory still shows it.
+func TestAnEditRefusedAsStaleLeavesNeitherDiskNorMemoryAhead(t *testing.T) {
+	srv, tagsPath := enabledServer(t)
+
+	heart := itemByName(t, srv, "q=Heart", "Heart.fbx")
+	resp := doJSON(t, "POST", srv.URL+"/api/tags", map[string]any{"id": "mine", "color": "#e11d48"})
+	resp.Body.Close()
+
+	// Someone else rewrites the store between that load and the next save.
+	external, err := tagstore.Load(tagsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := external.Define("theirs", "#0ea5e9"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tagstore.Save(tagsPath, external); err != nil {
+		t.Fatal(err)
+	}
+
+	resp = doJSON(t, "POST", srv.URL+"/api/assign", map[string]any{
+		"fingerprints": heart.Fingerprints, "tag": "mine", "on": true,
+	})
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("assign over an externally edited store = %d, want 409", resp.StatusCode)
+	}
+
+	var p paletteResp
+	decode(t, doJSON(t, "GET", srv.URL+"/api/tags", nil), &p)
+	ids := map[string]bool{}
+	for _, tg := range p.Tags {
+		ids[tg.ID] = true
+	}
+	if !ids["theirs"] {
+		t.Error("the external edit is missing from the palette; the server did not reload from disk")
+	}
+	after := itemByName(t, srv, "q=Heart", "Heart.fbx")
+	for _, tg := range after.Tags {
+		if tg == "mine" {
+			t.Error("the rejected assignment is still on the card; memory is ahead of the file")
+		}
+	}
+}
+
+// Expansion relaxes only the tag filter. Every other facet and the text search still
+// apply, so a companion the query itself excludes must not be folded back in.
+func TestIncludeRelatedStillHonoursTheNonTagFilters(t *testing.T) {
+	srv, _ := enabledServer(t)
+	items := taggedAssets(t, srv, "limit=50").Items
+	var heartFP, swordFP []string
+	for _, it := range items {
+		switch it.Name {
+		case "Heart.fbx":
+			heartFP = it.Fingerprints
+		case "Sword.glb":
+			swordFP = it.Fingerprints
+		}
+	}
+	if len(heartFP) == 0 || len(swordFP) == 0 {
+		t.Fatal("fixture did not produce both assets with fingerprints")
+	}
+
+	doJSON(t, "POST", srv.URL+"/api/link", map[string]any{
+		"fingerprints": append(append([]string{}, heartFP...), swordFP...), "on": true,
+	}).Body.Close()
+	doJSON(t, "POST", srv.URL+"/api/assign", map[string]any{
+		"fingerprints": heartFP, "tag": "love", "on": true,
+	}).Body.Close()
+
+	// Without the text search, the companion is folded in.
+	got := taggedAssets(t, srv, "tag=love&includeRelated=1")
+	names := map[string]bool{}
+	for _, it := range got.Items {
+		names[it.Name] = true
+	}
+	if !names["Sword.glb"] {
+		t.Fatal("the linked companion was not expanded in at all; the fixture is not exercising expansion")
+	}
+
+	// With one, the companion no longer matches and must stay out.
+	got = taggedAssets(t, srv, "q=Heart&tag=love&includeRelated=1")
+	for _, it := range got.Items {
+		if it.Name == "Sword.glb" {
+			t.Error("expansion relaxed the text search as well as the tag filter")
+		}
 	}
 }

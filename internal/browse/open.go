@@ -19,5 +19,12 @@ func openBrowser(url string) {
 	default:
 		cmd = "xdg-open"
 	}
-	_ = exec.Command(cmd, append(args, url)...).Start()
+	c := exec.Command(cmd, append(args, url)...)
+	if err := c.Start(); err != nil {
+		return
+	}
+	// Reaped in the background: the opener exits as soon as it has handed the URL to
+	// the desktop, and a child nothing ever waits on stays a zombie for the life of
+	// the server.
+	go func() { _ = c.Wait() }()
 }

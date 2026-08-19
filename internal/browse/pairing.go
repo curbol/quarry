@@ -95,6 +95,9 @@ func pickRM(assets []assetindex.Asset, rm []int, nonRM assetindex.Asset) string 
 			continue
 		}
 		score := 0
+		if path.Dir(r.Source.EntryPath()) == path.Dir(nonRM.Source.EntryPath()) {
+			score += 4
+		}
 		if r.Source.ArchivePath == nonRM.Source.ArchivePath {
 			score += 2
 		}

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -192,7 +193,10 @@ var loopbackHosts = map[string]bool{
 // deliberate choice to serve other machines, which have their own names for this one.
 func guardHost(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		host := r.Host
+		// Browsers send a lowercase host without the trailing dot, but a hand-typed
+		// curl or an FQDN written "localhost." does not, and a 403 there reads as a bug
+		// rather than as the protection it is.
+		host := strings.TrimSuffix(strings.ToLower(r.Host), ".")
 		if h, _, err := net.SplitHostPort(host); err == nil {
 			host = h
 		}
@@ -435,18 +439,14 @@ func (s *server) computeResults(query url.Values) []assetDTO {
 	} else {
 		grouped = groupItems(s.ix.Assets, matched)
 	}
-	for i := range grouped {
-		grouped[i].RootMotionID = s.rmSibling[grouped[i].ID]
-		if _, isRM := assetindex.RootMotionVariant(assetFileBase(grouped[i].Source)); isRM {
-			grouped[i].BakedMotion = true
-		}
-	}
 	// Resolve each card's tags (the union over its fingerprints) and its linked
 	// companions, then filter by the requested tags, so a card matches on its whole
 	// tag set. The count/total below reflect the post-filter result set.
-	s.resolveTags(grouped)
-	s.resolveRelated(grouped)
-	includeRelated := query.Get("includeRelated") == "1"
+	s.decorate(grouped)
+	// Expansion relaxes the tag filter, so with no tag filter there is nothing to
+	// relax and every card is already present. Checking here keeps the copy below from
+	// duplicating a library-sized result set to guarantee a no-op.
+	includeRelated := query.Get("includeRelated") == "1" && len(query["tag"]) > 0
 	var preTag []assetDTO
 	if includeRelated {
 		preTag = append([]assetDTO(nil), grouped...)
@@ -481,6 +481,13 @@ func sortItems(items []assetDTO, mode string) {
 // underscore before a trailing number (SPR_..._Gem09.png -> ..._Gem_09.png), which
 // otherwise leaves the identical sprite showing as two cards. Pairing this with the
 // byte size in the group key keeps genuinely different files apart.
+// groupKey is the identity a result card is grouped on: same normalized name, same
+// size. Shared with the facet counts so the two cannot disagree about what one card
+// is — a divergence there advertises a total no filter can reach.
+func groupKey(a assetindex.Asset) string {
+	return groupNameKey(a.Name) + "\x00" + strconv.FormatInt(a.Size, 10)
+}
+
 func groupNameKey(name string) string {
 	var b strings.Builder
 	for _, r := range strings.ToLower(name) {
@@ -504,7 +511,7 @@ func groupItems(assets []assetindex.Asset, sel []int32) []assetDTO {
 	var order []string
 	for _, ai := range sel {
 		a := &assets[ai]
-		key := groupNameKey(a.Name) + "\x00" + strconv.FormatInt(a.Size, 10)
+		key := groupKey(*a)
 		g := byKey[key]
 		if g == nil {
 			g = &group{rep: ai}
@@ -535,6 +542,34 @@ func groupItems(assets []assetindex.Asset, sel []int32) []assetDTO {
 	return out
 }
 
+// decorate fills the per-card fields that depend on server state rather than on the
+// card's own assets, so every path that builds cards produces the same shape. The
+// lightbox reads rootMotionId and bakedMotion off whatever card it was handed, and a
+// card built one way and a card built another have to agree.
+func (s *server) decorate(cards []assetDTO) {
+	for i := range cards {
+		d := &cards[i]
+		// Over every copy, not just the representative. Pairing groups by (vendor,
+		// pack, base) while cards group by name and size, so one card routinely spans
+		// packs and the copy that owns the RM sibling need not be the one thumbRank
+		// picked to represent it. Reading only the representative left the card with no
+		// toggle while its RM stayed suppressed from the grid — the file unreachable in
+		// browse, which is the outcome per-card suppression exists to avoid.
+		d.RootMotionID = s.rmSibling[d.ID]
+		for _, c := range d.Copies {
+			if d.RootMotionID != "" {
+				break
+			}
+			d.RootMotionID = s.rmSibling[c.ID]
+		}
+		if _, isRM := assetindex.RootMotionVariant(assetFileBase(d.Source)); isRM {
+			d.BakedMotion = true
+		}
+	}
+	s.resolveTags(cards)
+	s.resolveRelated(cards)
+}
+
 // sortedSet returns the set's keys sorted.
 func sortedSet(set map[string]bool) []string {
 	out := make([]string, 0, len(set))
@@ -553,7 +588,16 @@ func (s *server) handleContent(w http.ResponseWriter, r *http.Request) {
 	}
 	rc, size, err := s.ix.Open(a)
 	if err != nil {
-		http.Error(w, "cannot open asset", http.StatusNotFound)
+		// The id resolved, so the asset is in the index and this is not a miss. A
+		// corrupt archive, a full cache disk, or a stale index pointing outside the
+		// library all reach here, and answering 404 for every one of them tells a user
+		// whose disk filled that their models do not exist.
+		if errors.Is(err, fs.ErrNotExist) {
+			http.Error(w, "asset not found", http.StatusNotFound)
+			return
+		}
+		log.Printf("open %s: %v", a.RelPath, err)
+		http.Error(w, "cannot open asset: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 	defer rc.Close()
@@ -609,14 +653,28 @@ func contentType(ext string) string {
 // clicking that vendor returns.
 //
 // A card contributes once per distinct value across its copies, which is exactly
-// reachable — the facet filter runs over assets, before grouping, so a card survives
-// if any of its copies carries the value.
+// reachable — every facet filter runs over assets, before grouping, so a card
+// survives if any of its copies carries the value. Category is no exception: it is
+// derived from a file's path, so one card's copies can classify differently (the
+// same sprite under Source_Sprites/ in a zip and under Textures/ in a unitypackage),
+// and counting only the representative's would advertise a zero that ?type= returns
+// results for.
+//
+// Grouped over positions rather than through groupItems: this runs over the whole
+// library, and materializing every card as a DTO — with its copies slice and its
+// fingerprint set — to throw them all away is a large transient spike at startup.
 func buildFacets(assets []assetindex.Asset, hidden map[string]bool) facets {
-	visible := make([]int32, 0, len(assets))
+	byKey := map[string][]int32{}
+	var order []string
 	for i := range assets {
-		if !hidden[assets[i].ID] {
-			visible = append(visible, int32(i))
+		if hidden[assets[i].ID] {
+			continue
 		}
+		k := groupKey(assets[i])
+		if _, seen := byKey[k]; !seen {
+			order = append(order, k)
+		}
+		byKey[k] = append(byKey[k], int32(i))
 	}
 	categories, vendors, variants := map[string]int{}, map[string]int{}, map[string]int{}
 	bump := func(m map[string]int, seen map[string]bool, v string) {
@@ -625,15 +683,14 @@ func buildFacets(assets []assetindex.Asset, hidden map[string]bool) facets {
 			m[v]++
 		}
 	}
-	for _, card := range groupItems(assets, visible) {
+	for _, k := range order {
 		cs, vs, vrs := map[string]bool{}, map[string]bool{}, map[string]bool{}
-		for _, c := range card.Copies {
-			bump(vendors, vs, c.Vendor)
-			bump(variants, vrs, c.Variant)
+		for _, i := range byKey[k] {
+			a := &assets[i]
+			bump(categories, cs, string(a.Category))
+			bump(vendors, vs, a.Vendor)
+			bump(variants, vrs, a.Variant)
 		}
-		// Category is a property of the card, not of a copy: the representative is what
-		// the grid renders and what the type filter is compared against.
-		bump(categories, cs, string(card.Category))
 	}
 	return facets{
 		Categories: sortedFacet(categories),

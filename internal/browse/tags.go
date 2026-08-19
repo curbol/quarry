@@ -58,9 +58,10 @@ func (s *server) unionTagsLocked(fps []string) []string {
 			set[id] = true
 		}
 	}
-	if len(set) == 0 {
-		return nil
-	}
+	// sortedSet even when empty, so an untagged card serializes "tags": [] whatever its
+	// group size. Returning nil here made the field null for a grouped card and [] for
+	// a single one, which is a difference in the public response shape that says
+	// nothing about the card.
 	return sortedSet(set)
 }
 
@@ -349,7 +350,10 @@ func (s *server) handleRelated(w http.ResponseWriter, r *http.Request) {
 	seen := map[int32]bool{}
 	for rfp := range related {
 		for _, ai := range s.byFP[rfp] {
-			if seen[ai] {
+			// Suppressed root-motion siblings are folded into their in-place card
+			// everywhere else; surfacing one here would show the strip a card the grid
+			// never has.
+			if seen[ai] || s.rmSuppressed[s.ix.Assets[ai].ID] {
 				continue
 			}
 			seen[ai] = true
@@ -357,7 +361,7 @@ func (s *server) handleRelated(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	grouped := groupItems(s.ix.Assets, sel)
-	s.resolveTags(grouped)
+	s.decorate(grouped)
 	sortItems(grouped, "")
 	writeJSON(w, map[string]any{"items": grouped})
 }

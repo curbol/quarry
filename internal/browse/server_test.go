@@ -143,6 +143,7 @@ type assetsResp struct {
 	Items  []struct {
 		ID, Name, Category, Ext, Variant, CopyPath string
 		Thumb                                      string
+		RootMotionID                               string `json:"rootMotionId"`
 		Count                                      int
 		Width, Height                              int
 		Source                                     sourceJSON

@@ -160,3 +160,59 @@ func TestPairingLeavesANonAnimationRMAlone(t *testing.T) {
 		t.Error("a texture was given a root-motion toggle")
 	}
 }
+
+// The group key is only (vendor, pack, base), so a pack laid out per character puts
+// Goblin/Walk.fbx, Orc/Walk.fbx and both their RM siblings in one group. Without a
+// directory term both cards took the same first RM: one toggle played the wrong
+// character's travel, and the other RM was never suppressed.
+func TestPickRMPrefersASiblingInTheSameDirectory(t *testing.T) {
+	zipAt := func(id, entry string) assetindex.Asset {
+		return assetindex.Asset{
+			ID: id, Ext: "fbx", Vendor: "synty", Pack: "P",
+			Category: assetindex.CategoryAnimation,
+			Source:   assetindex.Source{Kind: assetindex.SourceZip, ArchivePath: "/p.zip", Entry: entry},
+		}
+	}
+	assets := []assetindex.Asset{
+		zipAt("goblin", "Anims/Goblin/Walk.fbx"),
+		zipAt("goblinRM", "Anims/Goblin/Walk_RM.fbx"),
+		zipAt("orc", "Anims/Orc/Walk.fbx"),
+		zipAt("orcRM", "Anims/Orc/Walk_RM.fbx"),
+	}
+
+	sibling, suppressed := buildRootMotionPairs(assets)
+	if got := sibling["goblin"]; got != "goblinRM" {
+		t.Errorf("goblin paired with %q, want goblinRM", got)
+	}
+	if got := sibling["orc"]; got != "orcRM" {
+		t.Errorf("orc paired with %q, want orcRM", got)
+	}
+	for _, id := range []string{"goblinRM", "orcRM"} {
+		if !suppressed[id] {
+			t.Errorf("%s was not suppressed; it would show as a card beside the pair it belongs to", id)
+		}
+	}
+}
+
+// A vendor shipping its root-motion variants in their own subfolder still pairs, so
+// the directory has to stay a preference rather than part of the group key.
+func TestPickRMStillPairsAcrossDirectoriesWhenThatIsAllThereIs(t *testing.T) {
+	zipAt := func(id, entry string) assetindex.Asset {
+		return assetindex.Asset{
+			ID: id, Ext: "fbx", Vendor: "kevdev", Pack: "P",
+			Category: assetindex.CategoryAnimation,
+			Source:   assetindex.Source{Kind: assetindex.SourceZip, ArchivePath: "/p.zip", Entry: entry},
+		}
+	}
+	assets := []assetindex.Asset{
+		zipAt("walk", "Animations/Walk.fbx"),
+		zipAt("walkRM", "Animations/RootMotion/Walk_RM.fbx"),
+	}
+	sibling, suppressed := buildRootMotionPairs(assets)
+	if got := sibling["walk"]; got != "walkRM" {
+		t.Errorf("walk paired with %q, want walkRM (the only candidate, in another folder)", got)
+	}
+	if !suppressed["walkRM"] {
+		t.Error("walkRM was not suppressed")
+	}
+}

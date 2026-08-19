@@ -36,10 +36,16 @@ func zipAssets(archivePath, displayRel, vendor, pack, variant string) ([]Asset, 
 	defer zr.Close()
 
 	var assets []Asset
+	// A zip may legally repeat an entry name, and naive writers do. Serving resolves a
+	// name to the first match, so enumerating both would give two cards one id and one
+	// set of bytes — the second carrying a fingerprint for content it never serves,
+	// and so tagging what the user is not looking at.
+	seen := make(map[string]bool, len(zr.File))
 	for _, f := range zr.File {
-		if f.FileInfo().IsDir() || !safeEntry(f.Name) || skipEntry(f.Name) {
+		if f.FileInfo().IsDir() || !safeEntry(f.Name) || skipEntry(f.Name) || seen[f.Name] {
 			continue
 		}
+		seen[f.Name] = true
 		src := Source{Kind: SourceZip, ArchivePath: archivePath, Entry: f.Name}
 		a := newAsset(src,
 			path.Base(f.Name),

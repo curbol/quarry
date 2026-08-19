@@ -1,9 +1,12 @@
 package assetindex
 
 import (
+	"archive/zip"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"io/fs"
 	"os"
@@ -711,5 +714,222 @@ func TestExtractionCannotEscapeItsDirectory(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dest, "ok", "asset")); err != nil {
 		t.Errorf("the legitimate entry was not extracted: %v", err)
+	}
+}
+
+// An archive entry a loose twin suppressed must come back when that twin goes away.
+// The cached asset set is post-dedup, so reusing an unchanged archive's cached
+// enumeration alone would reuse the suppression with it and drop the asset for good:
+// the file is still in the zip, and nothing would report it missing.
+func TestRefreshRestoresAnEntryItsLooseTwinStopsSuppressing(t *testing.T) {
+	root, mk := libRoot(t)
+	cacheDir := t.TempDir()
+	writeZip(t, mk("kevdev", "A", "A.zip"), map[string]string{"Animations/Idle.fbx": "IDLEBYTES"})
+	loose := mk("kevdev", "A", "src", "Animations", "Idle.fbx")
+	os.WriteFile(loose, []byte("IDLEBYTES"), 0o644)
+
+	count := func(ix *Index) (n int) {
+		for _, a := range ix.Assets {
+			if a.Name == "Idle.fbx" {
+				n++
+			}
+		}
+		return n
+	}
+
+	ix, err := LoadOrBuild(Options{Root: root, CacheDir: cacheDir}, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := count(ix); got != 1 {
+		t.Fatalf("Idle.fbx count = %d after the first build, want 1 (the loose copy suppresses the zip entry)", got)
+	}
+
+	if err := os.Remove(loose); err != nil {
+		t.Fatal(err)
+	}
+	again, err := LoadOrBuild(Options{Root: root, CacheDir: cacheDir}, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := count(again); got != 1 {
+		t.Errorf("Idle.fbx count = %d after the loose twin was deleted, want 1 (the zip entry it suppressed)", got)
+	}
+
+	// The whole point is that an incremental refresh describes the same library a
+	// full scan would, so compare against one rather than only against a number.
+	cold, err := LoadOrBuild(Options{Root: root, CacheDir: t.TempDir()}, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := count(again), count(cold); got != want {
+		t.Errorf("refreshed index has %d Idle.fbx, a fresh scan of the same tree has %d", got, want)
+	}
+}
+
+// A zip may repeat an entry name. Serving resolves a name to the first match, so a
+// second asset for the same name would be a card whose fingerprint describes bytes
+// no request can reach — a tag applied to content the user never saw.
+func TestDuplicateZipEntryNamesIndexOnce(t *testing.T) {
+	root, mk := libRoot(t)
+	zipPath := mk("vendor", "pack", "dup.zip")
+
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	for _, body := range []string{"FIRSTBYTES", "SECONDBYTESXX"} {
+		w, err := zw.Create("Models/Thing.fbx")
+		if err != nil {
+			t.Fatal(err)
+		}
+		w.Write([]byte(body))
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(zipPath, buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	assets, err := Scan(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var things []Asset
+	for _, a := range assets {
+		if a.Name == "Thing.fbx" {
+			things = append(things, a)
+		}
+	}
+	if len(things) != 1 {
+		t.Fatalf("indexed %d assets named Thing.fbx, want 1", len(things))
+	}
+	// The survivor must be the entry serving resolves to, so its fingerprint
+	// describes the bytes a content request actually returns.
+	if want := crcFingerprint(crc32.ChecksumIEEE([]byte("FIRSTBYTES")), 10); things[0].Fingerprint != want {
+		t.Errorf("fingerprint = %q, want %q (the first entry, which is what Open serves)", things[0].Fingerprint, want)
+	}
+}
+
+// A tree indexes the same whether it shipped packed or extracted, so the archive
+// walk drops the dot-paths the loose walk drops — including a dot-directory's whole
+// contents, not just a dot-named file.
+func TestDotPathsAreSkippedInsideArchivesToo(t *testing.T) {
+	root, mk := libRoot(t)
+	writeZip(t, mk("vendor", "pack", "p.zip"), map[string]string{
+		"SourceFiles/Models/Keep.fbx":       "KEEP",
+		"SourceFiles/.vscode/settings.json": "HIDDEN",
+		".git/config":                       "HIDDEN",
+		"SourceFiles/.editorconfig":         "HIDDEN",
+	})
+	assets, err := Scan(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range assets {
+		if strings.Contains(a.Source.Entry, "/.") || strings.HasPrefix(a.Source.Entry, ".") {
+			t.Errorf("indexed %q from inside a dot-path; the loose walk drops those", a.Source.Entry)
+		}
+	}
+	if len(assets) != 1 {
+		t.Errorf("indexed %d assets, want 1 (Keep.fbx)", len(assets))
+	}
+}
+
+// A dot-named symlink is working state like any other dot-entry. Handling it as a
+// link instead would report a skip naming --follow-symlinks for something a plain
+// dot-dir is dropped for silently, and index a hidden tree when the flag is on.
+func TestDotNamedSymlinksAreSkippedLikeDotDirs(t *testing.T) {
+	root, mk := libRoot(t)
+	outside := t.TempDir()
+	os.WriteFile(filepath.Join(outside, "Hidden.fbx"), []byte("HIDDEN"), 0o644)
+	os.WriteFile(mk("vendor", "pack", "Keep.fbx"), []byte("KEEP"), 0o644)
+	if err := os.Symlink(outside, filepath.Join(root, ".ref")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	for _, follow := range []bool{false, true} {
+		ix, err := Build(Options{Root: root, FollowSymlinks: follow})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, a := range ix.Assets {
+			if a.Name == "Hidden.fbx" {
+				t.Errorf("follow=%v: indexed a file under a dot-named symlink", follow)
+			}
+		}
+		for _, s := range ix.Skipped {
+			if strings.HasPrefix(s.RelPath, ".ref") {
+				t.Errorf("follow=%v: reported %q as a skip; a dot-entry is dropped silently", follow, s.RelPath)
+			}
+		}
+	}
+}
+
+// The library is read-only: the tag store is the only thing quarry writes inside a
+// user's tree, and everything here writes under the cache dir instead. Asserted over
+// a whole scan-serve-prune cycle rather than one entry point, because the write that
+// would break this is likelier to appear in extraction or pruning than in the walk.
+func TestTheLibraryIsNeverWrittenTo(t *testing.T) {
+	root, mk := libRoot(t)
+	cacheDir := t.TempDir()
+	writeZip(t, mk("synty", "Foo_Pack", "Foo_SourceFiles.zip"), map[string]string{
+		"SourceFiles/Models/Heart.fbx":   "FBXHEART",
+		"SourceFiles/Textures/Heart.png": "PNGHEART",
+	})
+	writeUnityPackage(t, mk("synty", "Foo_Pack", "Foo_Unity_2022_3_v1.unitypackage"), []unityGUID{
+		{guid: "aaa", pathname: "Assets/Foo/Rock.prefab", asset: "PREFAB", preview: true},
+	})
+	os.WriteFile(mk("explosive", "RPG", "Sword.glb"), []byte("GLBBYTES"), 0o644)
+
+	snapshot := func() map[string]string {
+		out := map[string]string{}
+		if err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			fi, err := d.Info()
+			if err != nil {
+				return err
+			}
+			out[p] = fmt.Sprintf("%v|%d|%v|%v", d.IsDir(), fi.Size(), fi.Mode(), fi.ModTime())
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+
+	before := snapshot()
+	ix, err := LoadOrBuild(Options{Root: root, CacheDir: cacheDir}, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range ix.Assets {
+		if rc, _, err := ix.Open(a); err == nil {
+			io.Copy(io.Discard, rc)
+			rc.Close()
+		}
+		if rc, _, err := ix.OpenThumbnail(a); err == nil {
+			io.Copy(io.Discard, rc)
+			rc.Close()
+		}
+	}
+	if err := ix.PruneUnpacked(); err != nil {
+		t.Fatal(err)
+	}
+	after := snapshot()
+
+	for p, was := range before {
+		switch now, still := after[p]; {
+		case !still:
+			t.Errorf("%s disappeared from the library", p)
+		case now != was:
+			t.Errorf("%s changed: %s -> %s", p, was, now)
+		}
+	}
+	for p := range after {
+		if _, had := before[p]; !had {
+			t.Errorf("%s was created inside the library", p)
+		}
 	}
 }

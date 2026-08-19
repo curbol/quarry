@@ -46,37 +46,48 @@ func TestClassify(t *testing.T) {
 
 func TestRefineImage(t *testing.T) {
 	cases := []struct {
-		relPath string
-		want    Category
+		relPath      string
+		vendor, pack string
+		want         Category
 	}{
 		// UI: INTERFACE-pack sprite/icon/branding paths, and generic UI folders.
-		{"synty/INTERFACE_Dark_Fantasy_HUD/x.zip::Source_Sprites/Core/Icons_Input/ICON_Input_Stick.png", CategoryUI},
-		{"synty/INTERFACE_Fantasy_Menus/x.zip::Source_Sprites/Core/Branding/SPR_Logo.png", CategoryUI},
-		{"pack/UI/button_01.png", CategoryUI},
-		{"pack/HUD/minimap.png", CategoryUI},
+		{"synty/INTERFACE_Dark_Fantasy_HUD/x.zip::Source_Sprites/Core/Icons_Input/ICON_Input_Stick.png", "", "", CategoryUI},
+		{"synty/INTERFACE_Fantasy_Menus/x.zip::Source_Sprites/Core/Branding/SPR_Logo.png", "", "", CategoryUI},
+		{"pack/UI/button_01.png", "", "", CategoryUI},
+		{"pack/HUD/minimap.png", "", "", CategoryUI},
 		// UI wins over a texture folder when both are present in the path.
-		{"pack/UI/Textures/icon.png", CategoryUI},
+		{"pack/UI/Textures/icon.png", "", "", CategoryUI},
 		// texture: /textures/ tree, sibling folders, and map suffixes.
-		{"synty/POLYGON_Nature/x.zip::Textures/PolygonNature_Texture_01.png", CategoryTexture},
-		{"pack/Textures/Wall_Normal.png", CategoryTexture},
-		{"pack/Decals/blood_01.png", CategoryTexture},
-		{"pack/Materials/rock_emissive.png", CategoryTexture},
+		{"synty/POLYGON_Nature/x.zip::Textures/PolygonNature_Texture_01.png", "", "", CategoryTexture},
+		{"pack/Textures/Wall_Normal.png", "", "", CategoryTexture},
+		{"pack/Decals/blood_01.png", "", "", CategoryTexture},
+		{"pack/Materials/rock_emissive.png", "", "", CategoryTexture},
 		// image: the remainder (no UI token, no texture folder/suffix).
-		{"pack/Misc/fx_circle_01.png", CategoryImage},
-		{"pack/color_palette.png", CategoryImage},
+		{"pack/Misc/fx_circle_01.png", "", "", CategoryImage},
+		{"pack/color_palette.png", "", "", CategoryImage},
 		// "build" contains the substring "ui" but is not a UI token boundary.
-		{"pack/Buildings/wall.png", CategoryImage},
+		{"pack/Buildings/wall.png", "", "", CategoryImage},
 		// The pack/archive NAME must not drive classification: POLYGON_Icons ships 3D
 		// props, and a file under its Textures/ folder is a texture even though "Icons"
 		// is in the pack name. Only the path inside the archive (after "::") counts.
-		{"synty/POLYGON_Icons/POLYGON_Icons_Unity_2022_3_v1_2_1.unitypackage::Assets/Synty/PolygonGeneric/Textures/Alts/Generic_01_A.png", CategoryTexture},
+		{"synty/POLYGON_Icons/POLYGON_Icons_Unity_2022_3_v1_2_1.unitypackage::Assets/Synty/PolygonGeneric/Textures/Alts/Generic_01_A.png", "", "", CategoryTexture},
 		// A genuine UI sprite inside an archive still reads as UI from its entry path,
 		// even when the pack name carries no UI token.
-		{"synty/POLYGON_Kit/POLYGON_Kit.unitypackage::Assets/UI/HUD/health_bar.png", CategoryUI},
+		{"synty/POLYGON_Kit/POLYGON_Kit.unitypackage::Assets/UI/HUD/health_bar.png", "", "", CategoryUI},
+		// The same rule for a loose file, where the pack name is a prefix of the
+		// library-relative path rather than something before a "::". An extracted copy
+		// must classify as whatever the archive entry beside it classifies as.
+		{"synty/POLYGON_Icons/Textures/Generic_01_A.png", "synty", "POLYGON_Icons", CategoryTexture},
+		{"synty/INTERFACE_Fantasy_Menus/Textures/Wall_Normal.png", "synty", "INTERFACE_Fantasy_Menus", CategoryTexture},
+		// A real UI path under a UI-named pack still reads as UI on its own evidence.
+		{"synty/INTERFACE_Fantasy_Menus/Source_Sprites/Branding/SPR_Logo.png", "synty", "INTERFACE_Fantasy_Menus", CategoryUI},
+		// A file directly under a vendor dir has no pack; the vendor name must not
+		// drive classification either.
+		{"icons/Textures/rock_albedo.png", "icons", "", CategoryTexture},
 	}
 	for _, c := range cases {
-		if got := refineImage(c.relPath); got != c.want {
-			t.Errorf("refineImage(%q) = %s, want %s", c.relPath, got, c.want)
+		if got := refineImage(c.relPath, c.vendor, c.pack); got != c.want {
+			t.Errorf("refineImage(%q, %q, %q) = %s, want %s", c.relPath, c.vendor, c.pack, got, c.want)
 		}
 	}
 }

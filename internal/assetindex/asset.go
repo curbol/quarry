@@ -172,7 +172,7 @@ func newAsset(s Source, name, relPath, vendor, pack, variant string, size int64,
 	ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(name), "."))
 	cat, thumb := Classify(ext)
 	if cat == CategoryImage {
-		cat = refineImage(relPath)
+		cat = refineImage(relPath, vendor, pack)
 	}
 	if cat == CategoryModel {
 		cat = refineModel(pack, name)

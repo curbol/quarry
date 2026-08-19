@@ -60,8 +60,26 @@ func TestGLBClipSplit(t *testing.T) {
 		if c.Thumb != ThumbGLB {
 			t.Errorf("clip %q thumb = %q, want glb", c.Name, c.Thumb)
 		}
+		// ClipIndex is what the preview dereferences to pick an animation out of the
+		// file; Clip is a disambiguated label that need not name any animation in it.
+		// Nothing else asserts the index, and an off-by-one here plays every clip as
+		// the wrong one with the rest of this test still green.
+		if c.Source.ClipIndex == nil {
+			t.Errorf("clip %q carries no ClipIndex; the preview has nothing to look up", c.Name)
+		}
 		ids[c.ID] = true
 		fps[c.Fingerprint] = true
+	}
+	byIndex := map[int]string{}
+	for _, c := range clips {
+		if c.Source.ClipIndex != nil {
+			byIndex[*c.Source.ClipIndex] = c.Source.Clip
+		}
+	}
+	for i, want := range []string{"Walk", "Run", "Idle"} {
+		if got := byIndex[i]; got != want {
+			t.Errorf("ClipIndex %d = %q, want %q (the order writeGLB wrote)", i, got, want)
+		}
 	}
 	if len(ids) != 3 || len(fps) != 3 {
 		t.Errorf("clip ids/fingerprints not distinct: ids=%d fps=%d", len(ids), len(fps))

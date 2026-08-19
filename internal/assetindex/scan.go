@@ -37,12 +37,18 @@ func isSidecar(ext string) bool {
 
 // skipEntry reports archive entries that aren't browseable assets: dot-files
 // (.editorconfig, .gitignore, …) and engine sidecars, matching the loose-file walk.
+//
+// Every segment is checked, not just the last: the loose walk drops a dot-directory
+// with everything under it, so an archive carrying .git/config or
+// SourceFiles/.vscode/settings.json has to lose them the same way, or the same tree
+// indexes differently depending on whether it shipped packed or extracted.
 func skipEntry(name string) bool {
-	base := path.Base(name)
-	if strings.HasPrefix(base, ".") {
-		return true
+	for _, seg := range strings.Split(name, "/") {
+		if strings.HasPrefix(seg, ".") {
+			return true
+		}
 	}
-	return isSidecar(strings.ToLower(strings.TrimPrefix(path.Ext(base), ".")))
+	return isSidecar(strings.ToLower(strings.TrimPrefix(path.Ext(path.Base(name)), ".")))
 }
 
 // libEntry is one file discovered by walking the library: either an archive (to
@@ -149,16 +155,20 @@ func (w *walker) tree(dir, prefix string) error {
 			return nil
 		}
 		name := d.Name()
-		if d.Type()&fs.ModeSymlink != 0 {
-			return w.symlink(p, r)
-		}
-		if d.IsDir() {
-			if p != dir && strings.HasPrefix(name, ".") {
+		// Ahead of the symlink branch: a dot-named entry is working state whichever
+		// kind it is, and letting a link be handled first would either index a hidden
+		// tree under --follow-symlinks or report a skip naming that flag for something
+		// a plain dot-dir is dropped for silently.
+		if p != dir && strings.HasPrefix(name, ".") {
+			if d.IsDir() {
 				return filepath.SkipDir
 			}
 			return nil
 		}
-		if strings.HasPrefix(name, ".") {
+		if d.Type()&fs.ModeSymlink != 0 {
+			return w.symlink(p, r)
+		}
+		if d.IsDir() {
 			return nil
 		}
 		info, err := d.Info()
@@ -239,27 +249,33 @@ func (w *walker) symlink(p, r string) error {
 	return w.tree(target, r)
 }
 
-// enumerateArchive opens one archive entry and returns its assets.
-func enumerateArchive(e libEntry) ([]Asset, error) {
+// enumerateArchive opens one archive entry and returns its assets, plus a note when
+// a pass over the archive degraded without failing outright — assets it could still
+// enumerate alongside a report of what it could not.
+func enumerateArchive(e libEntry) ([]Asset, *SkippedFile, error) {
 	switch e.kind {
 	case SourceZip:
-		return zipAssets(e.path, e.rel, e.vendor, e.pack, e.variant)
+		a, err := zipAssets(e.path, e.rel, e.vendor, e.pack, e.variant)
+		return a, nil, err
 	case SourceUnityPackage:
 		return unityAssets(e.path, e.rel, e.vendor, e.pack, e.variant)
 	}
-	return nil, nil
+	return nil, nil, nil
 }
 
 // archiveAssets enumerates one archive, turning a read failure into a skip note
 // instead of an error. A truncated or otherwise damaged file in a large library
 // must not make the whole index unbuildable — browse treats a build failure as
 // fatal, so one bad file would take the entire browser down with it.
+// A partial failure returns both: the assets that were enumerated, and the note
+// naming what was lost. The caller keeps the assets and declines to cache the
+// archive's print, so the degraded pass is retried next run rather than frozen.
 func archiveAssets(e libEntry) ([]Asset, *SkippedFile) {
-	a, err := enumerateArchive(e)
+	a, note, err := enumerateArchive(e)
 	if err != nil {
 		return nil, &SkippedFile{RelPath: e.rel, Reason: err.Error()}
 	}
-	return a, nil
+	return a, note
 }
 
 // looseAsset builds the single asset for a loose file entry, reading the file to
@@ -428,23 +444,28 @@ func vendorPack(rel string) (vendor, pack string) {
 // can share a basename+size across packs or subtrees. Only archive-vs-loose is
 // de-duplicated; two archive variants of the same asset are kept (distinct
 // deliverables, distinguished by the variant facet).
-func dedup(assets []Asset) []Asset {
+//
+// The dropped entries are returned rather than discarded because suppression is a
+// property of the pair, not of the archive: the loose twin can be deleted while the
+// archive's stat print stays identical, and an incremental refresh that kept only
+// the survivors would reuse the suppression along with them and lose the asset.
+func dedup(assets []Asset) (kept, dropped []Asset) {
 	looseKeys := make(map[string]struct{})
 	for i := range assets {
 		if assets[i].Source.Kind == SourceLoose {
 			looseKeys[looseDedupKey(assets[i])] = struct{}{}
 		}
 	}
-	out := assets[:0]
 	for _, a := range assets {
 		if a.Source.Kind != SourceLoose {
 			if _, ok := looseKeys[archiveDedupKey(a)]; ok {
+				dropped = append(dropped, a)
 				continue
 			}
 		}
-		out = append(out, a)
+		kept = append(kept, a)
 	}
-	return out
+	return kept, dropped
 }
 
 func normSubpath(s string) string { return strings.TrimPrefix(s, "src/") }
@@ -454,15 +475,22 @@ func dedupKey(vendor, pack, subpath string, size int64) string {
 }
 
 func looseDedupKey(a Asset) string {
-	// A file directly under a vendor dir has no pack, so the prefix is built rather
-	// than formatted: "vendor" + "/" + "" + "/" would be a doubled separator that
-	// matches nothing, silently disabling dedup for that layout.
-	prefix := a.Vendor + "/"
-	if a.Pack != "" {
-		prefix += a.Pack + "/"
+	return dedupKey(a.Vendor, a.Pack, packSubpath(a.RelPath, a.Vendor, a.Pack), a.Size)
+}
+
+// packSubpath strips the vendor/pack prefix from a loose file's library-relative
+// path, leaving the path within the pack — the half that describes the file rather
+// than the release it shipped in.
+//
+// A file directly under a vendor dir has no pack, so the prefix is built rather than
+// formatted: "vendor" + "/" + "" + "/" would be a doubled separator that matches
+// nothing, silently leaving the whole path in place.
+func packSubpath(relPath, vendor, pack string) string {
+	prefix := vendor + "/"
+	if pack != "" {
+		prefix += pack + "/"
 	}
-	within := strings.TrimPrefix(a.RelPath, prefix)
-	return dedupKey(a.Vendor, a.Pack, within, a.Size)
+	return strings.TrimPrefix(relPath, prefix)
 }
 
 func archiveDedupKey(a Asset) string {

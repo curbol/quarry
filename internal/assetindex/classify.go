@@ -86,13 +86,17 @@ func refineModel(pack, name string) Category {
 // image using its path. UI containers win (a HUD sprite is UI even if the pack also
 // ships textures), then texture folders and material-map suffixes, else a plain image.
 //
-// It matches only the file's path inside its archive (after "::"), never the
-// pack/archive name: a pack called "POLYGON_Icons" must not make its textures read as
-// UI. Loose files (no "::") are matched whole.
-func refineImage(relPath string) Category {
+// It matches only the path within the pack — after "::" for an archive entry, after
+// the vendor/pack prefix for a loose file — never the pack or archive name: a pack
+// called "POLYGON_Icons" must not make its textures read as UI. Matching a loose
+// file's whole library-relative path would do exactly that, and would also classify
+// it differently from the byte-identical copy inside the pack's own archive.
+func refineImage(relPath, vendor, pack string) Category {
 	p := relPath
 	if i := strings.LastIndex(p, "::"); i >= 0 {
 		p = p[i+len("::"):]
+	} else {
+		p = packSubpath(p, vendor, pack)
 	}
 	p = strings.ToLower(p)
 	switch {

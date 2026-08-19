@@ -100,7 +100,7 @@ func walkUnityTar(archivePath string, visit func(guid, member string, hdr *tar.H
 // the gzip+tar once, resolving each GUID's real path from its `pathname` member and
 // noting an optional `preview.png`. GUIDs with no `asset` payload (Unity directory
 // placeholders) are dropped so they never become phantom index rows.
-func unityAssets(archivePath, displayRel, vendor, pack, variant string) ([]Asset, error) {
+func unityAssets(archivePath, displayRel, vendor, pack, variant string) ([]Asset, *SkippedFile, error) {
 	entries := map[string]*unityEntry{}
 	var order []string
 	// Only images need the head bytes, and the two members arrive in either order
@@ -140,7 +140,7 @@ func unityAssets(archivePath, displayRel, vendor, pack, variant string) ([]Asset
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	var assets []Asset
@@ -160,7 +160,11 @@ func unityAssets(archivePath, displayRel, vendor, pack, variant string) ([]Asset
 		a.Width, a.Height = e.width, e.height
 		assets = append(assets, a)
 	}
-	return applySidekick(archivePath, assets), nil
+	assets, note := applySidekick(archivePath, assets)
+	if note != nil {
+		note.RelPath = displayRel
+	}
+	return assets, note, nil
 }
 
 // extractUnityPackage decompresses a .unitypackage once, writing each GUID's

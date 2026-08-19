@@ -115,3 +115,25 @@ func mustScan(t *testing.T, root string) []Asset {
 	}
 	return assets
 }
+
+// A zero CRC over non-empty bytes is the absence of a fingerprint, not one. Degrading
+// it to a constant would give every such entry of the same size one identity, so a
+// tag on any of them would appear on all of them.
+func TestCRCFingerprintDegradesRatherThanColliding(t *testing.T) {
+	cases := []struct {
+		name string
+		crc  uint32
+		size int64
+		want string
+	}{
+		{"unset crc on real bytes is no fingerprint", 0, 4096, ""},
+		{"another size, same absence — must not collide", 0, 512, ""},
+		{"an empty file's crc is genuinely zero", 0, 0, "crc32:0:0"},
+		{"an ordinary entry", 0x1a2b3c4d, 41700000, "crc32:1a2b3c4d:41700000"},
+	}
+	for _, c := range cases {
+		if got := crcFingerprint(c.crc, c.size); got != c.want {
+			t.Errorf("%s: crcFingerprint(%#x, %d) = %q, want %q", c.name, c.crc, c.size, got, c.want)
+		}
+	}
+}

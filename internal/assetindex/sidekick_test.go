@@ -1,6 +1,7 @@
 package assetindex
 
 import (
+	"os"
 	"reflect"
 	"testing"
 )
@@ -179,5 +180,91 @@ func TestSidekickAtThePackageRootDoesNotClaimEverything(t *testing.T) {
 		if !kept[n] {
 			t.Errorf("%s was dropped as a Sidekick byproduct; it has nothing to do with the character", n)
 		}
+	}
+}
+
+// Two characters whose names share a prefix. Synty joins a byproduct's suffix to the
+// character name with the same "_" the names themselves contain, so only the longer
+// claim tells "Hero_Alt.prefab" (Hero_Alt's) apart from "Hero_CombinedMesh.asset"
+// (Hero's). Hero_Alt failed to assemble here, so its byproducts are all it has left.
+func TestSidekickDoesNotClaimALongerNamedNeighbour(t *testing.T) {
+	root, mk := libRoot(t)
+	writeUnityPackage(t, mk("synty", "SIDEKICK_Z", "SIDEKICK_Z_Unity_2021_3_v1_0_0.unitypackage"), []unityGUID{
+		{guid: "sk1", pathname: "Assets/S/Characters/Hero.sk", asset: "Name: Hero\nParts:\n- Name: SK_HEAD\n"},
+		{guid: "hd1", pathname: "Assets/S/Resources/Meshes/SK_HEAD.fbx", asset: "HEADFBX"},
+		{guid: "sk2", pathname: "Assets/S/Characters/Hero_Alt.sk", asset: "Name: Hero_Alt\nParts:\n- Name: SK_ABSENT\n"},
+		{guid: "p2", pathname: "Assets/S/Characters/Hero_Alt.prefab", asset: "PREFAB2"},
+		{guid: "m2", pathname: "Assets/S/Characters/Hero_Alt.mat", asset: "MAT2"},
+		// Hero's own byproducts, which it does supersede.
+		{guid: "p1", pathname: "Assets/S/Characters/Hero.prefab", asset: "PREFAB1"},
+		{guid: "c1", pathname: "Assets/S/Characters/Hero_CombinedMesh.asset", asset: "MESH1"},
+		// A neighbour that merely starts with the character name is not a byproduct.
+		{guid: "u1", pathname: "Assets/S/Characters/HeroicBanner.prefab", asset: "BANNER"},
+	})
+
+	assets, err := Scan(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kept := map[string]bool{}
+	for _, a := range assets {
+		kept[a.Name] = true
+	}
+	if !kept["Hero"] {
+		t.Fatal("Hero did not assemble")
+	}
+	for _, n := range []string{"Hero_Alt.prefab", "Hero_Alt.mat"} {
+		if !kept[n] {
+			t.Errorf("%s was dropped, but it belongs to Hero_Alt, which failed to assemble and has no other representation", n)
+		}
+	}
+	if !kept["HeroicBanner.prefab"] {
+		t.Error("HeroicBanner.prefab was dropped; it only shares a prefix with the character name")
+	}
+	for _, n := range []string{"Hero.prefab", "Hero_CombinedMesh.asset"} {
+		if kept[n] {
+			t.Errorf("%s survived; the assembled character supersedes its own byproducts", n)
+		}
+	}
+}
+
+// A Sidekick pass that cannot read the package's .sk data keeps every other asset,
+// reports the failure, and must not let the archive's stat print cache the degraded
+// enumeration — otherwise the missing characters persist until --reindex.
+func TestFailedSidekickAssemblyIsReportedAndNotCached(t *testing.T) {
+	root, mk := libRoot(t)
+	cacheDir := t.TempDir()
+	pkg := mk("synty", "SIDEKICK_W", "SIDEKICK_W_Unity_2021_3_v1_0_0.unitypackage")
+	writeUnityPackage(t, pkg, []unityGUID{
+		{guid: "sk1", pathname: "Assets/S/Characters/Hero.sk", asset: "Name: Hero\nParts:\n- Name: SK_HEAD\n"},
+		{guid: "hd1", pathname: "Assets/S/Resources/Meshes/SK_HEAD.fbx", asset: "HEADFBX"},
+	})
+
+	ix, err := LoadOrBuild(Options{Root: root, CacheDir: cacheDir}, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := ix.ArchivePrint[pkg]; !ok {
+		t.Fatal("a package that assembled cleanly should have its print cached")
+	}
+
+	// Truncate the archive past the enumeration head so the second pass fails while
+	// the first still succeeds.
+	full, err := os.ReadFile(pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(pkg, full[:len(full)/2], 0o644); err != nil {
+		t.Fatal(err)
+	}
+	broken, err := LoadOrBuild(Options{Root: root, CacheDir: cacheDir}, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := broken.ArchivePrint[pkg]; ok {
+		t.Error("a degraded enumeration was cached against the archive's print; it would be reused until --reindex")
+	}
+	if len(broken.Skipped) == 0 {
+		t.Error("nothing was reported; the failure would be invisible to the user")
 	}
 }

@@ -19,7 +19,7 @@ import (
 // also keys the unpacked-archive tree, so a change to what extraction writes belongs
 // here too: an archive whose bytes never changed keeps its fingerprint, and only the
 // version tells the old extraction apart from what the current code would produce.
-const indexVersion = 17
+const indexVersion = 18
 
 // SkippedFile records a library file the scan could not read. A damaged archive
 // costs its own contents, not the rest of the library, so the failure is carried
@@ -40,6 +40,12 @@ type Index struct {
 	ArchivePrint map[string]string `json:"archivePrint"` // abs archive path -> stat fingerprint
 	LoosePrint   map[string]string `json:"loosePrint"`   // abs loose path -> stat fingerprint
 	Skipped      []SkippedFile     `json:"skipped,omitempty"`
+
+	// Suppressed holds the archive entries dedup dropped in favour of a loose twin.
+	// They are cached because reuse is keyed on the archive's stat print, which does
+	// not move when the twin outside it is deleted: without them a refresh would
+	// reuse only the survivors and the entry would never come back.
+	Suppressed []Asset `json:"suppressed,omitempty"`
 
 	// FollowSymlinks is the setting this index was built under, kept because it
 	// changes what the scan covers: a cache built the other way describes a
@@ -115,7 +121,8 @@ func Build(opt Options) (*Index, error) {
 // Refresh directly from silently merging two schemes' assets into one index.
 func (ix *Index) Refresh() error {
 	if ix.Version != indexVersion {
-		ix.Assets, ix.ArchivePrint, ix.LoosePrint = nil, map[string]string{}, map[string]string{}
+		ix.Assets, ix.Suppressed = nil, nil
+		ix.ArchivePrint, ix.LoosePrint = map[string]string{}, map[string]string{}
 		ix.Version = indexVersion
 	}
 	entries, skipped, linkRoots, err := walkLibrary(ix.Root, ix.FollowSymlinks)
@@ -125,9 +132,15 @@ func (ix *Index) Refresh() error {
 	ix.LinkRoots = linkRoots
 	// Positions, not values: an Asset is ~20 strings, so mapping the whole set by value
 	// would hold a second copy of a 150k-asset library alongside the one being rebuilt.
+	// Indexed over the survivors and the suppressed together, so an archive's cached
+	// enumeration is reused whole and dedup gets the same full set to decide over
+	// that a fresh scan would.
+	prev := make([]Asset, 0, len(ix.Assets)+len(ix.Suppressed))
+	prev = append(prev, ix.Assets...)
+	prev = append(prev, ix.Suppressed...)
 	oldByArchive := map[string][]int{}
 	oldByLoose := map[string][]int{}
-	for i, a := range ix.Assets {
+	for i, a := range prev {
 		if a.Source.Kind == SourceLoose {
 			oldByLoose[a.Source.FilePath] = append(oldByLoose[a.Source.FilePath], i)
 		} else {
@@ -139,7 +152,7 @@ func (ix *Index) Refresh() error {
 	var assets []Asset
 	reuse := func(idx []int) {
 		for _, i := range idx {
-			assets = append(assets, ix.Assets[i])
+			assets = append(assets, prev[i])
 		}
 	}
 	for _, e := range entries {
@@ -175,17 +188,22 @@ func (ix *Index) Refresh() error {
 			continue
 		}
 		a, skip := archiveAssets(e)
+		// Same rule the loose path follows: a derivation that did not fully succeed is
+		// left out of newPrint, because the print describes the file rather than
+		// whether reading it worked. Whatever assets came back are still kept — a
+		// package whose character assembly failed still contributes everything else.
 		if skip != nil {
 			delete(newPrint, e.path)
 			skipped = append(skipped, *skip)
-			continue
 		}
 		assets = append(assets, a...)
 	}
 	ix.ArchivePrint = newPrint
 	ix.LoosePrint = newLoose
 	ix.Skipped = skipped
-	ix.setAssets(dedup(assets))
+	kept, dropped := dedup(assets)
+	ix.setAssets(kept)
+	ix.Suppressed = dropped
 	return nil
 }
 

@@ -52,7 +52,7 @@ func parseSidekick(data []byte) (name string, parts []string) {
 // picked out by extension alone from an archive this tool did not produce.
 const maxSidekickBytes = 256 << 10
 
-func applySidekick(archivePath string, assets []Asset) []Asset {
+func applySidekick(archivePath string, assets []Asset) ([]Asset, *SkippedFile) {
 	// Driven off the surviving assets, not the raw enumeration: a part resolved from a
 	// guid the enumeration already dropped (no payload, unsafe path, a sidecar) would
 	// name an id the index cannot serve, and the frontend would silently render the
@@ -74,18 +74,33 @@ func applySidekick(archivePath string, assets []Asset) []Asset {
 		}
 	}
 	if len(skGuids) == 0 {
-		return assets
+		return assets, nil
 	}
 	skBytes, err := readUnityAssetBytes(archivePath, skGuids, maxSidekickBytes)
 	if err != nil {
 		// Assembly is a vendor-specific second pass over a package the vendor-neutral
 		// first pass already enumerated. Losing it costs the character cards, not the
-		// several thousand assets the package otherwise contributes.
-		return assets
+		// several thousand assets the package otherwise contributes — so the assets
+		// are kept and the failure is reported, never absorbed. Reporting it is what
+		// keeps the caller from caching this enumeration against the archive's stat
+		// print: the print describes the file, not whether the second pass worked.
+		return assets, &SkippedFile{Reason: "sidekick characters could not be assembled: " + err.Error()}
 	}
-	// Only a character that actually assembled supersedes its byproducts; the
-	// characters collected here bound the suppression below.
-	var assembled []sidekickChar
+	// Every .sk in the package, assembled or not. An unassembled character still has
+	// to claim its own name below, or the assembled character whose name prefixes it
+	// would take the byproducts that are the unassembled one's only representation.
+	var chars []sidekickChar
+	for g := range skGuids {
+		i, ok := byGuid[g]
+		if !ok {
+			continue
+		}
+		p := assets[i].Source.Pathname
+		chars = append(chars, sidekickChar{
+			tree: path.Dir(p) + "/",
+			base: strings.TrimSuffix(path.Base(p), path.Ext(p)),
+		})
+	}
 	for g := range skGuids {
 		data, ok := skBytes[g]
 		if !ok {
@@ -109,24 +124,31 @@ func applySidekick(archivePath string, assets []Asset) []Asset {
 		assets[i].Category = CategoryModel
 		assets[i].Thumb = ThumbSidekick
 		assets[i].Source.Parts = partIDs
-		assembled = append(assembled, sidekickChar{
-			tree: path.Dir(p) + "/",
-			base: strings.TrimSuffix(path.Base(p), path.Ext(p)),
-		})
+		base := strings.TrimSuffix(path.Base(p), path.Ext(p))
+		for ci := range chars {
+			if chars[ci].tree == path.Dir(p)+"/" && chars[ci].base == base {
+				chars[ci].assembled = true
+			}
+		}
 	}
 	kept := assets[:0]
 	for _, a := range assets {
-		if !sidekickByproduct(a, assembled) {
+		if !sidekickByproduct(a, chars) {
 			kept = append(kept, a)
 		}
 	}
-	return kept
+	return kept, nil
 }
 
-// sidekickChar is one assembled character's suppression scope: the directory its
-// .sk sits in, and the .sk's own base name, which every byproduct of that character
-// is named after.
-type sidekickChar struct{ tree, base string }
+// sidekickChar is one character's suppression scope: the directory its .sk sits in,
+// the .sk's own base name, which every byproduct of that character is named after,
+// and whether the character actually assembled. Unassembled characters are carried
+// too, because a name only claims its own byproducts by being the longest one that
+// matches them.
+type sidekickChar struct {
+	tree, base string
+	assembled  bool
+}
 
 // sidekickByproduct reports a per-character byproduct that its assembled .sk
 // character supersedes: the magenta prefab, its material, and the combined-mesh /
@@ -139,7 +161,7 @@ type sidekickChar struct{ tree, base string }
 // Matching the name as well as the directory is what keeps that last promise true:
 // two characters commonly share a directory, and a .sk exported to the top of a
 // package would otherwise claim every prefab and material in it.
-func sidekickByproduct(a Asset, assembled []sidekickChar) bool {
+func sidekickByproduct(a Asset, chars []sidekickChar) bool {
 	if a.Thumb == ThumbSidekick {
 		return false
 	}
@@ -148,12 +170,41 @@ func sidekickByproduct(a Asset, assembled []sidekickChar) bool {
 	default:
 		return false
 	}
-	for _, c := range assembled {
-		if strings.HasPrefix(a.Source.Pathname, c.tree) && strings.HasPrefix(a.Name, c.base) {
-			return true
+	// The longest matching name wins, and only then does assembly decide. Synty joins
+	// a byproduct's suffix to the character name with the same "_" the names
+	// themselves contain, so "Hero" matching "Hero_Alt.prefab" is indistinguishable
+	// from "Hero" matching "Hero_CombinedMesh.asset" on separators alone. What tells
+	// them apart is that "Hero_Alt" is itself a character in the package: it is the
+	// longer claim on that file, so the file is its byproduct, not Hero's.
+	stem := strings.TrimSuffix(a.Name, path.Ext(a.Name))
+	best := -1
+	for i, c := range chars {
+		if !strings.HasPrefix(a.Source.Pathname, c.tree) || !namedFor(stem, c.base) {
+			continue
+		}
+		if best < 0 || len(c.base) > len(chars[best].base) {
+			best = i
 		}
 	}
-	return false
+	return best >= 0 && chars[best].assembled
+}
+
+// namedFor reports whether stem names a byproduct of base: base itself, or base
+// followed by a separator. Requiring the separator is what stops "Base" from
+// claiming "BaseSkeleton".
+func namedFor(stem, base string) bool {
+	if stem == base {
+		return true
+	}
+	if !strings.HasPrefix(stem, base) {
+		return false
+	}
+	c := stem[len(base)]
+	return !isAlnum(c)
+}
+
+func isAlnum(c byte) bool {
+	return c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
 }
 
 // readUnityAssetBytes streams a .unitypackage once and returns the `asset` payload of
@@ -168,9 +219,15 @@ func readUnityAssetBytes(archivePath string, want map[string]bool, limit int64) 
 		if member != "asset" || !want[guid] {
 			return nil
 		}
-		b, err := io.ReadAll(io.LimitReader(tr, limit))
+		// limit+1 so an over-long member is recognised rather than silently truncated:
+		// a short read would assemble a character missing the limbs the truncated tail
+		// named, and still suppress the byproducts that would have shown it.
+		b, err := io.ReadAll(io.LimitReader(tr, limit+1))
 		if err != nil {
 			return err
+		}
+		if int64(len(b)) > limit {
+			return nil
 		}
 		out[guid] = b
 		return nil

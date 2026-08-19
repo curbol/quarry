@@ -53,14 +53,29 @@ func ResolveCacheDir(flag string) (string, error) {
 // where the index and every unpacked archive get written — into the read-only tree,
 // for the next run to then index.
 func resolveXDG(flag, ownEnv, xdgEnv, homeSub, failure string) (string, error) {
+	// Expanding a "~" needs the same home directory the last branch does, so it fails
+	// the same way and carries the same hint. Returning the path unexpanded instead
+	// would hand back a cwd-relative "~/…" with no error — the fallback this function
+	// exists to refuse, arriving through the branches that look like they cannot fail.
+	expand := func(p string) (string, error) {
+		v, err := ExpandHome(p)
+		if err != nil {
+			return "", fmt.Errorf(failure, err)
+		}
+		return v, nil
+	}
 	if flag != "" {
-		return ExpandHome(flag), nil
+		return expand(flag)
 	}
 	if v := os.Getenv(ownEnv); v != "" {
-		return ExpandHome(v), nil
+		return expand(v)
 	}
 	if v := os.Getenv(xdgEnv); v != "" {
-		return filepath.Join(ExpandHome(v), "quarry"), nil
+		base, err := expand(v)
+		if err != nil {
+			return "", err
+		}
+		return filepath.Join(base, "quarry"), nil
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -97,7 +112,11 @@ func Load(dir string) (Config, error) {
 	if v := os.Getenv("QUARRY_ROOT"); v != "" {
 		c.Root = v
 	}
-	c.Root = ExpandHome(c.Root)
+	root, err := ExpandHome(c.Root)
+	if err != nil {
+		return Config{}, err
+	}
+	c.Root = root
 	return c, nil
 }
 
@@ -105,11 +124,21 @@ func Load(dir string) (Config, error) {
 // exported because --root overrides the value Load has already expanded, and a path
 // typed into a systemd unit or a wrapper script reaches the flag with its "~" intact
 // — no shell having been there to expand it.
-func ExpandHome(p string) string {
-	if p == "~" || strings.HasPrefix(p, "~/") {
-		if home, err := os.UserHomeDir(); err == nil {
-			return filepath.Join(home, strings.TrimPrefix(p, "~"))
-		}
+//
+// A home directory that cannot be found is reported rather than left in the path. The
+// unexpanded form is not a harmless passthrough: nothing downstream treats "~" as
+// special, so it becomes an ordinary directory name resolved against the working
+// directory — a literal "~" created beside whatever quarry was run from, holding the
+// tags or the cache the user meant to put in their home. A systemd unit with no
+// Environment=HOME= is exactly the setting this function was added for, and exactly
+// where UserHomeDir fails.
+func ExpandHome(p string) (string, error) {
+	if p != "~" && !strings.HasPrefix(p, "~/") {
+		return p, nil
 	}
-	return p
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("cannot expand %q: %w", p, err)
+	}
+	return filepath.Join(home, strings.TrimPrefix(p, "~")), nil
 }

@@ -143,7 +143,10 @@ func TestUnassignKeepsPaletteEntry(t *testing.T) {
 	}
 }
 
-func TestSaveIsSortedAndDeterministic(t *testing.T) {
+// Ordering only. That a save is reproducible is TestLoadSaveRoundTripIsByteIdentical's
+// job, and it proves more: saving the same in-memory store twice only shows map
+// iteration does not leak, where a load-then-save shows the file survives the trip.
+func TestSaveIsSorted(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, FileName)
 	s := New()
@@ -169,15 +172,6 @@ func TestSaveIsSortedAndDeterministic(t *testing.T) {
 	// Each assignment's tags are sorted: fp-a lists alpha before zebra.
 	if !strings.Contains(text, `tags = ["alpha", "zebra"]`) {
 		t.Errorf("assignment tags not sorted (want [\"alpha\", \"zebra\"]):\n%s", text)
-	}
-	// Deterministic: a second save of an equivalently-built store is byte-identical.
-	path2 := filepath.Join(dir, "second-"+FileName)
-	if err := s.Save(path2); err != nil {
-		t.Fatal(err)
-	}
-	b2, _ := os.ReadFile(path2)
-	if string(b2) != text {
-		t.Errorf("save not deterministic:\n--- first ---\n%s\n--- second ---\n%s", text, string(b2))
 	}
 }
 
@@ -606,20 +600,39 @@ func TestSaveToADifferentPathIsNotStale(t *testing.T) {
 	}
 }
 
-// Rename must say when there is nothing to rename. Reporting success let a caller that
-// follows a rename with a color edit define the new id from nothing, answering
-// "renamed" while inventing a tag no asset carries.
+// Rename must say when there is nothing to rename, whatever the new name is.
+// Reporting success let a caller that follows a rename with a color edit define the
+// new id from nothing, answering "renamed" while inventing a tag no asset carries —
+// and short-circuiting the identity case first hid the miss for `Rename(x, x)`.
 func TestRenameReportsAMissingTag(t *testing.T) {
-	s := New()
-	s.Define("hero", "#112233")
-	if err := s.Rename("ghost", "villain"); err == nil {
-		t.Error("renaming a tag that does not exist reported success")
-	}
-	if _, ok := s.Color("villain"); ok {
-		t.Error("the rename target was defined despite the source not existing")
-	}
-	if err := s.Rename("hero", "champion"); err != nil {
-		t.Errorf("renaming an existing tag: %v", err)
+	for _, tc := range []struct {
+		name, old, neu string
+		define         string
+		wantErr        bool
+	}{
+		{name: "missing source", old: "ghost", neu: "villain", wantErr: true},
+		{name: "missing source, unchanged name", old: "ghost", neu: "ghost", wantErr: true},
+		{name: "missing source, empty name", old: "ghost", neu: "", wantErr: true},
+		{name: "present source", define: "hero", old: "hero", neu: "champion"},
+		{name: "present source, unchanged name", define: "hero", old: "hero", neu: "hero"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := New()
+			if tc.define != "" {
+				if err := s.Define(tc.define, "#112233"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			err := s.Rename(tc.old, tc.neu)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("Rename(%q, %q) = %v, wantErr %v", tc.old, tc.neu, err, tc.wantErr)
+			}
+			if tc.wantErr && tc.neu != "" {
+				if _, ok := s.Color(tc.neu); ok {
+					t.Errorf("%q was defined despite the source not existing", tc.neu)
+				}
+			}
+		})
 	}
 }
 
@@ -665,25 +678,6 @@ func TestLoadRefusesADuplicateTagID(t *testing.T) {
 	}
 }
 
-// Renaming a tag that does not exist reports the miss whatever the new name is.
-// Short-circuiting the identity case first answered "renamed" for a tag the store
-// has never heard of.
-func TestRenameReportsAMissingTagEvenWhenTheNameIsUnchanged(t *testing.T) {
-	s := New()
-	if err := s.Rename("ghost", "ghost"); err == nil {
-		t.Error("renaming a missing tag to its own name reported success")
-	}
-	if err := s.Rename("ghost", "villain"); err == nil {
-		t.Error("renaming a missing tag reported success")
-	}
-	if err := s.Define("hero", "#e11d48"); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.Rename("hero", "hero"); err != nil {
-		t.Errorf("renaming an existing tag to its own name = %v, want nil", err)
-	}
-}
-
 // Groups are orthogonal to tags: a link never changes what tags a fingerprint
 // carries, and neither does a tag edit change what a fingerprint is linked to.
 // Rename and Delete are the two that sweep broadly enough to break this.
@@ -704,5 +698,89 @@ func TestTagEditsLeaveLinkGroupsAlone(t *testing.T) {
 	}
 	if got := s.Related("fp-b"); !reflect.DeepEqual(got, []string{"fp-a"}) {
 		t.Errorf("Related(fp-b) = %v after a delete, want [fp-a]", got)
+	}
+}
+
+// A file that is not TOML at all is the one load failure whose alternative outcome is
+// silent: returning an empty store would let the next edit rewrite the file with
+// nothing in it. Every other "refuses" test here feeds syntactically valid TOML, so
+// the parse-error path — and the reason it names the file — went unexercised.
+func TestLoadRefusesMalformedTOML(t *testing.T) {
+	for _, body := range []string{
+		"[[tag\n  id = \"hero\"\n",
+		"id = \n",
+		"[[tag]]\n  id = \"unterminated\n",
+	} {
+		p := filepath.Join(t.TempDir(), FileName)
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		s, err := Load(p)
+		if err == nil {
+			t.Errorf("Load(%q) returned a store with %d tags; a file quarry cannot parse must not read as an empty one", body, len(s.Tags()))
+			continue
+		}
+		// A TOML parse error carries a line number but not a file, and this one
+		// surfaces during a failed save's recovery reload, where nothing else says
+		// which store was being read.
+		if !strings.Contains(err.Error(), p) {
+			t.Errorf("error %q does not name the file", err)
+		}
+	}
+}
+
+// Every user string lands in the file as a TOML value, and the encoder escapes them —
+// but a fingerprint already carries ":" and "#", a split-GLB clip name is an arbitrary
+// vendor string, and a tag id is whatever the user typed. This pins the round trip so
+// a future change to fileTOML's shape (in particular, moving a fingerprint into a key
+// position, where the escaping rules differ) cannot pass unnoticed.
+func TestAwkwardLabelsAndFingerprintsRoundTrip(t *testing.T) {
+	labels := []string{`say "hi"`, `back\slash`, "line\nbreak", "tab\there", "emoji 🎯", "key:value"}
+	fps := []string{
+		`crc32:abc:12#Walk "fast"`,
+		`crc32:def:34#back\slash`,
+		"crc32:aaa:1#new\nline",
+		"uguid:0123456789abcdef",
+	}
+	s := New()
+	for _, fp := range fps {
+		for _, l := range labels {
+			s.Assign(fp, l)
+		}
+	}
+	s.Link(fps)
+
+	p := filepath.Join(t.TempDir(), FileName)
+	if err := s.Save(p); err != nil {
+		t.Fatal(err)
+	}
+	back, err := Load(p)
+	if err != nil {
+		t.Fatalf("reloading a store with awkward strings: %v", err)
+	}
+	for _, fp := range fps {
+		got := back.TagsFor(fp)
+		if len(got) != len(labels) {
+			t.Errorf("TagsFor(%q) = %v, want all %d labels", fp, got, len(labels))
+		}
+	}
+	if got := len(back.Groups()); got != 1 {
+		t.Errorf("groups = %d, want the one link group", got)
+	}
+	// And the file it wrote is the file it writes again: an escape that decoded to
+	// something else would show up here rather than as a silently altered tag.
+	first, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := back.Save(p); err != nil {
+		t.Fatal(err)
+	}
+	second, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(first) != string(second) {
+		t.Errorf("re-saving changed the file:\n--- first ---\n%s\n--- second ---\n%s", first, second)
 	}
 }

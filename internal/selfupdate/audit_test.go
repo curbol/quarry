@@ -447,6 +447,10 @@ func TestRunStopsWhenAlreadyCurrent(t *testing.T) {
 		{"a requested version", "v1.2.3", "1.2.3"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			// Run resolves a token before anything else, and an unpinned environment
+			// sends it to fork the real `gh` and hand a live credential to the stub
+			// server below. The suite is offline; this keeps it that way.
+			t.Setenv("GITHUB_TOKEN", "test-token")
 			var mu sync.Mutex
 			var assetHits int
 			var paths []string
@@ -494,6 +498,7 @@ func TestRunStopsWhenAlreadyCurrent(t *testing.T) {
 // The tag is compared with its "v" stripped from either side, so a release tagged
 // v1.2.3 and a binary built as 1.2.3 (or v1.2.3) are the same version.
 func TestRunTreatsAVPrefixAsTheSameVersion(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "test-token")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `{"tag_name":"v0.4.0","assets":[]}`)
 	}))
@@ -571,4 +576,46 @@ func forceInstallRenameFailure(t *testing.T) {
 	prev := installRename
 	installRename = func(string, string) error { return errors.New("invalid cross-device link") }
 	t.Cleanup(func() { installRename = prev })
+}
+
+// The target is interpolated into the release API's path, and Go sends a path as
+// parsed rather than cleaned. Without this, `update ../../someone/repo/releases/latest`
+// resolves server-side to another repository's release, fetched with this user's token
+// and reported as if it were quarry's.
+func TestFetchReleaseRefusesATargetThatIsNotAVersion(t *testing.T) {
+	var asked []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		asked = append(asked, r.URL.Path)
+		fmt.Fprint(w, `{"tag_name":"v9.9.9","assets":[]}`)
+	}))
+	defer srv.Close()
+	old := releasesAPIURL
+	releasesAPIURL = srv.URL
+	defer func() { releasesAPIURL = old }()
+
+	for _, target := range []string{
+		"../../someone-else/repo/releases/latest",
+		"latest",
+		" 1.2.3",
+		"1.2.3/../../other",
+		"?per_page=1",
+		"-1.2.3",
+	} {
+		if _, err := fetchRelease("", target); err == nil {
+			t.Errorf("target %q was accepted; requests so far: %v", target, asked)
+		}
+	}
+	if len(asked) != 0 {
+		t.Errorf("a rejected target still reached the network: %v", asked)
+	}
+
+	// Ordinary versions, with and without the "v", still resolve.
+	for _, target := range []string{"1.2.3", "v1.2.3", "0.4.0-rc.1", "1.2.3+build5"} {
+		if _, err := fetchRelease("", target); err != nil {
+			t.Errorf("target %q was refused: %v", target, err)
+		}
+	}
+	if len(asked) != 4 {
+		t.Errorf("release requests = %v, want one per accepted version", asked)
+	}
 }

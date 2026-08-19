@@ -381,6 +381,12 @@ func Load(path string) (*Store, error) {
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		return s, nil
 	}
+	// Stamped before the contents are read, not after. A write landing between the two
+	// would otherwise leave this store holding the old file under the new file's stamp,
+	// and the next Save would pass its staleness check and destroy that write with no
+	// trace. Stamping first fails the other way — a spurious ErrStale, which the caller
+	// already recovers from by reloading.
+	stamp := stampOf(path)
 	var f fileTOML
 	md, err := toml.DecodeFile(path, &f)
 	if err != nil {
@@ -444,7 +450,7 @@ func Load(path string) (*Store, error) {
 	for _, g := range f.Groups {
 		s.Link(g.Fingerprints)
 	}
-	s.stamp = stampOf(path)
+	s.stamp = stamp
 	return s, nil
 }
 

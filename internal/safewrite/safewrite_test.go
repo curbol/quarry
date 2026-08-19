@@ -228,7 +228,7 @@ func TestAtomicWritesThroughASymlink(t *testing.T) {
 		if err := write(link, "edited"); err != nil {
 			t.Fatal(err)
 		}
-		if got := readFile(t, real); got != "edited" {
+		if got := read(t, real); got != "edited" {
 			t.Errorf("the real file says %q, want %q — the write did not reach it", got, "edited")
 		}
 		if fi, err := os.Lstat(link); err != nil || fi.Mode()&os.ModeSymlink == 0 {
@@ -246,7 +246,7 @@ func TestAtomicWritesThroughASymlink(t *testing.T) {
 		if err := write(link, "first save"); err != nil {
 			t.Fatal(err)
 		}
-		if got := readFile(t, real); got != "first save" {
+		if got := read(t, real); got != "first save" {
 			t.Errorf("the real file says %q; a store linked into place before its first save must still be created there", got)
 		}
 		if fi, err := os.Lstat(link); err != nil || fi.Mode()&os.ModeSymlink == 0 {
@@ -267,7 +267,7 @@ func TestAtomicWritesThroughASymlink(t *testing.T) {
 		if err := write(filepath.Join(linkDir, "store.toml"), "through the dir"); err != nil {
 			t.Fatal(err)
 		}
-		if got := readFile(t, filepath.Join(realDir, "store.toml")); got != "through the dir" {
+		if got := read(t, filepath.Join(realDir, "store.toml")); got != "through the dir" {
 			t.Errorf("the real directory holds %q, want %q", got, "through the dir")
 		}
 	})
@@ -288,7 +288,7 @@ func TestAtomicWritesThroughASymlink(t *testing.T) {
 		if err := write(outer, "edited"); err != nil {
 			t.Fatal(err)
 		}
-		if got := readFile(t, real); got != "edited" {
+		if got := read(t, real); got != "edited" {
 			t.Errorf("the file at the end of the chain says %q, want %q", got, "edited")
 		}
 	})
@@ -305,15 +305,6 @@ func TestAtomicWritesThroughASymlink(t *testing.T) {
 		// The write may fail; what it must not do is hang or recurse without end.
 		_ = write(a, "whatever")
 	})
-}
-
-func readFile(t *testing.T, path string) string {
-	t.Helper()
-	b, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("reading %s: %v", path, err)
-	}
-	return string(b)
 }
 
 // A killed write leaves its temp file behind, and the next write clears it. The temp

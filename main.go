@@ -128,7 +128,11 @@ func run(args []string) error {
 		return err
 	}
 	if *root != "" {
-		cfg.Root = config.ExpandHome(*root)
+		expanded, err := config.ExpandHome(*root)
+		if err != nil {
+			return err
+		}
+		cfg.Root = expanded
 	}
 	// A bool flag cannot distinguish unset from false by its value, so only an
 	// explicitly passed --follow-symlinks overrides config.toml.
@@ -140,11 +144,15 @@ func run(args []string) error {
 	if cfg.Root == "" {
 		return fmt.Errorf("no scan root: pass --root <dir>, set QUARRY_ROOT, or add\n  root = \"/path/to/your/assets\"\nto %s", filepath.Join(configDir, "config.toml"))
 	}
+	tagsPath, err := resolveTagsPath(*tagsFlag, configDir)
+	if err != nil {
+		return err
+	}
 	return served(settings{
 		Root:           cfg.Root,
 		Addr:           *addr,
 		CacheDir:       cacheDir,
-		TagsPath:       resolveTagsPath(*tagsFlag, configDir),
+		TagsPath:       tagsPath,
 		Reindex:        *reindex,
 		FollowSymlinks: cfg.FollowSymlinks,
 	})
@@ -160,16 +168,16 @@ func isFlag(arg string) bool {
 // quarry.tags.toml found by walking up from the working directory is a project store
 // that travels with that project; with none in sight the store is the user-wide one
 // in the config dir, so tagging works from anywhere and is never silently off.
-func resolveTagsPath(tagsFlag, configDir string) string {
+func resolveTagsPath(tagsFlag, configDir string) (string, error) {
 	if tagsFlag != "" {
 		return config.ExpandHome(tagsFlag)
 	}
 	if wd, err := os.Getwd(); err == nil {
 		if p, ok := tagstore.Discover(wd); ok {
-			return p
+			return p, nil
 		}
 	}
-	return filepath.Join(configDir, tagstore.FileName)
+	return filepath.Join(configDir, tagstore.FileName), nil
 }
 
 // serve indexes the asset root and runs the UI until interrupted.

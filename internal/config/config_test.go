@@ -147,6 +147,31 @@ func TestResolveDirs(t *testing.T) {
 					t.Errorf("got %q alongside the error; want no path at all", got)
 				}
 			})
+
+			// Every branch, not just the last one: a "~" reaching the flag or the env
+			// needs the same home the fallback does, and returning it unexpanded is the
+			// cwd-relative name this whole function exists to refuse.
+			t.Run("a tilde with no home is an error on every branch", func(t *testing.T) {
+				for _, tc := range []struct{ name, flag, own, xdg string }{
+					{name: "flag", flag: "~/state"},
+					{name: "own env", own: "~/state"},
+					{name: "xdg env", xdg: "~/state"},
+				} {
+					t.Run(tc.name, func(t *testing.T) {
+						clearQuarryEnv(t)
+						t.Setenv("HOME", "")
+						t.Setenv(r.ownEnv, tc.own)
+						t.Setenv(r.xdgEnv, tc.xdg)
+						got, err := r.resolve(tc.flag)
+						if err == nil {
+							t.Fatalf("resolved to %q with no home; want an error", got)
+						}
+						if got != "" {
+							t.Errorf("got %q alongside the error; want no path at all", got)
+						}
+					})
+				}
+			})
 		})
 	}
 }
@@ -169,9 +194,34 @@ func TestExpandHome(t *testing.T) {
 		{"/a/~/b", "/a/~/b"},
 		{"./~", "./~"},
 	} {
-		if got := ExpandHome(tc.in); got != tc.want {
+		got, err := ExpandHome(tc.in)
+		if err != nil {
+			t.Errorf("ExpandHome(%q) = %v", tc.in, err)
+			continue
+		}
+		if got != tc.want {
 			t.Errorf("ExpandHome(%q) = %q, want %q", tc.in, got, tc.want)
 		}
+	}
+}
+
+// An unexpandable "~" must not pass through as an ordinary path. Nothing downstream
+// treats it as special, so it resolves against the working directory: a literal "~"
+// directory holding the tags or the cache the user meant to put in their home.
+func TestExpandHomeReportsAMissingHome(t *testing.T) {
+	t.Setenv("HOME", "")
+	for _, in := range []string{"~", "~/lib/assets"} {
+		got, err := ExpandHome(in)
+		if err == nil {
+			t.Errorf("ExpandHome(%q) = %q with no home; want an error", in, got)
+		}
+		if got != "" {
+			t.Errorf("ExpandHome(%q) returned %q alongside the error; want no path at all", in, got)
+		}
+	}
+	// A path with no "~" in it needs no home and must still resolve.
+	if got, err := ExpandHome("/abs/path"); err != nil || got != "/abs/path" {
+		t.Errorf("ExpandHome(/abs/path) = %q, %v; want the path unchanged", got, err)
 	}
 }
 

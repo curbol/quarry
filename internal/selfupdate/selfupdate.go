@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"time"
@@ -48,7 +49,7 @@ const DevVersion = "dev"
 // Run updates the binary to target (a version like "0.2.0"), or to the latest
 // release when target is empty. current is the running binary's version.
 func Run(current, target string) error {
-	current = strings.TrimSpace(current)
+	current, target = strings.TrimSpace(current), strings.TrimSpace(target)
 	if current == "" || current == DevVersion {
 		return fmt.Errorf("this is a dev build (version %q); `update` only works on release builds — install one with install.sh", current)
 	}
@@ -112,9 +113,20 @@ func newRequest(token, method, url string) (*http.Request, error) {
 	return req, nil
 }
 
+// versionArg is what may be pasted into the release API's path. The argument is
+// interpolated into a URL, and Go sends a path as parsed rather than cleaned, so
+// `update ../../someone/repo/releases/latest` would resolve server-side to another
+// repository's release — fetched with this user's token and reported as if it were
+// quarry's. Anchoring the shape also rejects the untrimmed " 1.2.3" that would
+// otherwise become the tag "v 1.2.3" and 404 with nothing explaining why.
+var versionArg = regexp.MustCompile(`^v?[0-9][0-9A-Za-z.+-]*$`)
+
 func fetchRelease(token, target string) (*release, error) {
 	url := releasesAPIURL + "/latest"
 	if target != "" {
+		if !versionArg.MatchString(target) {
+			return nil, fmt.Errorf("%q is not a version; pass one like 1.2.3", target)
+		}
 		tag := target
 		if !strings.HasPrefix(tag, "v") {
 			tag = "v" + tag

@@ -114,15 +114,24 @@ func TestUpdateRejectsExtraArguments(t *testing.T) {
 func TestResolveTagsPath(t *testing.T) {
 	cfgDir := t.TempDir()
 
+	mustResolve := func(flag string) string {
+		t.Helper()
+		got, err := resolveTagsPath(flag, cfgDir)
+		if err != nil {
+			t.Fatalf("resolveTagsPath(%q) = %v", flag, err)
+		}
+		return got
+	}
+
 	// An explicit --tags wins outright.
-	if got := resolveTagsPath("/custom/tags.toml", cfgDir); got != "/custom/tags.toml" {
+	if got := mustResolve("/custom/tags.toml"); got != "/custom/tags.toml" {
 		t.Errorf("explicit --tags = %q", got)
 	}
 
 	// With no project store in sight, the user-wide store in the config dir is used
 	// rather than tagging being switched off.
 	t.Chdir(t.TempDir())
-	if got, want := resolveTagsPath("", cfgDir), filepath.Join(cfgDir, tagstore.FileName); got != want {
+	if got, want := mustResolve(""), filepath.Join(cfgDir, tagstore.FileName); got != want {
 		t.Errorf("fallback tags path = %q, want %q", got, want)
 	}
 
@@ -134,7 +143,7 @@ func TestResolveTagsPath(t *testing.T) {
 	sub := filepath.Join(dir, "a", "b")
 	os.MkdirAll(sub, 0o755)
 	t.Chdir(sub)
-	if got, want := resolveTagsPath("", cfgDir), filepath.Join(dir, tagstore.FileName); got != want {
+	if got, want := mustResolve(""), filepath.Join(dir, tagstore.FileName); got != want {
 		t.Errorf("discovered tags path = %q, want %q", got, want)
 	}
 }
@@ -194,6 +203,13 @@ func TestFollowSymlinksFlagOverridesConfig(t *testing.T) {
 	}
 	if !got.FollowSymlinks {
 		t.Error("config.toml's follow_symlinks was lost when the flag was absent")
+	}
+	// browse.Serve reads an empty tags path as "tagging disabled", and the CLI is
+	// documented never to pass one. Asserted on the settings a real run produced,
+	// because resolveTagsPath being correct in isolation says nothing about it still
+	// being wired into the struct below.
+	if got.TagsPath == "" {
+		t.Error("the CLI passed an empty tagsPath, which browse.Serve reads as tagging disabled")
 	}
 
 	if err := run([]string{"--config", cfgDir, "--cache", t.TempDir(), "--follow-symlinks=false"}); err != nil {

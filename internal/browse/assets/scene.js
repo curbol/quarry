@@ -500,11 +500,31 @@ function rigEntry(item, root) {
 // as an animation itself — nothing in its name marks it as the rig — so a caller that
 // can rank what comes back asks for animations too; one that takes results in name
 // order must not, or a pack's hundreds of clips crowd out its single body.
-async function rigCandidates(q, vendor, limit, types) {
+async function rigCandidates({ q, vendor, limit, types, sort }) {
   const p = new URLSearchParams({ limit: String(limit), q });
   for (const t of types) p.append('type', t);
   if (vendor) p.set('vendor', vendor);
+  if (sort) p.set('sort', sort);
   try { return (await (await fetch('/api/assets?' + p)).json()).items || []; } catch { return []; }
+}
+
+// nameSeries is a file name's leading word — "A" in A_POLY_BOW_Cmp_Idle, "Paladin" in
+// Paladin WProp J Nordstrom. Files a vendor generates as one series share it.
+const nameSeries = (name) => (name || '').split(/[_@\-. ]/)[0].toLowerCase();
+
+// packRigs picks what to try from the pack shipping a clip, heaviest first. Weight
+// alone finds a character body, which outweighs every clip beside it — but not a prop
+// rig: a bow its own clips animate is lighter than the character animations it ships
+// with, and hundreds of those outrank it. Dropping the series the clip itself belongs
+// to leaves the things a pack animates rather than the animations, and the heaviest of
+// those is the rig. Only extensions loadModel can open are worth a load; a pack's
+// heaviest file is often a .blend the preview cannot read at all.
+async function packRigs(pack, vendor, name) {
+  const series = nameSeries(name);
+  const page = await rigCandidates({ q: pack, vendor, limit: 500, types: ['model', 'animation'], sort: 'size' });
+  return page
+    .filter((it) => nameSeries(it.name) !== series && ['fbx', 'glb', 'gltf'].includes(it.ext))
+    .slice(0, 3);
 }
 
 // ---- character registry: match a clip-only animation to a rig it can play on ----
@@ -596,7 +616,8 @@ const CharRegistry = {
   },
   // When the seed didn't cover a clip's rig, look for a body in the clip's own vendor
   // (a clip's native character usually ships in the same vendor's packs).
-  async discoverForVendor(vendor, want, pack) {
+  async discoverForVendor(asset, want) {
+    const { vendor, pack, name } = asset || {};
     if (!vendor) return;
     // Load candidate bodies until one actually covers this clip (a single showcase mesh can
     // win by bone count yet be a multi-skeleton mesh register now rejects, and some bodies
@@ -616,13 +637,11 @@ const CharRegistry = {
       }
       return false;
     };
-    // The pack shipping the clips usually ships their body too, under whatever name its
-    // vendor happens to use. Weight finds it where the name terms below cannot: a rigged
-    // character carries mesh and skin data no clip file has, so it is the heaviest thing
-    // in an animation pack by a wide margin.
-    if (pack && await consider((await rigCandidates(pack, vendor, 100, ['model', 'animation'])).sort((a, b) => b.size - a.size).slice(0, 3))) return;
+    // The pack shipping the clips usually ships what they animate, under whatever name
+    // its vendor happens to use — a name search cannot find it, but weight can.
+    if (pack && await consider(await packRigs(pack, vendor, name))) return;
     for (const t of ['Character', 'Hero', 'Human', 'Knight', 'Warrior', 'Body', 'Model', 'Base']) {
-      if (await consider(await rigCandidates(t, vendor, 8, ['model']))) return;
+      if (await consider(await rigCandidates({ q: t, vendor, limit: 8, types: ['model'] }))) return;
     }
   },
 };

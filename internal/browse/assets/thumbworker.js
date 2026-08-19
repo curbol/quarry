@@ -161,7 +161,7 @@ async function rigFor(clip, asset) {
   const bones = clipBones(clip);
   await CharRegistry.seed();
   let m = CharRegistry.match(bones, vendor);
-  if (!m) { await CharRegistry.discoverForVendor(vendor, bones, asset.pack); m = CharRegistry.match(bones, vendor); }
+  if (!m) { await CharRegistry.discoverForVendor(asset, bones); m = CharRegistry.match(bones, vendor); }
   while (m) {
     if (rigs.has(m.id)) return rigs.get(m.id);
     const rig = await loadModel(contentURL(m.id), m.ext)

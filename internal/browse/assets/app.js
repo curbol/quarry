@@ -1086,7 +1086,7 @@ class ModelThumbnails {
       id: asset.id,
       seq,
       asset: {
-        id: asset.id, ext: asset.ext, vendor: asset.vendor, pack: asset.pack, thumb: asset.thumb,
+        id: asset.id, name: asset.name, ext: asset.ext, vendor: asset.vendor, pack: asset.pack, thumb: asset.thumb,
         source: {
           clip: asset.source && asset.source.clip,
           clipIndex: asset.source && asset.source.clipIndex,

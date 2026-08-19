@@ -305,7 +305,7 @@ export function startViewer(container, asset, panels) {
     const run = async (q) => {
       const my = ++seq;
       if (!q) { items = suggestKnown(); active = -1; render(); return; }
-      const found = await rigCandidates(q, null, 8, ['model', 'animation']);
+      const found = await rigCandidates({ q, limit: 8, types: ['model', 'animation'] });
       if (my === seq) { items = found; active = -1; render(); }
     };
     let t;
@@ -453,7 +453,7 @@ export function startViewer(container, asset, panels) {
     };
     if (await playOnMatch()) return;
     if (stopped) return;
-    await CharRegistry.discoverForVendor(asset.vendor, bones, asset.pack);
+    await CharRegistry.discoverForVendor(asset, bones);
     if (await playOnMatch()) return;
     if (stopped) return;
     showPlaceholder('Animation clip — pick a character in the sidebar →');

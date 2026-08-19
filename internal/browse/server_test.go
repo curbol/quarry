@@ -143,6 +143,7 @@ type assetsResp struct {
 	Items  []struct {
 		ID, Name, Category, Ext, Variant, CopyPath string
 		Thumb                                      string
+		Size                                       int64
 		RootMotionID                               string `json:"rootMotionId"`
 		Count                                      int
 		Width, Height                              int
@@ -596,5 +597,33 @@ func TestConcurrentUnityContent(t *testing.T) {
 	close(errs)
 	for e := range errs {
 		t.Fatalf("concurrent content: %s", e)
+	}
+}
+
+// A mesh-less clip previews on a body borrowed from its own pack, found by weight: the
+// rigged mesh outweighs the clips around it. The pack can run to hundreds of files, so
+// the ordering has to be the server's over the whole result set — a client ranking one
+// page of names would never see the mesh.
+func TestAssetsSortBySizeIsHeaviestFirst(t *testing.T) {
+	srv := serverWith(t, func(mk func(...string) string) {
+		writeZip(t, mk("synty", "Pack", "Pack_SourceFiles_v1.zip"), map[string]string{
+			"SourceFiles/A_Clip_01.fbx": strings.Repeat("c", 300),
+			"SourceFiles/A_Clip_02.fbx": strings.Repeat("c", 200),
+			"SourceFiles/Body.fbx":      strings.Repeat("b", 900),
+		})
+	})
+
+	got := getAssets(t, srv, "sort=size")
+	if len(got.Items) < 3 {
+		t.Fatalf("got %d items, want the pack's 3", len(got.Items))
+	}
+	if got.Items[0].Name != "Body.fbx" {
+		t.Errorf("heaviest is %q, want Body.fbx", got.Items[0].Name)
+	}
+	for i := 1; i < len(got.Items); i++ {
+		if got.Items[i-1].Size < got.Items[i].Size {
+			t.Errorf("item %d (%d bytes) is lighter than item %d (%d bytes)",
+				i-1, got.Items[i-1].Size, i, got.Items[i].Size)
+		}
 	}
 }

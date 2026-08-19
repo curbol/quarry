@@ -460,11 +460,19 @@ func (s *server) computeResults(query url.Values) []assetDTO {
 }
 
 // sortItems orders results: "path" keeps assets grouped by their location
-// (vendor/pack/folder); the default is case-insensitive by name.
+// (vendor/pack/folder), "size" puts the heaviest first — which is how a rig search
+// finds the one mesh among a pack of clips; the default is case-insensitive by name.
 func sortItems(items []assetDTO, mode string) {
 	switch mode {
 	case "path":
 		sort.Slice(items, func(i, j int) bool { return items[i].RelPath < items[j].RelPath })
+	case "size":
+		sort.Slice(items, func(i, j int) bool {
+			if items[i].Size != items[j].Size {
+				return items[i].Size > items[j].Size
+			}
+			return items[i].RelPath < items[j].RelPath
+		})
 	default:
 		sort.Slice(items, func(i, j int) bool {
 			ni, nj := strings.ToLower(items[i].Name), strings.ToLower(items[j].Name)

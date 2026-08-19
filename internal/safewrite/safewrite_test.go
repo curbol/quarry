@@ -200,3 +200,117 @@ func TestStreamLeavesNoPartialFile(t *testing.T) {
 		t.Errorf("a partial %s survives a failed copy; a later read cannot tell it from a whole one", dst)
 	}
 }
+
+// A destination reached through a symlink is written through it. os.Rename replaces
+// the path it is given rather than what that path points at, so renaming onto a link
+// silently swaps the link for a regular file and strands the real file with its old
+// contents — a store linked into a synced folder or shared between checkouts stops
+// receiving edits with nothing reported.
+func TestAtomicWritesThroughASymlink(t *testing.T) {
+	write := func(path, body string) error {
+		return Atomic(path, ".t-*", func(w io.Writer) error {
+			_, err := io.WriteString(w, body)
+			return err
+		})
+	}
+
+	t.Run("link to an existing file", func(t *testing.T) {
+		dir := t.TempDir()
+		real := filepath.Join(dir, "real.toml")
+		if err := os.WriteFile(real, []byte("original"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		link := filepath.Join(dir, "link.toml")
+		if err := os.Symlink(real, link); err != nil {
+			t.Skipf("symlinks unavailable: %v", err)
+		}
+		if err := write(link, "edited"); err != nil {
+			t.Fatal(err)
+		}
+		if got := readFile(t, real); got != "edited" {
+			t.Errorf("the real file says %q, want %q — the write did not reach it", got, "edited")
+		}
+		if fi, err := os.Lstat(link); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+			t.Errorf("the symlink was replaced by a regular file (err=%v)", err)
+		}
+	})
+
+	t.Run("link whose target does not exist yet", func(t *testing.T) {
+		dir := t.TempDir()
+		real := filepath.Join(dir, "notyet.toml")
+		link := filepath.Join(dir, "link.toml")
+		if err := os.Symlink(real, link); err != nil {
+			t.Skipf("symlinks unavailable: %v", err)
+		}
+		if err := write(link, "first save"); err != nil {
+			t.Fatal(err)
+		}
+		if got := readFile(t, real); got != "first save" {
+			t.Errorf("the real file says %q; a store linked into place before its first save must still be created there", got)
+		}
+		if fi, err := os.Lstat(link); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+			t.Errorf("the dangling symlink was replaced by a regular file (err=%v)", err)
+		}
+	})
+
+	t.Run("a symlinked parent directory", func(t *testing.T) {
+		dir := t.TempDir()
+		realDir := filepath.Join(dir, "real")
+		if err := os.MkdirAll(realDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		linkDir := filepath.Join(dir, "link")
+		if err := os.Symlink(realDir, linkDir); err != nil {
+			t.Skipf("symlinks unavailable: %v", err)
+		}
+		if err := write(filepath.Join(linkDir, "store.toml"), "through the dir"); err != nil {
+			t.Fatal(err)
+		}
+		if got := readFile(t, filepath.Join(realDir, "store.toml")); got != "through the dir" {
+			t.Errorf("the real directory holds %q, want %q", got, "through the dir")
+		}
+	})
+
+	t.Run("a chain of links", func(t *testing.T) {
+		dir := t.TempDir()
+		real := filepath.Join(dir, "real.toml")
+		if err := os.WriteFile(real, []byte("original"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		mid, outer := filepath.Join(dir, "mid.toml"), filepath.Join(dir, "outer.toml")
+		if err := os.Symlink(real, mid); err != nil {
+			t.Skipf("symlinks unavailable: %v", err)
+		}
+		if err := os.Symlink(mid, outer); err != nil {
+			t.Fatal(err)
+		}
+		if err := write(outer, "edited"); err != nil {
+			t.Fatal(err)
+		}
+		if got := readFile(t, real); got != "edited" {
+			t.Errorf("the file at the end of the chain says %q, want %q", got, "edited")
+		}
+	})
+
+	t.Run("a cycle is not followed forever", func(t *testing.T) {
+		dir := t.TempDir()
+		a, b := filepath.Join(dir, "a.toml"), filepath.Join(dir, "b.toml")
+		if err := os.Symlink(b, a); err != nil {
+			t.Skipf("symlinks unavailable: %v", err)
+		}
+		if err := os.Symlink(a, b); err != nil {
+			t.Fatal(err)
+		}
+		// The write may fail; what it must not do is hang or recurse without end.
+		_ = write(a, "whatever")
+	})
+}
+
+func readFile(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading %s: %v", path, err)
+	}
+	return string(b)
+}

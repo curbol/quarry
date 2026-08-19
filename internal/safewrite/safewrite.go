@@ -22,6 +22,7 @@ import (
 // TOML store truncated that way still parses, so the loss reads as "your tags are
 // gone" with nothing reporting an error.
 func Atomic(path, tmpPattern string, encode func(io.Writer) error) error {
+	path = resolveLinks(path)
 	tmp, err := os.CreateTemp(filepath.Dir(path), tmpPattern)
 	if err != nil {
 		return err
@@ -72,6 +73,52 @@ func Atomic(path, tmpPattern string, encode func(io.Writer) error) error {
 		d.Close()
 	}
 	return nil
+}
+
+// maxLinkHops bounds the symlink chain resolveLinks will follow, so a cycle ends in a
+// write to the last path seen rather than looping.
+const maxLinkHops = 16
+
+// resolveLinks rewrites path to the file a rename must actually land on. os.Rename
+// replaces the path it is given rather than what that path points through, so renaming
+// onto a symlink swaps the link for a regular file and leaves the real file holding its
+// old contents — with nothing to report, because the write succeeded. The tag store is
+// meant to be committed and shared, so being linked into a synced folder or between two
+// checkouts is an ordinary setup for it, and losing that link silently is the worst
+// available outcome for the one file quarry writes into a user's tree.
+//
+// Resolving the parent separately matters twice over: it covers a destination reached
+// through a linked directory, and it keeps the temp file on the same filesystem as the
+// real destination, without which the rename fails outright.
+//
+// This does not preserve a hard link. Both names there are the file, with no target to
+// resolve, and keeping one would mean writing in place — which is the guarantee this
+// package exists to provide instead.
+func resolveLinks(path string) string {
+	// Followed by hand rather than with EvalSymlinks, which refuses a link whose target
+	// does not exist: a store linked into place and not yet saved is exactly that.
+	for i := 0; i < maxLinkHops; i++ {
+		fi, err := os.Lstat(path)
+		if err != nil || fi.Mode()&os.ModeSymlink == 0 {
+			break
+		}
+		target, err := os.Readlink(path)
+		if err != nil {
+			break
+		}
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(filepath.Dir(path), target)
+		}
+		path = target
+	}
+	dir, name := filepath.Split(path)
+	if dir == "" {
+		return path
+	}
+	if real, err := filepath.EvalSymlinks(dir); err == nil {
+		return filepath.Join(real, name)
+	}
+	return path
 }
 
 // Stream copies src into dst, creating or truncating it with perm, and removes dst

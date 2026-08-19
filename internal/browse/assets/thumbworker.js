@@ -33,6 +33,7 @@ import {
   captureRootRest, cloneRig, retargetedFor, dispose, disposeClone, CharRegistry, frameBox, contentURL, clipBones,
   rootBoneName,
 } from '/static/scene.js';
+import { JobTracker } from '/static/jobtracker.js';
 
 const SIZE = 220;
 const canvas = new OffscreenCanvas(SIZE, SIZE);
@@ -210,14 +211,10 @@ async function downscale(asset) {
 // the next job overwrites the canvas.
 let queue = Promise.resolve();
 
-// latest maps an asset id to the sequence number of the most recent request for it, so
-// a job can tell whether it is still the one the page wants between the message arriving
-// and the queue reaching it. Without that a filter change leaves the queue working
-// through a backlog for cards nobody is looking at before it renders what is on screen.
-//
-// An entry is deleted on cancel and overwritten on re-request, so the map holds one
-// entry per asset currently wanted rather than growing with every id ever cancelled.
-const latest = new Map();
+// Which queued jobs are still wanted. Without this a filter change leaves the queue
+// working through a backlog for cards nobody is looking at before it renders what is
+// on screen. See jobtracker.js for why the decision is per request rather than per id.
+const jobs = new JobTracker();
 
 // JOB_TIMEOUT_MS bounds one render. A stalled fetch or a pathological parse would
 // otherwise hold the single queue forever, and every card behind it keeps its spinner
@@ -238,19 +235,12 @@ self.onmessage = (e) => {
     return;
   }
   if (e.data.type === 'cancel') {
-    latest.delete(e.data.id);
+    jobs.cancel(e.data.id);
     return;
   }
   const { id, seq, asset } = e.data;
-  // The request's own sequence number decides whether it is still wanted, rather than a
-  // set of cancelled ids. Keying cancellation on the id alone could not tell a stale job
-  // from a fresh one for the same asset: a grid rebuild cancels every pending id and the
-  // new observer immediately re-requests the visible ones, and that re-request cleared
-  // the cancel for the job already sitting in the queue — so both ran, and the second
-  // result overwrote the first's cache entry without revoking the URL the visible image
-  // was using.
-  latest.set(id, seq);
-  const current = () => latest.get(id) === seq;
+  jobs.note(id, seq);
+  const current = () => jobs.isCurrent(id, seq);
   // Images bypass the queue: they never touch the shared GL canvas the queue exists to
   // serialize, and making them wait behind a 65MB model parse is what a grid of
   // textures would spend all its time doing.

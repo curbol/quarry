@@ -21,6 +21,18 @@ go vet ./...
 gofmt -l .                      # list unformatted files
 ```
 
+The frontend's two pure decisions — the grid's card recycling and the thumbnail
+worker's job dispatch — are checked separately, because a mistake in either leaves the
+UI working and merely slow or subtly wrong:
+
+```bash
+node --test 'internal/browse/jstest/*.test.mjs'
+```
+
+Node's own runner, no `package.json` and nothing installed. Everything else in
+`assets/` is exercised through the Go tests or not at all; do not grow this into a
+general frontend harness without deciding to take on a second ecosystem.
+
 There is no Makefile or task runner; use the `go` toolchain directly. The suite is
 fully offline: browse tests run against `net/http/httptest` servers over indexes
 built in temp dirs.

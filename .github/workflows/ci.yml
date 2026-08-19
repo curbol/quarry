@@ -43,3 +43,18 @@ jobs:
       # The tag store is mutated under a mutex by concurrent requests, and scanning
       # fans out over the tree, so the suite is worth running under the detector.
       - run: go test -race ./...
+
+  # The grid's card recycling and the thumbnail worker's job dispatch are arithmetic
+  # and message ordering: a mistake in either leaves the UI working and merely slow or
+  # subtly wrong, which is what no Go test and no eye reliably catches. The pure halves
+  # live in assets/gridwindow.js and assets/jobtracker.js and are checked here. Node's
+  # own test runner, no package.json and nothing installed, so this stays a runtime
+  # rather than an ecosystem.
+  js:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: node --test 'internal/browse/jstest/*.test.mjs'

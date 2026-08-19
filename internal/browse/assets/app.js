@@ -6,6 +6,7 @@ import {
   prepareClipRig, cloneRig, poseAt, retargetedFor, stripRootMotion, dispose, CharRegistry, rigEntry, rigCandidates, CLAY, _posedV,
   rootBoneName,
 } from '/static/scene.js';
+import { LIVE, wantedRange, visibleRange, needsRebuild, spacerRows } from '/static/gridwindow.js';
 
 const PAGE = 200;
 
@@ -123,14 +124,7 @@ function reset() {
 // dropped row occupied can be held open by a full-width spacer of the same height. That
 // keeps the scrollbar honest and the scroll position stable.
 const gridWindow = {
-  // Live cards to keep. Comfortably more than a screenful at any window size, so
-  // ordinary scrolling never outruns the rebuild.
-  size: 1500,
-  // How much live margin the viewport must keep on each side. A rebuild happens when
-  // it is about to run out, not when it has moved: measuring drift instead compares a
-  // window that slides with the viewport against the live one, and those differ the
-  // moment the first row scrolls past.
-  slack: 400,
+  size: LIVE,
   start: 0,
   end: 0,
   active: false,
@@ -180,53 +174,24 @@ const gridWindow = {
     return el;
   },
 
-  // wanted is the item range that should be live for the current scroll position,
-  // centred on the viewport and snapped to whole rows so the spacers line up.
-  wanted(m) {
-    const total = state.items.length;
-    const firstVisibleRow = Math.max(0, Math.floor((window.scrollY - els.grid.offsetTop) / m.rowH));
-    const rowsLive = Math.ceil(this.size / m.cols);
-    const startRow = Math.max(0, firstVisibleRow - Math.floor(rowsLive / 3));
-    const start = startRow * m.cols;
-    return { start, end: Math.min(total, start + rowsLive * m.cols) };
-  },
-
-  // visible is the item range the viewport actually covers right now, snapped to whole
-  // rows. wanted() describes where the live range should sit; this describes what the
-  // user is looking at, and the two answer different questions.
-  visible(m) {
-    const total = state.items.length;
-    const top = window.scrollY - els.grid.offsetTop;
-    const firstRow = Math.max(0, Math.floor(top / m.rowH));
-    const lastRow = Math.max(firstRow, Math.floor((top + window.innerHeight) / m.rowH));
-    return {
-      start: Math.min(total, firstRow * m.cols),
-      end: Math.min(total, (lastRow + 1) * m.cols),
-    };
-  },
+  // scrollTop is the viewport's offset into the grid itself, which is what the range
+  // arithmetic is expressed in.
+  scrollTop() { return window.scrollY - els.grid.offsetTop; },
 
   // sync rebuilds the live range when the viewport is close to running out of it.
-  // Called after each page and on scroll/resize.
-  //
-  // The test is how much live margin is left on each side, not how far the wanted
-  // range has moved. Those are not the same: wanted() is a fixed-width window that
-  // slides with the viewport, so away from the ends its start moves by one column
-  // every time a row scrolls past, and requiring it to stay inside the live range
-  // meant rebuilding all 1500 cards on every row of scroll in either direction. The
-  // margin is only unavailable at the ends of the list, where there is nothing more to
-  // hold.
+  // Called after each page and on scroll/resize. The decision itself lives in
+  // gridwindow.js; this supplies the measurements and does the DOM work.
   sync(force) {
     const total = state.items.length;
     if (!this.active && total <= this.size) return;
     const m = this.metrics();
     if (!m) return;
+    const at = { scrollTop: this.scrollTop(), rowH: m.rowH, cols: m.cols, total };
     if (!force && this.active) {
-      const view = this.visible(m);
-      const above = this.start <= 0 || view.start - this.start >= this.slack;
-      const below = this.end >= total || this.end - view.end >= this.slack;
-      if (above && below) return;
+      const view = visibleRange({ ...at, viewportH: window.innerHeight });
+      if (!needsRebuild({ live: { start: this.start, end: this.end }, view, total })) return;
     }
-    const want = this.wanted(m);
+    const want = wantedRange({ ...at, size: this.size });
     this.render(want.start, want.end, m);
   },
 
@@ -238,13 +203,14 @@ const gridWindow = {
     modelThumbs.release();
     tagWatchers.clear();
 
+    const rows = spacerRows({ start, end, total, cols: m.cols });
     const frag = document.createDocumentFragment();
     this.top = this.spacer('top');
-    this.top.style.height = Math.ceil(start / m.cols) * m.rowH + 'px';
+    this.top.style.height = rows.before * m.rowH + 'px';
     frag.appendChild(this.top);
     for (let i = start; i < end; i++) frag.appendChild(card(state.items[i]));
     this.bottom = this.spacer('bottom');
-    this.bottom.style.height = Math.ceil(Math.max(0, total - end) / m.cols) * m.rowH + 'px';
+    this.bottom.style.height = rows.after * m.rowH + 'px';
     frag.appendChild(this.bottom);
 
     els.grid.replaceChildren(frag);

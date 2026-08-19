@@ -333,8 +333,11 @@ func TestPruneUnpackedDropsStaleExtractions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Seeded under the live per-root tree, not the legacy <cacheDir>/unpacked one: the
+	// legacy sweep removes that whole directory in one call, which would delete both
+	// fixtures before either loop below ran and leave them untested.
 	seed := func(parts ...string) string {
-		dir := filepath.Join(append([]string{cacheDir, "unpacked"}, parts...)...)
+		dir := filepath.Join(append([]string{ix.stateDir(), "unpacked"}, parts...)...)
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -930,6 +933,97 @@ func TestTheLibraryIsNeverWrittenTo(t *testing.T) {
 	for p := range after {
 		if _, had := before[p]; !had {
 			t.Errorf("%s was created inside the library", p)
+		}
+	}
+}
+
+// The cache dir is whatever --cache or QUARRY_CACHE_DIR named, taken verbatim, so it
+// can be a directory the user keeps other things in. A directory called "unpacked"
+// there is not evidence quarry wrote it, and the prune must not delete it.
+func TestPruneLeavesAUserDirectoryThatMerelyLooksLegacy(t *testing.T) {
+	root, mk := libRoot(t)
+	os.WriteFile(mk("v", "Pack", "Sword.glb"), []byte("GLBBYTES"), 0o644)
+	cacheDir := t.TempDir()
+
+	userWork := filepath.Join(cacheDir, "unpacked")
+	if err := os.MkdirAll(userWork, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	notes := filepath.Join(userWork, "notes.txt")
+	os.WriteFile(notes, []byte("months of work"), 0o644)
+	userIndex := filepath.Join(cacheDir, "index.json")
+	os.WriteFile(userIndex, []byte(`{"mine":true}`), 0o644)
+
+	ix, err := Build(Options{Root: root, CacheDir: cacheDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ix.PruneUnpacked(); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{notes, userIndex} {
+		if _, err := os.Stat(p); os.IsNotExist(err) {
+			t.Errorf("%s was deleted; quarry never wrote it", p)
+		}
+	}
+}
+
+// A cache dir an older quarry did write is still swept, so an upgrade does not
+// strand the whole pre-per-root tree.
+func TestPruneSweepsARealLegacyCache(t *testing.T) {
+	root, mk := libRoot(t)
+	os.WriteFile(mk("v", "Pack", "Sword.glb"), []byte("GLBBYTES"), 0o644)
+	cacheDir := t.TempDir()
+
+	old := filepath.Join(cacheDir, "unpacked", "16", "deadbeef")
+	if err := os.MkdirAll(old, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(old, "asset"), []byte("old"), 0o644)
+	legacyIndex := filepath.Join(cacheDir, "index.json")
+	os.WriteFile(legacyIndex, []byte(`{"version":16,"root":"/somewhere","assets":[]}`), 0o644)
+
+	ix, err := Build(Options{Root: root, CacheDir: cacheDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ix.PruneUnpacked(); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{filepath.Join(cacheDir, "unpacked"), legacyIndex} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("%s survived; an older quarry's tree is regenerable state nothing will consult again", p)
+		}
+	}
+}
+
+// The refusal has to hold on the run that matters — the first one, when the cache dir
+// does not exist yet. Resolving a missing path is what a naive check gets wrong: the
+// root resolves through its symlinks and the cache dir does not, so a directory
+// plainly inside the root compares as outside it, and quarry writes its index and
+// every unpacked archive into the tree it promises to leave alone.
+func TestCacheDirInsideASymlinkedRootIsRefused(t *testing.T) {
+	real := t.TempDir()
+	link := filepath.Join(t.TempDir(), "lib")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	for _, c := range []struct {
+		name     string
+		cacheDir string
+		want     bool
+	}{
+		{"not yet created, under the link", filepath.Join(link, "cache"), true},
+		{"not yet created, under the resolved root", filepath.Join(real, "cache"), true},
+		{"nested deeper", filepath.Join(link, "a", "b", "cache"), true},
+		{"the root itself", link, true},
+		{"genuinely outside", filepath.Join(t.TempDir(), "cache"), false},
+	} {
+		_, err := Build(Options{Root: link, CacheDir: c.cacheDir})
+		refused := err != nil && strings.Contains(err.Error(), "inside the scan root")
+		if refused != c.want {
+			t.Errorf("%s: refused = %v, want %v (err = %v)", c.name, refused, c.want, err)
 		}
 	}
 }

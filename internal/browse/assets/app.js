@@ -1670,7 +1670,7 @@ function startViewer(container, asset) {
     const run = async (q) => {
       const my = ++seq;
       if (!q) { items = suggestKnown(); active = -1; render(); return; }
-      const found = await rigCandidates(q, null, 8);
+      const found = await rigCandidates(q, null, 8, ['model', 'animation']);
       if (my === seq) { items = found; active = -1; render(); }
     };
     let t;

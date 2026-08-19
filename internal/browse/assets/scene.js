@@ -458,15 +458,16 @@ function rigEntry(item, root) {
   return { id: item.id, name: item.name, ext: item.ext, bones, vendor: item.vendor };
 }
 
-// rigCandidates searches the library for assets that might serve as a rig. Animations
-// are searched alongside models because a body shipped inside an animation pack is
-// classified as an animation itself — nothing in its name marks it as the rig — so
-// searching models alone hides the very character a pack's own clips need.
-async function rigCandidates(q, vendor, limit) {
-  const url = `/api/assets?type=model&type=animation&limit=${limit}`
-    + (vendor ? `&vendor=${encodeURIComponent(vendor)}` : '')
-    + `&q=${encodeURIComponent(q)}`;
-  try { return (await (await fetch(url)).json()).items || []; } catch { return []; }
+// rigCandidates searches the library for assets that might serve as a rig. types is
+// what the search will accept. A body shipped inside an animation pack is classified
+// as an animation itself — nothing in its name marks it as the rig — so a caller that
+// can rank what comes back asks for animations too; one that takes results in name
+// order must not, or a pack's hundreds of clips crowd out its single body.
+async function rigCandidates(q, vendor, limit, types) {
+  const p = new URLSearchParams({ limit: String(limit), q });
+  for (const t of types) p.append('type', t);
+  if (vendor) p.set('vendor', vendor);
+  try { return (await (await fetch('/api/assets?' + p)).json()).items || []; } catch { return []; }
 }
 
 // ---- character registry: match a clip-only animation to a rig it can play on ----
@@ -582,9 +583,9 @@ const CharRegistry = {
     // vendor happens to use. Weight finds it where the name terms below cannot: a rigged
     // character carries mesh and skin data no clip file has, so it is the heaviest thing
     // in an animation pack by a wide margin.
-    if (pack && await consider((await rigCandidates(pack, vendor, 100)).sort((a, b) => b.size - a.size).slice(0, 3))) return;
+    if (pack && await consider((await rigCandidates(pack, vendor, 100, ['model', 'animation'])).sort((a, b) => b.size - a.size).slice(0, 3))) return;
     for (const t of ['Character', 'Hero', 'Human', 'Knight', 'Warrior', 'Body', 'Model', 'Base']) {
-      if (await consider(await rigCandidates(t, vendor, 8))) return;
+      if (await consider(await rigCandidates(t, vendor, 8, ['model']))) return;
     }
   },
 };

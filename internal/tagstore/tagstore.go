@@ -444,6 +444,27 @@ func (s *Store) Reload(path string) error {
 	return nil
 }
 
+// staleTempAge is how old a leftover temp must be before a save clears it. Anything
+// younger could belong to a second quarry writing the same store right now, and the
+// point of the sweep is to leave one less thing behind, not to race one.
+const staleTempAge = 24 * time.Hour
+
+// sweepStaleTemps removes temp files an interrupted save abandoned. The store lives
+// in a user's project directory, often under source control, and it is the one file
+// quarry writes there — a killed run should not leave a second one sitting beside it
+// forever. Failures are ignored: this is tidying, not part of the write.
+func sweepStaleTemps(dir string) {
+	matches, err := filepath.Glob(filepath.Join(dir, ".quarry-tags-*"))
+	if err != nil {
+		return
+	}
+	for _, m := range matches {
+		if fi, err := os.Stat(m); err == nil && time.Since(fi.ModTime()) > staleTempAge {
+			os.Remove(m)
+		}
+	}
+}
+
 // Save writes the store at path atomically, with tags sorted by id, assignments
 // sorted by fingerprint, groups sorted by first member, and every member list
 // sorted, for minimal diffs.
@@ -473,6 +494,7 @@ func Save(path string, s *Store) error {
 		f.Groups = append(f.Groups, Group{Fingerprints: g})
 	}
 
+	sweepStaleTemps(filepath.Dir(path))
 	if err := safewrite.Atomic(path, ".quarry-tags-*", func(w io.Writer) error {
 		return toml.NewEncoder(w).Encode(f)
 	}); err != nil {

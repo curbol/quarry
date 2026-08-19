@@ -1,6 +1,7 @@
 package assetindex
 
 import (
+	"bytes"
 	"errors"
 	"io"
 	"os"
@@ -95,6 +96,21 @@ func (ix *Index) unpackedDir() string {
 //
 // It deletes whatever it does not recognize, including an in-flight "unpack-*" temp
 // dir, so it must run before the server starts serving rather than alongside it.
+// isLegacyIndex reports whether path is a cache file quarry wrote, rather than a
+// file of the user's that happens to share the name. Only the head is read: the real
+// thing runs to hundreds of megabytes, and the fields that identify it are at the
+// front of the object.
+func isLegacyIndex(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	head := make([]byte, 512)
+	n, _ := io.ReadFull(f, head)
+	return bytes.Contains(head[:n], []byte(`"version"`)) && bytes.Contains(head[:n], []byte(`"root"`))
+}
+
 func (ix *Index) PruneUnpacked() error {
 	if ix.cacheDir == "" {
 		return nil
@@ -108,11 +124,18 @@ func (ix *Index) PruneUnpacked() error {
 
 	// State was once written directly under the cache dir rather than per root, so a
 	// cache written by an older quarry holds a tree nothing will ever consult again.
-	// It is quarry's own regenerable output in quarry's own cache dir, so sweep it.
-	if legacy := filepath.Join(ix.cacheDir, "unpacked"); legacy != filepath.Join(ix.stateDir(), "unpacked") {
-		if _, err := os.Stat(legacy); err == nil {
-			remove(legacy)
-			remove(filepath.Join(ix.cacheDir, "index.json"))
+	//
+	// Both halves of that layout have to be present before either is removed. The
+	// cache dir is whatever --cache or QUARRY_CACHE_DIR named, taken verbatim, and
+	// "unpacked" is a plausible name for a directory a user keeps their own work in;
+	// finding one alone is not evidence quarry wrote it. Finding it beside an
+	// index.json is.
+	legacyUnpacked := filepath.Join(ix.cacheDir, "unpacked")
+	legacyIndex := filepath.Join(ix.cacheDir, "index.json")
+	if legacyUnpacked != filepath.Join(ix.stateDir(), "unpacked") && isLegacyIndex(legacyIndex) {
+		if fi, err := os.Stat(legacyUnpacked); err == nil && fi.IsDir() {
+			remove(legacyUnpacked)
+			remove(legacyIndex)
 		}
 	}
 

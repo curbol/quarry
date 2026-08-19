@@ -58,6 +58,19 @@ func Atomic(path, tmpPattern string, encode func(io.Writer) error) error {
 		os.Remove(tmpName)
 		return err
 	}
+	// The rename itself needs the same durability the bytes just got: fsyncing the
+	// file guarantees the data is on disk, not that the directory entry pointing at it
+	// is. Without this a crash right after a successful save can come back to the
+	// previous contents — the edit reported as written is simply gone.
+	//
+	// A directory that cannot be opened or synced is not worth failing a write that
+	// already landed, so the error is dropped rather than returned: the file is in
+	// place either way, and reporting failure here would send a caller into recovery
+	// over a save that succeeded.
+	if d, err := os.Open(filepath.Dir(path)); err == nil {
+		d.Sync()
+		d.Close()
+	}
 	return nil
 }
 

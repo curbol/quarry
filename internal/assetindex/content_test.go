@@ -244,7 +244,7 @@ func TestRefreshRebuildsAcrossAnIndexVersion(t *testing.T) {
 	ix.Version = indexVersion - 1
 	ix.Assets = append(ix.Assets, Asset{ID: "ghost", RelPath: "gone/ghost.fbx",
 		Source: Source{Kind: SourceLoose, FilePath: filepath.Join(root, "gone", "ghost.fbx")}})
-	if err := ix.Refresh(); err != nil {
+	if err := ix.refresh(); err != nil {
 		t.Fatal(err)
 	}
 	if ix.Version != indexVersion {

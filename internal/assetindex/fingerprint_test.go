@@ -90,7 +90,7 @@ func TestFingerprintStableAndRefreshRecomputes(t *testing.T) {
 	}
 
 	// Refresh over an unchanged tree preserves fingerprints.
-	if err := ix.Refresh(); err != nil {
+	if err := ix.refresh(); err != nil {
 		t.Fatal(err)
 	}
 	if got := fpByName(ix.Assets); got["Sword.glb"] != before["Sword.glb"] || got["Tree.fbx"] != before["Tree.fbx"] {
@@ -99,7 +99,7 @@ func TestFingerprintStableAndRefreshRecomputes(t *testing.T) {
 
 	// Changing the loose file's bytes (and size) recomputes its fingerprint on Refresh.
 	os.WriteFile(loose, []byte("GLBSWORD-EDITED-LONGER"), 0o644)
-	if err := ix.Refresh(); err != nil {
+	if err := ix.refresh(); err != nil {
 		t.Fatal(err)
 	}
 	if got, want := fpByName(ix.Assets)["Sword.glb"], wantCRC("GLBSWORD-EDITED-LONGER"); got != want {

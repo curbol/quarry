@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/curbol/quarry/internal/safewrite"
@@ -33,6 +34,12 @@ type SkippedFile struct {
 // resolve through byID (never by reconstructing a path from client input), and the
 // unpacked-archive cache under CacheDir is keyed by each archive's fingerprint so a
 // changed archive re-extracts.
+//
+// An index is built by one goroutine and then read by many: Lookup, Open and
+// OpenThumbnail are safe to call concurrently, and everything that rewrites the asset
+// set is unexported and runs before the index is handed to a server. Rebuilding one
+// in place while it is being served would race every reader and strand the resolved
+// link roots Open checks against.
 type Index struct {
 	Version      int               `json:"version"`
 	Root         string            `json:"root"`
@@ -66,8 +73,10 @@ type Index struct {
 	zips zipReaders
 }
 
-// fingerprint identifies a file by path, size, and mtime, so a re-download or edit
-// invalidates any cached enumeration or extraction of it.
+// fingerprint identifies a file by path, size, and mtime, so any re-download or edit
+// that moves the size or the mtime invalidates the cached enumeration and extraction
+// of it. One that preserves both — a copy made with rsync --times or cp -p over a
+// file of identical length — does not, and needs --reindex.
 func fingerprint(path string) (string, error) {
 	fi, err := os.Stat(path)
 	if err != nil {
@@ -92,6 +101,52 @@ type Options struct {
 	FollowSymlinks bool
 }
 
+// resolvePath normalizes a path for containment comparison, resolving symlinks as
+// far as the filesystem allows and re-appending the part that does not exist yet.
+//
+// EvalSymlinks fails outright on a missing path, and a cache dir does not exist on
+// the run that creates it — which is the run the containment check has to catch. A
+// plain fallback to Abs would then compare a symlink-resolved root against an
+// unresolved cache dir and call a directory plainly inside the root outside it.
+func resolvePath(p string) string {
+	if abs, err := filepath.Abs(p); err == nil {
+		p = abs
+	}
+	rest := ""
+	for {
+		if r, err := filepath.EvalSymlinks(p); err == nil {
+			return filepath.Join(r, rest)
+		}
+		parent := filepath.Dir(p)
+		if parent == p {
+			return filepath.Join(p, rest)
+		}
+		rest = filepath.Join(filepath.Base(p), rest)
+		p = parent
+	}
+}
+
+// checkCacheDir refuses a cache dir inside the scan root. The tree quarry promises
+// not to write to is not somewhere to put the index and every unpacked archive, and
+// the next run would index its own output.
+//
+// It lives here rather than at the call site because this package does the writing
+// and derives where state goes from these same options: a caller reaching for Build
+// or LoadOrBuild directly would otherwise bypass the guarantee entirely.
+func checkCacheDir(root, cacheDir string) error {
+	if cacheDir == "" {
+		return nil
+	}
+	rel, err := filepath.Rel(resolvePath(root), resolvePath(cacheDir))
+	if err != nil {
+		return nil
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return nil
+	}
+	return fmt.Errorf("cache dir %s is inside the scan root %s; pick one outside it with --cache", cacheDir, root)
+}
+
 // Build scans a library from scratch into a fresh index. It is Refresh over an
 // empty index: with nothing cached to reuse, every entry takes the re-derive path.
 func Build(opt Options) (*Index, error) {
@@ -99,18 +154,21 @@ func Build(opt Options) (*Index, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := checkCacheDir(absRoot, opt.CacheDir); err != nil {
+		return nil, err
+	}
 	ix := &Index{
 		Version: indexVersion, Root: absRoot, cacheDir: opt.CacheDir,
 		FollowSymlinks: opt.FollowSymlinks,
 		ArchivePrint:   map[string]string{}, LoosePrint: map[string]string{},
 	}
-	if err := ix.Refresh(); err != nil {
+	if err := ix.refresh(); err != nil {
 		return nil, err
 	}
 	return ix, nil
 }
 
-// Refresh re-walks the library, reusing the cached enumeration of every archive
+// refresh re-walks the library, reusing the cached enumeration of every archive
 // and the cached fingerprint of every loose file whose stat fingerprint is
 // unchanged, re-deriving only changed or new files. This avoids re-decompressing
 // every unitypackage and re-reading every loose file's bytes on each run.
@@ -119,7 +177,7 @@ func Build(opt Options) (*Index, error) {
 // carrying another version's is emptied first and re-derived whole. Enforcing that
 // here rather than at the call site is what keeps a caller that reaches for Load and
 // Refresh directly from silently merging two schemes' assets into one index.
-func (ix *Index) Refresh() error {
+func (ix *Index) refresh() error {
 	if ix.Version != indexVersion {
 		ix.Assets, ix.Suppressed = nil, nil
 		ix.ArchivePrint, ix.LoosePrint = map[string]string{}, map[string]string{}
@@ -209,7 +267,7 @@ func (ix *Index) Refresh() error {
 
 // load reads a cached index from disk and rebuilds its id lookup. It is unexported
 // because a loaded index is not yet a usable one: nothing here checks Version or
-// Root, and pairing a stale schema with current code is what Refresh's re-derive
+// Root, and pairing a stale schema with current code is what refresh's re-derive
 // guard and LoadOrBuild's match exist to prevent. Callers want LoadOrBuild.
 //
 // encoding/json buffers a whole top-level value before decoding it, so a 100MB-plus
@@ -290,6 +348,9 @@ func LoadOrBuild(opt Options, reindex bool, warn func(string)) (*Index, error) {
 		return nil, err
 	}
 	opt.Root = absRoot
+	if err := checkCacheDir(absRoot, opt.CacheDir); err != nil {
+		return nil, err
+	}
 	cachePath := ""
 	if opt.CacheDir != "" {
 		cachePath = filepath.Join(stateDir(opt.CacheDir, absRoot), "index.json")
@@ -299,7 +360,7 @@ func LoadOrBuild(opt Options, reindex bool, warn func(string)) (*Index, error) {
 		// cache built the other way is describing a different library.
 		if ix, err := load(cachePath, opt.CacheDir); err == nil &&
 			ix.Root == absRoot && ix.Version == indexVersion && ix.FollowSymlinks == opt.FollowSymlinks {
-			if err := ix.Refresh(); err != nil {
+			if err := ix.refresh(); err != nil {
 				return nil, err
 			}
 			saveCache(ix, warn)

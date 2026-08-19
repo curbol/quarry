@@ -15,7 +15,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"syscall"
 
 	"github.com/curbol/quarry/internal/assetindex"
@@ -173,33 +172,8 @@ func resolveTagsPath(tagsFlag, configDir string) string {
 	return filepath.Join(configDir, tagstore.FileName)
 }
 
-// withinRoot reports whether dir sits inside root, comparing resolved absolute
-// paths so a symlinked cache dir cannot slip past the check.
-func withinRoot(root, dir string) bool {
-	resolve := func(p string) string {
-		if r, err := filepath.EvalSymlinks(p); err == nil {
-			return r
-		}
-		if abs, err := filepath.Abs(p); err == nil {
-			return abs
-		}
-		return filepath.Clean(p)
-	}
-	rel, err := filepath.Rel(resolve(root), resolve(dir))
-	if err != nil {
-		return false
-	}
-	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
-}
-
 // serve indexes the asset root and runs the UI until interrupted.
 func serve(s settings) error {
-	// The cache holds the index and every unpacked archive. Under the scan root it
-	// would be written into a tree quarry promises to leave alone, and indexed as
-	// library content on the next run.
-	if withinRoot(s.Root, s.CacheDir) {
-		return fmt.Errorf("cache dir %s is inside the scan root %s; pick one outside it with --cache", s.CacheDir, s.Root)
-	}
 	warn := func(m string) { fmt.Fprintln(os.Stderr, "warning:", m) }
 	fmt.Fprintf(os.Stderr, "indexing %s …\n", s.Root)
 	opt := assetindex.Options{Root: s.Root, CacheDir: s.CacheDir, FollowSymlinks: s.FollowSymlinks}

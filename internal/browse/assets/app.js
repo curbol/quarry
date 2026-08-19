@@ -1,9 +1,4 @@
-import {
-  contentURL, loadModel, loadSidekick, normalizeClip, clipBones, clipsForAsset, loadRMClips, isSynty,
-  coversBones, posedBox, frameBox, isRenderable, captureRootRest, uprightRig,
-  prepareClipRig, cloneRig, poseAt, retargetedFor, stripRootMotion, dispose, CharRegistry, rigEntry, rigCandidates, CLAY, _posedV,
-  rootBoneName,
-} from '/static/scene.js';
+import { contentURL, thumbURL, CharRegistry } from '/static/scene.js';
 import { LIVE, wantedRange, visibleRange, needsRebuild, spacerRows } from '/static/gridwindow.js';
 import { iconEl } from '/static/icons.js';
 import { startViewer } from '/static/viewer.js';

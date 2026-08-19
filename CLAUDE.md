@@ -63,7 +63,11 @@ packages, each with a package doc comment stating its contract:
   by the character's own name as well as its directory, since two characters commonly
   share one. HTTP-free — the `browse` server queries it.
 - `browse` — serves the web UI, querying an `assetindex.Index` and streaming asset
-  bytes and thumbnails (three.js 3D previews, copy-path). `includeRelated=1` folds
+  bytes and thumbnails (three.js 3D previews, copy-path). Its frontend is plain ES
+  modules under `assets/`, no build step: `app.js` is the page (grid, search, filters,
+  tagging), `viewer.js` the lightbox's 3D preview and the only three.js consumer on the
+  page, `scene.js` the model/clip helpers it shares with `thumbworker.js`, and
+  `gridwindow.js` / `jobtracker.js` the two pure decisions the Node tests cover. `includeRelated=1` folds
   each tag match's linked companions into results; `/api/link` and `/api/related`
   write and resolve links. It also pairs each in-place animation with its root-motion
   (`_RM`) sibling (`pairing.go`): the in-place card carries `rootMotionId` and the RM

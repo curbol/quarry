@@ -8,6 +8,7 @@ import { GLTFLoader } from '/static/vendor/three/jsm/loaders/GLTFLoader.js';
 import { FBXLoader } from '/static/vendor/three/jsm/loaders/FBXLoader.js';
 
 export const contentURL = (id) => '/api/content?id=' + encodeURIComponent(id);
+export const thumbURL = (id) => '/api/thumb?id=' + encodeURIComponent(id);
 
 // CharRegistry persists to localStorage on the main thread; a worker has none, so it
 // falls back to an in-memory store (its rig cache then lasts the worker's lifetime).

@@ -578,7 +578,7 @@ func TestAnEditRefusedAsStaleLeavesNeitherDiskNorMemoryAhead(t *testing.T) {
 	if err := external.Define("theirs", "#0ea5e9"); err != nil {
 		t.Fatal(err)
 	}
-	if err := tagstore.Save(tagsPath, external); err != nil {
+	if err := external.Save(tagsPath); err != nil {
 		t.Fatal(err)
 	}
 

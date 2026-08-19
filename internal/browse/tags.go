@@ -406,7 +406,7 @@ func (s *server) applyEdit(mutate func() (any, error)) ([]byte, int) {
 		}
 		return errBody(s.recoverLocked(err.Error())), status
 	}
-	if err := tagstore.Save(s.tagsPath, s.store); err != nil {
+	if err := s.store.Save(s.tagsPath); err != nil {
 		// Handlers mutate the store and then persist, so a failed save would otherwise
 		// leave memory claiming more than disk holds: the UI keeps reporting the tag
 		// until a restart silently takes it away again.

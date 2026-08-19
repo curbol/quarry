@@ -217,15 +217,18 @@ func (s *Store) Rename(old, neu string) error {
 	if neu == "" {
 		return fmt.Errorf("empty tag id")
 	}
-	if old == neu {
-		return nil
-	}
 	oldColor, ok := s.colors[old]
 	if !ok {
 		// Reported rather than treated as a no-op: a caller that follows a rename with
 		// a color edit would otherwise define the new id from nothing, and answer
-		// "renamed" while inventing a tag no asset carries.
+		// "renamed" while inventing a tag no asset carries. Checked ahead of the
+		// identity case below, or renaming a tag to its own name would report success
+		// for a tag that does not exist while renaming it to any other name reports the
+		// miss.
 		return fmt.Errorf("no tag %q to rename", old)
+	}
+	if old == neu {
+		return nil
 	}
 	if _, exists := s.colors[neu]; !exists {
 		s.colors[neu] = oldColor
@@ -381,7 +384,10 @@ func Load(path string) (*Store, error) {
 	var f fileTOML
 	md, err := toml.DecodeFile(path, &f)
 	if err != nil {
-		return nil, err
+		// Named, like every other failure here: a TOML parse error carries a line
+		// number but not a file, and this one surfaces during a save's recovery reload
+		// where the user has no other clue which store was being read.
+		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	if unknown := md.Undecoded(); len(unknown) > 0 {
 		keys := make([]string, len(unknown))
@@ -395,11 +401,21 @@ func Load(path string) (*Store, error) {
 	// A color this version cannot parse is refused for the same reason an unknown key
 	// is: the next save rewrites the file whole, so quietly substituting a default
 	// would overwrite what the user typed with something they never chose.
-	var badColors []string
+	// A repeated [[tag]] id is refused for the same reason: the last row would win,
+	// and the next save would rewrite the file without the color the user typed on the
+	// other. Duplicate assignments and overlapping groups both merge losslessly, so
+	// this is the one duplicate that destroys something.
+	var badColors, dupes []string
+	seenTag := map[string]bool{}
 	for _, t := range f.Tags {
 		if t.ID == "" {
 			continue
 		}
+		if seenTag[t.ID] {
+			dupes = append(dupes, t.ID)
+			continue
+		}
+		seenTag[t.ID] = true
 		switch c, err := NormalizeColor(t.Color); {
 		case err == nil:
 			s.colors[t.ID] = c
@@ -408,6 +424,10 @@ func Load(path string) (*Store, error) {
 		default:
 			badColors = append(badColors, fmt.Sprintf("%s = %q", t.ID, t.Color))
 		}
+	}
+	if len(dupes) > 0 {
+		return nil, fmt.Errorf("%s defines the tag(s) %s more than once; keep one [[tag]] row per id, or the next edit drops all but the last",
+			path, strings.Join(dupes, ", "))
 	}
 	if len(badColors) > 0 {
 		return nil, fmt.Errorf("%s holds colors quarry cannot read (%s); use #rrggbb, or remove the color to get a generated one",
@@ -444,6 +464,9 @@ func (s *Store) Reload(path string) error {
 	return nil
 }
 
+// storeHeader leads every saved store. See Save for why it is there.
+const storeHeader = "# quarry tag store. Rewritten whole on every edit, so comments are not preserved.\n\n"
+
 // staleTempAge is how old a leftover temp must be before a save clears it. Anything
 // younger could belong to a second quarry writing the same store right now, and the
 // point of the sweep is to leave one less thing behind, not to race one.
@@ -475,7 +498,11 @@ func sweepStaleTemps(dir string) {
 // the user-wide one — is destroyed with no trace. Stat-then-rename leaves a window
 // too small to matter here and too expensive to close: this is one user's file, and
 // the failure being guarded against is measured in minutes, not microseconds.
-func Save(path string, s *Store) error {
+// A successful save records the file it wrote, which is what that staleness check
+// reads next time — so this mutates the store. A caller sharing a Store across
+// goroutines must hold the lock it holds for an edit, not the one it holds for a
+// read.
+func (s *Store) Save(path string) error {
 	if s.loadedFrom == path && s.stamp != stampOf(path) {
 		return fmt.Errorf("%s: %w", path, ErrStale)
 	}
@@ -496,6 +523,13 @@ func Save(path string, s *Store) error {
 
 	sweepStaleTemps(filepath.Dir(path))
 	if err := safewrite.Atomic(path, ".quarry-tags-*", func(w io.Writer) error {
+		// The store is meant to be hand-edited and committed, and a save rewrites it
+		// whole from a model that has no place to keep a comment. Saying so in the file
+		// is the only warning a user gets before their first tag click removes what
+		// they wrote; refusing to save over a comment would be worse.
+		if _, err := io.WriteString(w, storeHeader); err != nil {
+			return err
+		}
 		return toml.NewEncoder(w).Encode(f)
 	}); err != nil {
 		return err

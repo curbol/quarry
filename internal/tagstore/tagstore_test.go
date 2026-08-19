@@ -28,7 +28,7 @@ func TestDefineAssignRoundTrip(t *testing.T) {
 	s.Assign("crc32:abc:10", "hero")
 	s.Assign("crc32:abc:10", "wip")
 	s.Assign("uguid:xyz", "hero")
-	if err := Save(path, s); err != nil {
+	if err := s.Save(path); err != nil {
 		t.Fatal(err)
 	}
 
@@ -54,7 +54,7 @@ func TestAssignmentsPreservedRegardlessOfIndex(t *testing.T) {
 	path := filepath.Join(t.TempDir(), FileName)
 	s := New()
 	s.Assign("crc32:notinanyindex:999", "keep")
-	if err := Save(path, s); err != nil {
+	if err := s.Save(path); err != nil {
 		t.Fatal(err)
 	}
 	got, err := Load(path)
@@ -152,7 +152,7 @@ func TestSaveIsSortedAndDeterministic(t *testing.T) {
 	s.Assign("fp-b", "zebra")
 	s.Assign("fp-a", "zebra")
 	s.Assign("fp-a", "alpha")
-	if err := Save(path, s); err != nil {
+	if err := s.Save(path); err != nil {
 		t.Fatal(err)
 	}
 	b1, _ := os.ReadFile(path)
@@ -172,7 +172,7 @@ func TestSaveIsSortedAndDeterministic(t *testing.T) {
 	}
 	// Deterministic: a second save of an equivalently-built store is byte-identical.
 	path2 := filepath.Join(dir, "second-"+FileName)
-	if err := Save(path2, s); err != nil {
+	if err := s.Save(path2); err != nil {
 		t.Fatal(err)
 	}
 	b2, _ := os.ReadFile(path2)
@@ -247,7 +247,7 @@ func TestLinksRoundTripSortedAndPreserved(t *testing.T) {
 	path := filepath.Join(t.TempDir(), FileName)
 	s := New()
 	s.Link([]string{"crc32:zzz:9", "uguid:aaa"}) // unsorted input, unknown to any index
-	if err := Save(path, s); err != nil {
+	if err := s.Save(path); err != nil {
 		t.Fatal(err)
 	}
 	text, _ := os.ReadFile(path)
@@ -313,7 +313,7 @@ func TestFailedSaveLeavesNoTempFile(t *testing.T) {
 	s := New()
 	s.Assign("crc32:aa:1", "hero")
 
-	if err := Save(blocked, s); err == nil {
+	if err := s.Save(blocked); err == nil {
 		t.Fatal("Save reported success renaming onto a directory")
 	}
 	entries, err := os.ReadDir(dir)
@@ -395,7 +395,7 @@ func TestLoadSaveRoundTripIsByteIdentical(t *testing.T) {
 	s.Assign("fp-a", "alpha")
 	s.Link([]string{"fp-a", "fp-b"})
 	s.Link([]string{"fp-c", "fp-d"})
-	if err := Save(first, s); err != nil {
+	if err := s.Save(first); err != nil {
 		t.Fatal(err)
 	}
 
@@ -404,7 +404,7 @@ func TestLoadSaveRoundTripIsByteIdentical(t *testing.T) {
 		t.Fatal(err)
 	}
 	second := filepath.Join(dir, "round-trip-"+FileName)
-	if err := Save(second, reloaded); err != nil {
+	if err := reloaded.Save(second); err != nil {
 		t.Fatal(err)
 	}
 	a, b := readFile(t, first), readFile(t, second)
@@ -501,7 +501,7 @@ func TestSaveRefusesToClobberAnEditMadeSinceLoad(t *testing.T) {
 	p := filepath.Join(t.TempDir(), FileName)
 	seed := New()
 	seed.Define("hero", "#112233")
-	if err := Save(p, seed); err != nil {
+	if err := seed.Save(p); err != nil {
 		t.Fatal(err)
 	}
 
@@ -517,11 +517,11 @@ func TestSaveRefusesToClobberAnEditMadeSinceLoad(t *testing.T) {
 		t.Fatal(err)
 	}
 	theirs.Define("villain", "#445566")
-	if err := Save(p, theirs); err != nil {
+	if err := theirs.Save(p); err != nil {
 		t.Fatal(err)
 	}
 
-	err = Save(p, mine)
+	err = mine.Save(p)
 	if !errors.Is(err, ErrStale) {
 		t.Fatalf("Save = %v, want ErrStale: the other edit would have been destroyed", err)
 	}
@@ -544,7 +544,7 @@ func TestSaveRefusesToClobberAnEditMadeSinceLoad(t *testing.T) {
 	if _, ok := mine.Color("villain"); !ok {
 		t.Error("Reload did not pick up the other writer's tag")
 	}
-	if err := Save(p, mine); err != nil {
+	if err := mine.Save(p); err != nil {
 		t.Errorf("Save after Reload: %v, want it to succeed now that the store matches disk", err)
 	}
 }
@@ -557,10 +557,10 @@ func TestSaveToADifferentPathIsNotStale(t *testing.T) {
 	p := filepath.Join(dir, FileName)
 	s := New()
 	s.Define("hero", "#112233")
-	if err := Save(p, s); err != nil {
+	if err := s.Save(p); err != nil {
 		t.Fatal(err)
 	}
-	if err := Save(filepath.Join(dir, "copy-"+FileName), s); err != nil {
+	if err := s.Save(filepath.Join(dir, "copy-"+FileName)); err != nil {
 		t.Errorf("Save to a second path: %v", err)
 	}
 }
@@ -597,5 +597,71 @@ func TestLoadRefusesAnUnreadableColor(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "hero") {
 		t.Errorf("error %q does not name the offending tag", err)
+	}
+}
+
+// A repeated [[tag]] id would silently keep the last row's color and the next save
+// would rewrite the file without the other. Duplicate assignments and overlapping
+// groups merge losslessly, so this is the one duplicate that destroys what was typed.
+func TestLoadRefusesADuplicateTagID(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, FileName)
+	os.WriteFile(p, []byte(`
+[[tag]]
+  id = "hero"
+  color = "#e11d48"
+[[tag]]
+  id = "hero"
+  color = "#0ea5e9"
+`), 0o644)
+
+	_, err := Load(p)
+	if err == nil {
+		t.Fatal("a duplicate tag id was accepted; one of the two colors is silently dropped")
+	}
+	if !strings.Contains(err.Error(), "hero") || !strings.Contains(err.Error(), "more than once") {
+		t.Errorf("error = %v, want one naming the repeated id", err)
+	}
+}
+
+// Renaming a tag that does not exist reports the miss whatever the new name is.
+// Short-circuiting the identity case first answered "renamed" for a tag the store
+// has never heard of.
+func TestRenameReportsAMissingTagEvenWhenTheNameIsUnchanged(t *testing.T) {
+	s := New()
+	if err := s.Rename("ghost", "ghost"); err == nil {
+		t.Error("renaming a missing tag to its own name reported success")
+	}
+	if err := s.Rename("ghost", "villain"); err == nil {
+		t.Error("renaming a missing tag reported success")
+	}
+	if err := s.Define("hero", "#e11d48"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Rename("hero", "hero"); err != nil {
+		t.Errorf("renaming an existing tag to its own name = %v, want nil", err)
+	}
+}
+
+// Groups are orthogonal to tags: a link never changes what tags a fingerprint
+// carries, and neither does a tag edit change what a fingerprint is linked to.
+// Rename and Delete are the two that sweep broadly enough to break this.
+func TestTagEditsLeaveLinkGroupsAlone(t *testing.T) {
+	s := New()
+	s.Link([]string{"fp-a", "fp-b"})
+	s.Assign("fp-a", "hero")
+
+	if err := s.Rename("hero", "champion"); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.Related("fp-a"); !reflect.DeepEqual(got, []string{"fp-b"}) {
+		t.Errorf("Related(fp-a) = %v after a rename, want [fp-b]", got)
+	}
+	s.Delete("champion")
+	if got := s.Related("fp-a"); !reflect.DeepEqual(got, []string{"fp-b"}) {
+		t.Errorf("Related(fp-a) = %v after a delete, want [fp-b]", got)
+	}
+	if got := s.Related("fp-b"); !reflect.DeepEqual(got, []string{"fp-a"}) {
+		t.Errorf("Related(fp-b) = %v after a delete, want [fp-a]", got)
 	}
 }

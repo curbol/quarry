@@ -731,13 +731,7 @@ const tagFilter = {
   manageRow(id) {
     const row = document.createElement('div');
     row.className = 'tag-manage-row';
-    const color = document.createElement('input');
-    color.type = 'color';
-    color.className = 'tag-color';
-    color.value = hex6(tagColor(id));
-    color.addEventListener('change', async () => {
-      if (!await apiTag('PATCH', { id, color: color.value })) color.value = hex6(tagColor(id));
-    });
+    const color = tagColorInput(id, 'tag-color');
     const name = document.createElement('input');
     name.type = 'text';
     name.className = 'tag-name';
@@ -987,6 +981,20 @@ function writeClipboard(text) {
       ta.remove();
     }
   });
+}
+
+// tagColorInput is the swatch that edits a tag's color. Reverting to the stored color
+// when the save is refused is the part worth having in one place: a swatch left showing
+// a color the store rejected is the UI quietly disagreeing with the file.
+function tagColorInput(id, className) {
+  const color = document.createElement('input');
+  color.type = 'color';
+  color.className = className;
+  color.value = hex6(tagColor(id));
+  color.addEventListener('change', async () => {
+    if (!await apiTag('PATCH', { id, color: color.value })) color.value = hex6(tagColor(id));
+  });
+  return color;
 }
 
 // ---- category icons ----
@@ -1353,15 +1361,9 @@ function lbTagChip(a, id) {
   chip.dataset.tag = id;
   chip.style.setProperty('--tc', tagColor(id));
 
-  const color = document.createElement('input');
-  color.type = 'color';
-  color.className = 'tag-chip-color';
-  color.value = hex6(tagColor(id));
+  const color = tagColorInput(id, 'tag-chip-color');
   color.title = 'change color';
   color.addEventListener('click', (e) => e.stopPropagation());
-  color.addEventListener('change', async () => {
-    if (!await apiTag('PATCH', { id, color: color.value })) color.value = hex6(tagColor(id));
-  });
 
   const label = document.createElement('span');
   label.className = 'tag-chip-label';

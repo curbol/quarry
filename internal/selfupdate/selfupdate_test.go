@@ -9,10 +9,7 @@ import (
 // .github/workflows/release.yml). Every one has to be reachable: CI runs on a single
 // platform, so a mapping that drifts from these labels is only caught here.
 func releaseAssets() *release {
-	return &release{Assets: []struct {
-		Name string `json:"name"`
-		URL  string `json:"url"`
-	}{
+	return &release{Assets: []releaseAsset{
 		{Name: "quarry-1.0.0-mac-intel.zip", URL: "u/mac-intel"},
 		{Name: "quarry-1.0.0-mac-apple.zip", URL: "u/mac-apple"},
 		{Name: "quarry-1.0.0-linux-intel.zip", URL: "u/linux-intel"},
@@ -69,10 +66,7 @@ func TestPlatformAssetUnsupportedPlatform(t *testing.T) {
 }
 
 func TestPlatformAssetMissing(t *testing.T) {
-	rel := &release{Assets: []struct {
-		Name string `json:"name"`
-		URL  string `json:"url"`
-	}{
+	rel := &release{Assets: []releaseAsset{
 		{Name: "quarry-1.0.0-solaris-sparc.zip", URL: "u/nope"},
 	}}
 	if _, err := platformAsset(rel, "linux", "amd64"); err == nil || !strings.Contains(err.Error(), "no asset matching") {

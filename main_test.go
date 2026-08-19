@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -127,7 +128,9 @@ func TestResolveTagsPath(t *testing.T) {
 
 	// A store up the tree is a project store and takes precedence over the user one.
 	dir := t.TempDir()
-	os.WriteFile(filepath.Join(dir, tagstore.FileName), []byte("\n"), 0o644)
+	if err := os.WriteFile(filepath.Join(dir, tagstore.FileName), []byte("\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	sub := filepath.Join(dir, "a", "b")
 	os.MkdirAll(sub, 0o755)
 	t.Chdir(sub)
@@ -144,7 +147,9 @@ func TestRootFlagBeatsEnvironment(t *testing.T) {
 	cfgDir := t.TempDir()
 	envRoot := t.TempDir()
 	flagRoot := t.TempDir()
-	os.WriteFile(filepath.Join(cfgDir, "config.toml"), []byte("root = "+strconv.Quote(t.TempDir())+"\n"), 0o644)
+	if err := os.WriteFile(filepath.Join(cfgDir, "config.toml"), []byte("root = "+strconv.Quote(t.TempDir())+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	t.Setenv("QUARRY_ROOT", envRoot)
 
 	var got string
@@ -219,15 +224,28 @@ func TestServeIndexesAndPreparesTheTagStore(t *testing.T) {
 
 	// browse.Serve blocks until interrupted, so the run is stopped at the listen with an
 	// address that cannot bind. Everything under test happens before that point.
-	err := run([]string{
+	//
+	// The address is a port already held rather than an unparseable one: an address
+	// that is not an IP goes to the resolver, which is a real DNS query in a suite
+	// that is otherwise entirely offline, and makes the test hang behind a blackholed
+	// one. Port 0 asks the kernel for a free port, so this cannot collide with
+	// anything else on the machine, and a privileged low port would not fail for a
+	// container running as root.
+	busy, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer busy.Close()
+
+	err = run([]string{
 		"--root", root,
 		"--config", t.TempDir(),
 		"--cache", cacheDir,
 		"--tags", tagsPath,
-		"--addr", "256.256.256.256:1",
+		"--addr", busy.Addr().String(),
 	})
 	if err == nil {
-		t.Fatal("expected the bogus address to fail the listen")
+		t.Fatal("expected the occupied address to fail the listen")
 	}
 	if !strings.Contains(err.Error(), "listen") {
 		t.Fatalf("failed before listening: %v", err)

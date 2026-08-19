@@ -33,7 +33,9 @@ func TestRootUnsetWithoutConfig(t *testing.T) {
 func TestRootPrecedence(t *testing.T) {
 	clearQuarryEnv(t)
 	dir := t.TempDir()
-	os.WriteFile(filepath.Join(dir, "config.toml"), []byte(`root = "/from/file"`), 0o644)
+	if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte(`root = "/from/file"`), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	c, err := Load(dir)
 	if err != nil {
@@ -44,7 +46,10 @@ func TestRootPrecedence(t *testing.T) {
 	}
 
 	t.Setenv("QUARRY_ROOT", "/from/env")
-	c, _ = Load(dir)
+	c, err = Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if c.Root != "/from/env" {
 		t.Errorf("QUARRY_ROOT should override file, got %q", c.Root)
 	}
@@ -52,10 +57,16 @@ func TestRootPrecedence(t *testing.T) {
 
 func TestRootExpandsHome(t *testing.T) {
 	clearQuarryEnv(t)
-	t.Setenv("QUARRY_ROOT", "~/code/raw-assets")
-	c, _ := Load(t.TempDir())
-	home, _ := os.UserHomeDir()
-	if c.Root != filepath.Join(home, "code", "raw-assets") {
+	t.Setenv("QUARRY_ROOT", "~/assets/library")
+	c, err := Load(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Root != filepath.Join(home, "assets", "library") {
 		t.Errorf("root ~ not expanded: %q", c.Root)
 	}
 }
@@ -63,7 +74,9 @@ func TestRootExpandsHome(t *testing.T) {
 func TestLoadRejectsMalformedConfig(t *testing.T) {
 	clearQuarryEnv(t)
 	dir := t.TempDir()
-	os.WriteFile(filepath.Join(dir, "config.toml"), []byte("root = "), 0o644)
+	if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte("root = "), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := Load(dir); err == nil {
 		t.Error("malformed config.toml should be an error, not silently ignored")
 	}
@@ -168,7 +181,9 @@ func TestExpandHome(t *testing.T) {
 func TestLoadRejectsUnknownKeys(t *testing.T) {
 	clearQuarryEnv(t)
 	dir := t.TempDir()
-	os.WriteFile(filepath.Join(dir, "config.toml"), []byte("root = \"/x\"\nfollow_symlink = true\n"), 0o644)
+	if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte("root = \"/x\"\nfollow_symlink = true\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	_, err := Load(dir)
 	if err == nil {
 		t.Fatal("an unrecognized key was accepted silently")
@@ -190,7 +205,9 @@ func TestFollowSymlinksFromFile(t *testing.T) {
 		t.Error("following must be off unless asked for: it decides whether the scan leaves the root")
 	}
 
-	os.WriteFile(filepath.Join(dir, "config.toml"), []byte("root = \"/x\"\nfollow_symlinks = true\n"), 0o644)
+	if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte("root = \"/x\"\nfollow_symlinks = true\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	c, err = Load(dir)
 	if err != nil {
 		t.Fatal(err)

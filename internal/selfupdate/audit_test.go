@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -45,11 +46,18 @@ func zipWith(t *testing.T, name string, content []byte) []byte {
 	return buf.Bytes()
 }
 
-func assetServer(t *testing.T, status int, body []byte) (*httptest.Server, *http.Header) {
+// The captured header travels over a channel rather than a shared variable: the
+// handler runs on the server's goroutine and the assertion on the test's, and a TCP
+// round trip is not a happens-before edge the race detector (or the memory model)
+// recognises.
+func assetServer(t *testing.T, status int, body []byte) (*httptest.Server, func() http.Header) {
 	t.Helper()
-	var got http.Header
+	hdr := make(chan http.Header, 8)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		got = r.Header.Clone()
+		select {
+		case hdr <- r.Header.Clone():
+		default:
+		}
 		if status != http.StatusOK {
 			w.WriteHeader(status)
 			return
@@ -57,7 +65,14 @@ func assetServer(t *testing.T, status int, body []byte) (*httptest.Server, *http
 		w.Write(body)
 	}))
 	t.Cleanup(srv.Close)
-	return srv, &got
+	return srv, func() http.Header {
+		select {
+		case h := <-hdr:
+			return h
+		default:
+			return nil
+		}
+	}
 }
 
 func installedBinaryName() string {
@@ -105,10 +120,14 @@ func TestInstallReplacesBinaryInPlace(t *testing.T) {
 		}
 		t.Errorf("update left %v behind, want only the binary", names)
 	}
-	if auth := hdr.Get("Authorization"); auth != "token tok" {
+	sent := hdr()
+	if sent == nil {
+		t.Fatal("the asset server was never reached")
+	}
+	if auth := sent.Get("Authorization"); auth != "token tok" {
 		t.Errorf("Authorization = %q", auth)
 	}
-	if acc := hdr.Get("Accept"); acc != "application/octet-stream" {
+	if acc := sent.Get("Accept"); acc != "application/octet-stream" {
 		t.Errorf("Accept = %q", acc)
 	}
 }
@@ -341,11 +360,16 @@ func TestRunStopsWhenAlreadyCurrent(t *testing.T) {
 		{"a requested version", "v1.2.3", "1.2.3"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			var mu sync.Mutex
 			var assetHits int
+			var paths []string
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				paths = append(paths, r.URL.Path)
 				if strings.Contains(r.URL.Path, "/assets/") {
 					assetHits++
 				}
+				mu.Unlock()
 				fmt.Fprintf(w, `{"tag_name":%q,"assets":[{"name":"quarry-1.2.3-linux-intel.zip","url":%q}]}`,
 					tc.tag, "http://"+r.Host+"/assets/1")
 			}))
@@ -360,8 +384,21 @@ func TestRunStopsWhenAlreadyCurrent(t *testing.T) {
 			if err := Run("1.2.3", tc.target); err != nil {
 				t.Fatalf("Run on an already-current install returned %v, want nil", err)
 			}
-			if assetHits != 0 {
-				t.Errorf("Run downloaded an asset %d time(s) despite being current", assetHits)
+			mu.Lock()
+			gotHits, gotPaths := assetHits, append([]string(nil), paths...)
+			mu.Unlock()
+			if gotHits != 0 {
+				t.Errorf("Run downloaded an asset %d time(s) despite being current", gotHits)
+			}
+			// Which URL was asked for is the whole difference between the two cases, and
+			// nothing else asserts it: a regression that prepended "v" twice, or that
+			// fetched /latest for a specific version, would pass on the tag alone.
+			want := "/latest"
+			if tc.target != "" {
+				want = "/tags/v" + tc.target
+			}
+			if len(gotPaths) == 0 || gotPaths[0] != want {
+				t.Errorf("release request path = %v, want %s", gotPaths, want)
 			}
 		})
 	}
@@ -380,5 +417,62 @@ func TestRunTreatsAVPrefixAsTheSameVersion(t *testing.T) {
 
 	if err := Run("v0.4.0", ""); err != nil {
 		t.Errorf("Run(v0.4.0) = %v, want nil (no assets are listed, so anything past the version check fails)", err)
+	}
+}
+
+// The label suffix has to match on a separator. "win.zip" is a literal suffix of
+// "darwin.zip", so a bare suffix test hands a Windows user the macOS build — and
+// checkExecutable only sniffs a magic number every platform shares, so the wrong
+// build would replace a working install, including the update needed to recover.
+func TestPlatformAssetDoesNotMatchAcrossALabelBoundary(t *testing.T) {
+	rel := &release{TagName: "v1.0.0", Assets: []releaseAsset{
+		{Name: "quarry-1.0.0-darwin.zip", URL: "u/darwin"},
+	}}
+	if got, err := platformAsset(rel, "windows", "amd64"); err == nil {
+		t.Errorf("windows/amd64 matched %q, whose label merely ends in the windows suffix", got)
+	}
+
+	rel.Assets = append(rel.Assets, releaseAsset{Name: "quarry-1.0.0-win.zip", URL: "u/win"})
+	got, err := platformAsset(rel, "windows", "amd64")
+	if err != nil {
+		t.Fatalf("windows/amd64 with a real win asset present: %v", err)
+	}
+	if got != "u/win" {
+		t.Errorf("windows/amd64 resolved to %q, want u/win", got)
+	}
+}
+
+// archive/zip checks an entry's CRC only on reaching EOF, so bounding the unpack with
+// a LimitReader converted an oversize entry into a silently truncated binary that
+// still passed the magic-number check. The bound is enforced from the declared size
+// instead, and the read runs to EOF so the CRC is actually verified.
+func TestExtractRefusesAnOversizeEntryRatherThanTruncatingIt(t *testing.T) {
+	orig := maxBinaryBytes
+	maxBinaryBytes = 64
+	t.Cleanup(func() { maxBinaryBytes = orig })
+
+	dir := t.TempDir()
+	zipPath := filepath.Join(dir, "rel.zip")
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	w, err := zw.Create(binaryName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// An ELF magic so a truncated write would still pass checkExecutable.
+	w.Write(append([]byte{0x7f, 'E', 'L', 'F'}, bytes.Repeat([]byte("A"), 4096)...))
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(zipPath, buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := extractBinary(zipPath, dir)
+	if err == nil {
+		t.Fatalf("extracted %s over the size limit instead of refusing", out)
+	}
+	if !strings.Contains(err.Error(), "limit") {
+		t.Errorf("error = %v, want one naming the limit", err)
 	}
 }

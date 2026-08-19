@@ -38,11 +38,11 @@ mkdir -p ~/.config/quarry
 cp config.example.toml ~/.config/quarry/config.toml   # then edit `root`
 ```
 
-Or skip the file and pass `--root ~/code/raw-assets` (or set `QUARRY_ROOT`) per run.
+Or skip the file and pass `--root /path/to/your/assets` (or set `QUARRY_ROOT`) per run.
 
 ```bash
 quarry                            # index the configured root and open the browser
-quarry --root ~/code/raw-assets   # index somewhere else for this run
+quarry --root /path/to/your/assets   # index somewhere else for this run
 quarry --reindex                  # rebuild the index from scratch
 ```
 

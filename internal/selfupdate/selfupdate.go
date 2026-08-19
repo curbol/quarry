@@ -29,11 +29,15 @@ const binaryName = "quarry"
 var releasesAPIURL = "https://api.github.com/repos/curbol/quarry/releases"
 
 type release struct {
-	TagName string `json:"tag_name"`
-	Assets  []struct {
-		Name string `json:"name"`
-		URL  string `json:"url"`
-	} `json:"assets"`
+	TagName string         `json:"tag_name"`
+	Assets  []releaseAsset `json:"assets"`
+}
+
+// releaseAsset is one downloadable file on a release. Named rather than anonymous so
+// the platform matching over it can be exercised directly.
+type releaseAsset struct {
+	Name string `json:"name"`
+	URL  string `json:"url"`
 }
 
 // DevVersion is the version a locally-built binary carries. It is exported because
@@ -176,8 +180,13 @@ func platformAsset(rel *release, goos, goarch string) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("no release build for %s/%s", goos, goarch)
 	}
+	// The separator is part of the match. A bare suffix test makes "win.zip" a suffix
+	// of "darwin.zip", so a Windows user could be handed the macOS build — and since
+	// checkExecutable only sniffs a magic number, the wrong build would replace a
+	// working install. Nothing in the current labels collides; this is what keeps that
+	// from being the only reason it works.
 	for _, a := range rel.Assets {
-		if strings.HasSuffix(a.Name, suffix) {
+		if strings.HasSuffix(a.Name, "-"+suffix) {
 			return a.URL, nil
 		}
 	}
@@ -303,12 +312,16 @@ func download(token, url, dst string) error {
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("download failed: HTTP %d", resp.StatusCode)
 	}
-	return safewrite.Stream(dst, resp.Body, 0o644)
+	// Bounded for the same reason the extraction below is: this writes beside the
+	// running binary, and a response that never ends would fill the user's disk.
+	return safewrite.Stream(dst, io.LimitReader(resp.Body, maxBinaryBytes), 0o644)
 }
 
 // maxBinaryBytes caps what is unpacked from a release archive. quarry builds are a
-// few tens of MB; this is generous enough to never bite a real one.
-const maxBinaryBytes = 512 << 20
+// few tens of MB; this is generous enough to never bite a real one. A var so a test
+// can lower it: the refusal it guards is unreachable otherwise, and a bound nothing
+// exercises is a bound that silently stops working.
+var maxBinaryBytes int64 = 512 << 20
 
 func extractBinary(zipPath, dir string) (string, error) {
 	r, err := zip.OpenReader(zipPath)
@@ -330,10 +343,19 @@ func extractBinary(zipPath, dir string) (string, error) {
 		}
 		defer rc.Close()
 		out := filepath.Join(dir, want)
-		// Bounded by what a plausible build could be: a zip's declared sizes are not
-		// trustworthy, and this unpacks beside the running binary, so an inflated entry
-		// would fill the user's disk before anything noticed.
-		if err := safewrite.Stream(out, io.LimitReader(rc, maxBinaryBytes), 0o755); err != nil {
+		// Bounded by what a plausible build could be, because this unpacks beside the
+		// running binary and an inflated entry would fill the user's disk before
+		// anything noticed. Enforced from the declared size rather than by truncating
+		// the read: archive/zip verifies the entry's CRC only on reaching EOF, so a
+		// LimitReader that stops short returns a nil error and skips the check
+		// entirely. The truncated binary still carries the right magic number, so it
+		// would pass checkExecutable and replace a working install — including the
+		// `update` needed to recover. With no published checksum, that CRC is the whole
+		// integrity story.
+		if f.UncompressedSize64 > uint64(maxBinaryBytes) {
+			return "", fmt.Errorf("release binary is %d bytes, over the %d-byte limit", f.UncompressedSize64, maxBinaryBytes)
+		}
+		if err := safewrite.Stream(out, rc, 0o755); err != nil {
 			return "", err
 		}
 		return out, nil

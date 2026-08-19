@@ -69,7 +69,11 @@ archive, and the next run would index its own output.
 
 Reuse is keyed on a file's stat print alone, never on whether it left assets behind — an
 archive whose every entry is deduped away by an extracted twin contributes nothing, and
-demanding otherwise would re-decompress it on every run. A derivation that failed is
+demanding otherwise would re-decompress it on every run. The entries that dedup dropped
+are cached alongside the ones it kept, because suppression is a property of the pair
+rather than of the archive: the loose twin can be deleted while the archive's print does
+not move, and a refresh reusing only the survivors would carry the suppression forward
+and lose the asset with nothing reported. A derivation that failed is
 deliberately *not* cached: the print describes the file, not whether reading it worked, so
 caching one would keep serving the degraded result long after the cause was fixed.
 
@@ -142,8 +146,14 @@ card carrying `rootMotionId`, the RM variant's asset id; the lightbox's root-mot
 that file to show the travel, and the RM card is suppressed from the grid. Pairing groups assets
 by `(vendor, pack, canonical file base)` where the canonical base strips the `_RM` token — a
 trailing `_RM` (Quaternius/explosive GLBs) or a `_RM_` infix before a suffix (Synty FBX,
-`..._180L_RM_Masc`) — and pairs a group's in-place animations to its RM sibling (the same clip
-when the RM is also per-clip, else the whole-file RM). This is orthogonal to whether the clip has
+`..._180L_RM_Masc`) — and pairs a group's in-place animations to its RM sibling, preferring one in the same
+directory, then the same archive, then the same clip over a whole-file RM. The directory
+is a preference rather than part of the key because a pack laid out per character holds
+several same-named clips with their own RM files, while another ships every RM in one
+folder; keying on it would mispair the first and stop pairing the second. Because a
+result card groups by name and size while pairing groups by pack, a card can span the
+copy that owns the sibling and one that does not, so the card takes the sibling of
+whichever of its copies has one. This is orthogonal to whether the clip has
 a body to preview on: it only decides which file the toggle plays.
 
 `GET /api/assets` filters by tags with a repeatable `tag` param combined by `tagmode`: `and`
@@ -162,10 +172,12 @@ lightbox "parts of this set" strip); `POST /api/link {fingerprints, on}` links o
 
 The store never prunes to a currently-scanned set: assignments and groups for fingerprints
 outside the current view are preserved, so tags and links survive a disabled pack, a narrowed
-`--root`, or another machine. A save rewrites the file whole, so loading refuses a key it
-does not recognize rather than dropping it: the store travels between machines that need not
-run the same quarry, and that is exactly when a newer version's field would otherwise be
-destroyed by an older version's next edit. quarry is otherwise read-only over the library; this is its
+`--root`, or another machine. A save rewrites the file whole, so loading refuses anything the next save would not put
+back rather than dropping it: a key it does not recognize (the store travels between
+machines that need not run the same quarry, and that is exactly when a newer version's
+field would otherwise be destroyed by an older version's next edit), a color it cannot
+parse, and a tag id defined twice, where the second row would silently win. The one thing
+a save cannot preserve is comments, so it writes a header line saying so. quarry is otherwise read-only over the library; this is its
 one write surface, guarded by a mutex and written atomically. Because there is no session,
 the write endpoints require an `application/json` content-type, which forces a CORS
 preflight the server does not answer and so keeps a page the user happens to have open from

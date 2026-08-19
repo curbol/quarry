@@ -83,7 +83,9 @@ packages, each with a package doc comment stating its contract:
   a user's tree; everything else it writes is regenerable state under the cache dir,
   in `<cache>/roots/<hash of the scan root>/` — keyed by root so two roots sharing a
   cache dir do not prune each other's extractions away. A cache dir inside the scan
-  root is refused.
+  root is refused by `assetindex` itself, since that is the package that does the
+  writing — comparing paths resolved to their deepest existing ancestor, because the
+  run that has to be caught is the first one, when the cache dir does not exist yet.
 - **Tagging is never silently off.** With no project store discoverable, the
   user-wide store in the config dir is used. `browse.Serve` still honors an empty
   `tagsPath` as "disabled" so the package stays usable that way, but the CLI never

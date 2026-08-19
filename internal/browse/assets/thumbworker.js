@@ -30,7 +30,7 @@ if (typeof window === 'undefined') {
 import * as THREE from '/static/vendor/three/three.module.min.js';
 import {
   loadModel, loadSidekick, clipsForAsset, prepareClipRig, poseAt, stripRootMotion, isRenderable, isSynty,
-  captureRootRest, cloneRig, retargetedFor, dispose, CharRegistry, frameBox, contentURL,
+  captureRootRest, cloneRig, retargetedFor, dispose, disposeClone, CharRegistry, frameBox, contentURL, clipBones,
 } from '/static/scene.js';
 
 const SIZE = 220;
@@ -162,7 +162,7 @@ function evictFiles() {
 // for the rest of the session.
 async function rigFor(clip, asset) {
   const vendor = asset.vendor;
-  const bones = clipBonesOf(clip);
+  const bones = clipBones(clip);
   await CharRegistry.seed();
   let m = CharRegistry.match(bones, vendor);
   if (!m) { await CharRegistry.discoverForVendor(vendor, bones, asset.pack); m = CharRegistry.match(bones, vendor); }
@@ -181,10 +181,6 @@ async function rigFor(clip, asset) {
   return null;
 }
 
-function clipBonesOf(clip) {
-  return [...new Set(clip.tracks.map((t) => t.name.split('.')[0]))];
-}
-
 async function buildPosed(clip, asset, rootRest) {
   const vendor = asset.vendor;
   const template = await rigFor(clip, asset);
@@ -195,7 +191,7 @@ async function buildPosed(clip, asset, rootRest) {
   const mixer = poseAt(rig, posed);
   snap(rig, refBox);
   mixer.stopAllAction();
-  dispose(rig);
+  disposeClone(rig);
   return true;
 }
 
@@ -219,11 +215,14 @@ async function downscale(asset) {
 // the next job overwrites the canvas.
 let queue = Promise.resolve();
 
-// cancelled holds jobs the page gave up on (their cards were cleared) between the
-// message arriving and the queue reaching them. Without it a filter change leaves the
-// queue working through a backlog for cards nobody is looking at before it renders
-// what is on screen.
-const cancelled = new Set();
+// latest maps an asset id to the sequence number of the most recent request for it, so
+// a job can tell whether it is still the one the page wants between the message arriving
+// and the queue reaching it. Without that a filter change leaves the queue working
+// through a backlog for cards nobody is looking at before it renders what is on screen.
+//
+// An entry is deleted on cancel and overwritten on re-request, so the map holds one
+// entry per asset currently wanted rather than growing with every id ever cancelled.
+const latest = new Map();
 
 // JOB_TIMEOUT_MS bounds one render. A stalled fetch or a pathological parse would
 // otherwise hold the single queue forever, and every card behind it keeps its spinner
@@ -244,22 +243,30 @@ self.onmessage = (e) => {
     return;
   }
   if (e.data.type === 'cancel') {
-    cancelled.add(e.data.id);
+    latest.delete(e.data.id);
     return;
   }
-  const { id, asset } = e.data;
-  cancelled.delete(id); // a re-request supersedes an earlier cancel for the same asset
+  const { id, seq, asset } = e.data;
+  // The request's own sequence number decides whether it is still wanted, rather than a
+  // set of cancelled ids. Keying cancellation on the id alone could not tell a stale job
+  // from a fresh one for the same asset: a grid rebuild cancels every pending id and the
+  // new observer immediately re-requests the visible ones, and that re-request cleared
+  // the cancel for the job already sitting in the queue — so both ran, and the second
+  // result overwrote the first's cache entry without revoking the URL the visible image
+  // was using.
+  latest.set(id, seq);
+  const current = () => latest.get(id) === seq;
   // Images bypass the queue: they never touch the shared GL canvas the queue exists to
   // serialize, and making them wait behind a 65MB model parse is what a grid of
   // textures would spend all its time doing.
   if (asset.thumb === 'image') {
     downscale(asset)
-      .then((blob) => { if (!cancelled.delete(id)) self.postMessage({ id, blob }); })
-      .catch(() => { if (!cancelled.delete(id)) self.postMessage({ id, blob: null }); });
+      .then((blob) => { if (current()) self.postMessage({ id, seq, blob }); })
+      .catch(() => { if (current()) self.postMessage({ id, seq, blob: null }); });
     return;
   }
   queue = queue.then(async () => {
-    if (cancelled.delete(id)) return; // dropped while it waited its turn
+    if (!current()) return; // superseded or cancelled while it waited its turn
     try {
       // The timeout covers the whole job, not just build(): creating the context and
       // encoding the blob can stall too, and either one hanging outside the deadline
@@ -269,9 +276,9 @@ self.onmessage = (e) => {
         if (!(await build(asset))) return null;
         return canvas.convertToBlob({ type: 'image/png' });
       })());
-      self.postMessage({ id, blob: ok || null });
+      self.postMessage({ id, seq, blob: ok || null });
     } catch {
-      self.postMessage({ id, blob: null });
+      self.postMessage({ id, seq, blob: null });
     }
   });
 };

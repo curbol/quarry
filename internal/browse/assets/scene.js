@@ -438,6 +438,27 @@ function dispose(object) {
       }
     }
   });
+  disposeSkeletons(object);
+}
+
+// disposeSkeletons releases the bone texture three allocates lazily on a skeleton's
+// first render. It hangs off the Skeleton rather than off any material or geometry, so
+// nothing in the walk above reaches it, and it is only freed by name. One per skinned
+// model — and per clone, since each clone gets its own skeleton — retained for the life
+// of a worker that never restarts.
+function disposeSkeletons(object) {
+  object.traverse((o) => {
+    if (o.isSkinnedMesh && o.skeleton) o.skeleton.dispose();
+  });
+}
+
+// disposeClone tears down a rig produced by cloneRig. Object3D.clone copies geometry
+// and materials by reference, so the full dispose would free the buffers and compiled
+// programs belonging to the cached template the clone came from — re-uploading the mesh
+// and recompiling its shaders for every thumbnail, which is the cost caching the
+// template exists to avoid. A clone owns only its skeletons.
+function disposeClone(object) {
+  disposeSkeletons(object);
 }
 
 // rigEntry describes an asset as a rig a clip can play on, or null when it is not one.
@@ -593,5 +614,5 @@ const CharRegistry = {
 export {
   loadModel, loadSidekick, normalizeClip, boneNames, clipBones, clipsForAsset, loadRMClips, isSynty,
   coversBones, posedBox, frameBox, isRenderable, captureRootRest, uprightRig, prepareClipRig,
-  cloneRig, poseAt, retargetedFor, stripRootMotion, dispose, CharRegistry, rigEntry, rigCandidates, CLAY, _posedV,
+  cloneRig, poseAt, retargetedFor, stripRootMotion, dispose, disposeClone, CharRegistry, rigEntry, rigCandidates, CLAY, _posedV,
 };

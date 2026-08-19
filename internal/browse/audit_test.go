@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -647,6 +648,116 @@ func TestIncludeRelatedStillHonoursTheNonTagFilters(t *testing.T) {
 	for _, it := range got.Items {
 		if it.Name == "Sword.glb" {
 			t.Error("expansion relaxed the text search as well as the tag filter")
+		}
+	}
+}
+
+// frontendSources returns the JS this repo maintains. vendor/ is a third-party drop.
+func frontendSources(t *testing.T) map[string]string {
+	t.Helper()
+	out := map[string]string{}
+	entries, err := assetsFS.ReadDir("assets")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".js") {
+			continue
+		}
+		b, err := assetsFS.ReadFile("assets/" + e.Name())
+		if err != nil {
+			t.Fatal(err)
+		}
+		out[e.Name()] = string(b)
+	}
+	if len(out) == 0 {
+		t.Fatal("no frontend sources found")
+	}
+	return out
+}
+
+// The write endpoints are protected by requiring a JSON content-type, which forces a
+// CORS preflight the server never answers. That only holds while the frontend actually
+// sends one: a fetch that omits it, or uses a form encoding, silently downgrades to a
+// simple request and takes the protection with it. Checked here because it is a
+// property of the shipped JS that no request-level test can observe.
+func TestEveryMutatingFetchSendsAJSONContentType(t *testing.T) {
+	// A fetch with a method is a mutating one; a bare fetch(url) is a GET.
+	call := regexp.MustCompile(`(?s)fetch\((.{0,400}?)\)\s*[,;)]`)
+	for name, src := range frontendSources(t) {
+		for _, m := range call.FindAllStringSubmatch(src, -1) {
+			args := m[1]
+			if !strings.Contains(args, "method:") {
+				continue
+			}
+			if !strings.Contains(args, "application/json") {
+				t.Errorf("%s: a fetch with a method does not send an application/json content-type, "+
+					"which is what forces the preflight that protects the write endpoints:\n\tfetch(%s)", name, args)
+			}
+		}
+	}
+}
+
+// Asset names come from a user's filesystem, so a crafted one reaching innerHTML as
+// markup is a real, if small, injection. Enforced statically because the dangerous
+// version renders identically to the safe one, and no request-level test can see it.
+//
+// The rule is about what gets interpolated, not about the shape of the assignment:
+// every value spliced into markup must either be an ALL-CAPS constant this repo wrote
+// or go through escapeHTML. A bare identifier is resolved to its declaration once, so
+// markup assembled a line earlier is checked rather than waved through.
+func TestNothingUserDerivedReachesInnerHTML(t *testing.T) {
+	assign := regexp.MustCompile(`innerHTML\s*=\s*([^;\n]+)`)
+	interp := regexp.MustCompile(`\$\{([^}]*)\}`)
+	ident := regexp.MustCompile(`^[A-Za-z_$][\w$]*$`)
+	// The root of an expression: the identifier everything else hangs off.
+	root := regexp.MustCompile(`[A-Za-z_$][\w$]*`)
+	allCaps := regexp.MustCompile(`^[A-Z][A-Z0-9_]*$`)
+
+	// Property names and index keys are not values: ICONS[category] yields whatever
+	// ICONS holds no matter what category is, so indexing a constant table stays
+	// constant. Stripping them first leaves only the identifiers whose contents
+	// actually reach the markup.
+	prop := regexp.MustCompile(`\.[A-Za-z_$][\w$]*`)
+	index := regexp.MustCompile(`\[[^\]]*\]`)
+	safeExpr := func(e string) bool {
+		e = strings.TrimSpace(e)
+		if strings.Contains(e, "escapeHTML(") {
+			return true
+		}
+		e = index.ReplaceAllString(e, "")
+		e = prop.ReplaceAllString(e, "")
+		for _, r := range root.FindAllString(e, -1) {
+			if !allCaps.MatchString(r) {
+				return false
+			}
+		}
+		return true
+	}
+
+	for name, src := range frontendSources(t) {
+		for _, m := range assign.FindAllStringSubmatch(src, -1) {
+			rhs := strings.TrimSpace(m[1])
+			check := rhs
+			if ident.MatchString(rhs) {
+				// Resolve the identifier to its declaration in this file, if it has one.
+				decl := regexp.MustCompile(`(?:const|let|var)\s+` + regexp.QuoteMeta(rhs) + `\s*=\s*([^;\n]+)`)
+				if d := decl.FindStringSubmatch(src); d != nil {
+					check = d[1]
+				} else {
+					continue // a parameter; its call sites supply the markup
+				}
+			}
+			for _, e := range interp.FindAllStringSubmatch(check, -1) {
+				if !safeExpr(e[1]) {
+					t.Errorf("%s: innerHTML markup interpolates %q, which is neither an ALL-CAPS constant "+
+						"nor escaped, so a crafted file name would reach the DOM as markup", name, strings.TrimSpace(e[1]))
+				}
+			}
+			if !ident.MatchString(check) && !strings.Contains(check, "${") && !safeExpr(check) &&
+				!strings.HasPrefix(check, "'") && !strings.HasPrefix(check, `"`) {
+				t.Errorf("%s: innerHTML is assigned %q, which is neither a constant nor escaped", name, check)
+			}
 		}
 	}
 }

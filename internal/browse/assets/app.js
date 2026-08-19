@@ -1,6 +1,4 @@
 import * as THREE from 'three';
-import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
-import { FBXLoader } from 'three/addons/loaders/FBXLoader.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import {
   contentURL, loadModel, loadSidekick, normalizeClip, clipBones, clipsForAsset, loadRMClips, isSynty,
@@ -105,6 +103,9 @@ function reset() {
   tagWatchers.clear();
   gridWindow.reset();
   els.grid.replaceChildren();
+  // Cards appended straight into a fresh result set animate in; cards the window
+  // rebuilds while scrolling do not. See the .initial rule in style.css.
+  els.grid.classList.add('initial');
   fetchPage();
 }
 
@@ -124,8 +125,10 @@ const gridWindow = {
   // Live cards to keep. Comfortably more than a screenful at any window size, so
   // ordinary scrolling never outruns the rebuild.
   size: 1500,
-  // How far the viewport may drift before rebuilding; large enough that a rebuild is
-  // rare, small enough that it never reaches the edge of the live range.
+  // How much live margin the viewport must keep on each side. A rebuild happens when
+  // it is about to run out, not when it has moved: measuring drift instead compares a
+  // window that slides with the viewport against the live one, and those differ the
+  // moment the first row scrolls past.
   slack: 400,
   start: 0,
   end: 0,
@@ -138,11 +141,19 @@ const gridWindow = {
     this.end = 0;
     this.active = false;
     this.top = this.bottom = null;
+    this.geom = null;
   },
+
+  // geom caches what metrics() measures. Reading it costs a querySelectorAll over
+  // every live card plus getComputedStyle and two getBoundingClientRect, which forces
+  // a synchronous layout; doing that on every scroll frame is most of the cost of
+  // scrolling. Only a resize or a rebuild can change it.
+  geom: null,
 
   // metrics reads the live geometry rather than assuming it: the column count depends
   // on the viewport width and the row height on the cards' own content.
   metrics() {
+    if (this.geom) return this.geom;
     const cards = els.grid.querySelectorAll('.card');
     if (!cards.length) return null;
     const cs = getComputedStyle(els.grid);
@@ -157,7 +168,8 @@ const gridWindow = {
     const last = cards[cards.length - 1].getBoundingClientRect();
     const rowH = rows > 1 ? (last.bottom - first.top + gap) / rows : first.height + gap;
     if (!rowH) return null;
-    return { cols, rowH };
+    this.geom = { cols, rowH };
+    return this.geom;
   },
 
   spacer(where) {
@@ -178,19 +190,42 @@ const gridWindow = {
     return { start, end: Math.min(total, start + rowsLive * m.cols) };
   },
 
-  // sync renders the wanted range if the viewport has drifted far enough to need it.
+  // visible is the item range the viewport actually covers right now, snapped to whole
+  // rows. wanted() describes where the live range should sit; this describes what the
+  // user is looking at, and the two answer different questions.
+  visible(m) {
+    const total = state.items.length;
+    const top = window.scrollY - els.grid.offsetTop;
+    const firstRow = Math.max(0, Math.floor(top / m.rowH));
+    const lastRow = Math.max(firstRow, Math.floor((top + window.innerHeight) / m.rowH));
+    return {
+      start: Math.min(total, firstRow * m.cols),
+      end: Math.min(total, (lastRow + 1) * m.cols),
+    };
+  },
+
+  // sync rebuilds the live range when the viewport is close to running out of it.
   // Called after each page and on scroll/resize.
+  //
+  // The test is how much live margin is left on each side, not how far the wanted
+  // range has moved. Those are not the same: wanted() is a fixed-width window that
+  // slides with the viewport, so away from the ends its start moves by one column
+  // every time a row scrolls past, and requiring it to stay inside the live range
+  // meant rebuilding all 1500 cards on every row of scroll in either direction. The
+  // margin is only unavailable at the ends of the list, where there is nothing more to
+  // hold.
   sync(force) {
     const total = state.items.length;
     if (!this.active && total <= this.size) return;
     const m = this.metrics();
     if (!m) return;
-    const want = this.wanted(m);
-    if (!force && this.active && want.start >= this.start && want.end <= this.end &&
-      want.start - this.start >= 0 && this.end - want.end >= 0 &&
-      Math.abs(want.start - this.start) < this.slack) {
-      return;
+    if (!force && this.active) {
+      const view = this.visible(m);
+      const above = this.start <= 0 || view.start - this.start >= this.slack;
+      const below = this.end >= total || this.end - view.end >= this.slack;
+      if (above && below) return;
     }
+    const want = this.wanted(m);
     this.render(want.start, want.end, m);
   },
 
@@ -212,9 +247,13 @@ const gridWindow = {
     frag.appendChild(this.bottom);
 
     els.grid.replaceChildren(frag);
+    els.grid.classList.remove('initial');
     this.start = start;
     this.end = end;
     this.active = true;
+    // Re-measured on the next read: the cards that back the measurement are the ones
+    // just replaced.
+    this.geom = null;
   },
 
   // append adds a freshly loaded page. Once recycling is on the page goes into the
@@ -354,8 +393,29 @@ function applyPalette(p) {
   if (repaint) restyleTags();
 }
 
-async function loadPalette() {
-  try { applyPalette(await (await fetch('/api/tags')).json()); } catch { /* tagging stays off */ }
+// loadPalette turns tagging on. A failure here used to be swallowed, which presented
+// as tagging having switched itself off: no tag filter, no card tag buttons, no
+// lightbox tag panel, and nothing said. That is the outcome the write path goes out of
+// its way to avoid, and "tagging is never silently off" is the same promise the CLI
+// keeps by always resolving a store. So it is reported and retried; only a server that
+// genuinely has no store leaves it off, and that answer arrives as a successful
+// response saying so.
+async function loadPalette(attempt = 0) {
+  try {
+    const resp = await fetch('/api/tags');
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    applyPalette(await resp.json());
+  } catch (e) {
+    if (attempt < 2) {
+      setTimeout(() => loadPalette(attempt + 1), 500 * (attempt + 1));
+      return;
+    }
+    console.error('could not load the tag palette', e);
+    // Appended rather than assigned: a failing page load writes here too, and this
+    // arrives second.
+    els.error.textContent = 'Tagging is unavailable (' + (e && e.message ? e.message : 'unknown error') + '). Reload to try again.';
+    els.error.hidden = false;
+  }
 }
 
 // tagWatchers repaints the cards a tag edit affects, keyed on fingerprint — which is
@@ -898,14 +958,40 @@ const COPY_FEEDBACK_MS = 1200;
 // flashCopy copies text and marks btn as done for a moment. Buttons whose label is
 // text (rather than an icon) also say "copied ✓" and get their label back after.
 function flashCopy(btn, text, { label = false } = {}) {
-  navigator.clipboard.writeText(text).then(() => {
+  const flash = (ok) => {
     const previous = label ? btn.textContent : null;
-    if (label) btn.textContent = 'copied ✓';
-    btn.classList.add('done');
+    if (label) btn.textContent = ok ? 'copied ✓' : 'copy failed';
+    btn.classList.add(ok ? 'done' : 'failed');
     setTimeout(() => {
       if (previous !== null) btn.textContent = previous;
-      btn.classList.remove('done');
+      btn.classList.remove('done', 'failed');
     }, COPY_FEEDBACK_MS);
+  };
+  writeClipboard(text).then(flash, () => flash(false));
+}
+
+// writeClipboard falls back to a selection copy where the async clipboard API is
+// unavailable. navigator.clipboard exists only in a secure context, and serving on a
+// routable address — which --addr exists to allow — is plain http, so on every machine
+// but the one running quarry the property is simply undefined. Copy-path is a third of
+// what this UI is for, and reading it off a missing object threw inside the click
+// handler, leaving every copy button silently dead.
+function writeClipboard(text) {
+  if (navigator.clipboard && window.isSecureContext) return navigator.clipboard.writeText(text);
+  return new Promise((resolve, reject) => {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.cssText = 'position:fixed;top:-1000px;opacity:0';
+    document.body.appendChild(ta);
+    ta.select();
+    try {
+      document.execCommand('copy') ? resolve(true) : reject(new Error('copy rejected'));
+    } catch (e) {
+      reject(e);
+    } finally {
+      ta.remove();
+    }
   });
 }
 
@@ -984,7 +1070,8 @@ class ModelThumbnails {
     // otherwise accumulate every PNG it ever drew. Insertion order is eviction order,
     // refreshed on each hit.
     this.cache = new Map();   // asset.id -> object URL (a rendered blob)
-    this.pending = new Map(); // asset.id -> holder awaiting its render
+    this.pending = new Map(); // asset.id -> { holder, seq } awaiting its render
+    this.seq = 0;
     this.watch();
     this.dead = false;
     this.worker = new Worker('/static/thumbworker.js', { type: 'module' });
@@ -1023,7 +1110,7 @@ class ModelThumbnails {
     if (this.dead) return;
     this.dead = true;
     console.error('thumbnail worker stopped; 3D previews in the grid are unavailable', message || '');
-    for (const holder of this.pending.values()) {
+    for (const { holder } of this.pending.values()) {
       if (holder.isConnected) holder.classList.remove('loading');
       this.vis.unobserve(holder);
     }
@@ -1041,7 +1128,8 @@ class ModelThumbnails {
   }
   cancel(holder) {
     const asset = holder._asset;
-    if (!asset || this.pending.get(asset.id) !== holder) return;
+    const p = asset && this.pending.get(asset.id);
+    if (!p || p.holder !== holder) return;
     this.pending.delete(asset.id);
     this.worker.postMessage({ type: 'cancel', id: asset.id });
     holder.classList.remove('loading');
@@ -1052,10 +1140,15 @@ class ModelThumbnails {
     const cached = this.cache.get(asset.id);
     if (cached) { this.touch(asset.id); this.swap(holder, cached); return; }
     holder.classList.add('loading');
-    this.pending.set(asset.id, holder);
+    // Each request carries a sequence number the worker echoes back, so a result for a
+    // request that was since cancelled and re-made is recognisable as stale. Matching on
+    // the id alone let a superseded job's result land on the current card's entry.
+    const seq = ++this.seq;
+    this.pending.set(asset.id, { holder, seq });
     // Only the fields the worker's build needs — DTOs aren't structured-clone-friendly wholesale.
     this.worker.postMessage({
       id: asset.id,
+      seq,
       asset: {
         id: asset.id, ext: asset.ext, vendor: asset.vendor, pack: asset.pack, thumb: asset.thumb,
         source: {
@@ -1073,6 +1166,10 @@ class ModelThumbnails {
     this.cache.set(id, url);
   }
   remember(id, url) {
+    // Replacing an entry revokes what it held: overwriting the key would leave the old
+    // URL alive with nothing tracking it, outside the cache bound entirely.
+    const prev = this.cache.get(id);
+    if (prev && prev !== url) URL.revokeObjectURL(prev);
     this.cache.set(id, url);
     while (this.cache.size > THUMB_CACHE_MAX) {
       const oldest = this.cache.keys().next().value;
@@ -1080,9 +1177,14 @@ class ModelThumbnails {
       this.cache.delete(oldest);
     }
   }
-  onResult({ id, blob }) {
-    const holder = this.pending.get(id);
+  onResult({ id, seq, blob }) {
+    const p = this.pending.get(id);
+    // Stale: this request was cancelled, or superseded by a later one whose result is
+    // the one to use. Dropping it before the object URL exists is what keeps a
+    // displaced URL from escaping the cache bound unrevoked.
+    if (!p || p.seq !== seq) return;
     this.pending.delete(id);
+    const holder = p.holder;
     if (blob) {
       const url = URL.createObjectURL(blob);
       this.remember(id, url);
@@ -1169,7 +1271,7 @@ function openLightbox(a) {
   const fields = [['Category', a.category], ['Format', a.ext || '—'], ['Size', humanSize(a.size)]];
   if (hasDims) fields.push(['Dimensions', `${a.width} × ${a.height}`]);
   else if (bitmap) fields.push(['Dimensions', '…']);
-  lb.fields.innerHTML = fields.map(([k, v]) => `<dt>${k}</dt><dd data-field="${k}">${escapeHTML(v)}</dd>`).join('');
+  lb.fields.innerHTML = fields.map(([k, v]) => `<dt>${escapeHTML(k)}</dt><dd data-field="${escapeHTML(k)}">${escapeHTML(v)}</dd>`).join('');
   // The index carries dimensions for images it could measure; probe the bytes only
   // as a fallback (a copy dropped from the index, or a format the scanner skipped).
   if (!hasDims && bitmap) {
@@ -1527,9 +1629,21 @@ function startViewer(container, asset) {
   container.appendChild(toolbar);
   setViewMode('iso');
 
-  const clearOverlays = () => { container.querySelectorAll('.lb-placeholder,.lb-controls').forEach((e) => e.remove()); };
-  const ensureCanvas = () => { if (!renderer.domElement.isConnected) container.appendChild(renderer.domElement); };
+  // The container and the renderer are shared with every other preview, and a load
+  // that fails can resolve long after the user moved on. Without this a dead viewer
+  // detaches the live one's canvas, deletes its controls, and writes its own error
+  // over whatever the user is now looking at — and nothing reattaches the canvas, so
+  // the live viewer renders into a detached one for the rest of the session.
+  const clearOverlays = () => {
+    if (stopped) return;
+    container.querySelectorAll('.lb-placeholder,.lb-controls').forEach((e) => e.remove());
+  };
+  const ensureCanvas = () => {
+    if (stopped) return;
+    if (!renderer.domElement.isConnected) container.appendChild(renderer.domElement);
+  };
   const showPlaceholder = (text) => {
+    if (stopped) return;
     if (obj) { scene.remove(obj); dispose(obj); obj = null; }
     renderer.domElement.remove();
     clearOverlays();
@@ -1627,7 +1741,9 @@ function startViewer(container, asset) {
   const SAVE_SVG = '<svg viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3h12v18l-6-4-6 4z"/></svg>';
 
   const useAndFallback = async (item, forBones) => {
-    if (!(await useCharacter(item))) showCharacterChooser(forBones, 'That model could not be loaded. Try another.');
+    const ok = await useCharacter(item);
+    if (stopped) return;
+    if (!ok) showCharacterChooser(forBones, 'That model could not be loaded. Try another.');
   };
 
   // characterSearch is a single autocomplete combobox: a text input whose dropdown of
@@ -1720,6 +1836,10 @@ function startViewer(container, asset) {
   }
 
   function showCharacterChooser(forBones, note) {
+    // lb.character is shared with every other preview, like the canvas and the
+    // container: a chooser built by a viewer the user already navigated away from
+    // would replace the sidebar of the one on screen.
+    if (stopped) return;
     lb.character.replaceChildren();
     const panel = document.createElement('div'); panel.className = 'lb-charpanel';
     const label = document.createElement('div'); label.className = 'lb-charpanel-label'; label.textContent = 'Character';
@@ -1819,7 +1939,14 @@ function startViewer(container, asset) {
     if (stopped) return;
     showPlaceholder('Animation clip — pick a character in the sidebar →');
     showCharacterChooser(bones);
-  })();
+  })().catch((e) => {
+    // Anything thrown past the handled load failures — a malformed clip, a rig that
+    // cannot be prepared — would otherwise be an unhandled rejection that leaves the
+    // viewer blank with nothing said. showPlaceholder is a no-op once this viewer has
+    // been torn down.
+    console.error('preview failed', e);
+    showPlaceholder('Could not display this asset.');
+  });
 
   const onResize = () => {
     const nw = container.clientWidth, nh = container.clientHeight;
@@ -1917,16 +2044,25 @@ new IntersectionObserver((entries) => {
 // so a fling costs one check per paint rather than one per scroll event, and both are
 // passive so neither can hold up the scroll itself.
 let windowTick = 0;
-const syncGridWindow = () => {
+let windowForce = false;
+const syncGridWindow = (force) => {
+  windowForce = windowForce || !!force;
   if (windowTick) return;
   windowTick = requestAnimationFrame(() => {
     windowTick = 0;
-    gridWindow.sync(false);
+    const f = windowForce;
+    windowForce = false;
+    gridWindow.sync(f);
   });
 };
-addEventListener('scroll', syncGridWindow, { passive: true });
-// A resize changes the column count, so the spacers have to be remeasured outright.
-addEventListener('resize', () => gridWindow.sync(true), { passive: true });
+addEventListener('scroll', () => syncGridWindow(false), { passive: true });
+// A resize changes the column count and the row height, so the cached geometry is
+// stale and the spacers have to be remeasured outright. Coalesced like scroll: dragging
+// a window edge emits a continuous stream of these, and each one rebuilds every card.
+addEventListener('resize', () => {
+  gridWindow.geom = null;
+  syncGridWindow(true);
+}, { passive: true });
 
 loadPalette();
 fetchPage();

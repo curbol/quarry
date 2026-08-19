@@ -165,13 +165,17 @@ header select:hover { border-color: var(--edge-hi); color: var(--text); }
   flex-direction: column;
   box-shadow: 0 10px 22px -16px rgba(0, 0, 0, 0.9);
   transition: transform .18s ease, box-shadow .18s ease, border-color .18s ease;
-  animation: card-in .34s ease;
   /* Skip layout+paint for off-screen cards; the grid can hold thousands after scrolling,
      and painting them all every frame is what pins the main thread. The observer still
      fires, so lazy thumbnails are unaffected. */
   content-visibility: auto;
   contain-intrinsic-size: auto 216px;
 }
+/* Only on the first paint of a result set. The windowed grid rebuilds its cards as the
+   viewport moves, and animating there fades the whole grid back in mid-scroll — a
+   full-grid flash plus a thousand concurrent animations, for cards that were already on
+   screen a frame earlier. */
+#grid.initial > .card { animation: card-in .34s ease; }
 @keyframes card-in { from { opacity: 0; transform: translateY(9px); } }
 .card:hover, .card:focus-visible {
   transform: translateY(-3px);

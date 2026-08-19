@@ -18,11 +18,19 @@ export const ICONS = {
   other: '<circle cx="12" cy="12" r="9"/><path d="M12 8v4l3 2"/>',
 };
 
+// Each glyph is parsed once and cloned per use. The grid draws one icon per card and
+// rebuilds its live window as the user scrolls, so building the markup and handing it
+// to the HTML parser per call runs the parser thousands of times over a long scroll.
+const parsed = new Map();
+
 export function iconEl(category) {
-  const wrap = document.createElement('div');
-  wrap.className = 'icon-wrap';
-  wrap.style.display = 'flex';
-  const svg = `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round">${ICONS[category] || ICONS.other}</svg>`;
-  wrap.innerHTML = svg;
-  return wrap.firstChild;
+  const key = ICONS[category] ? category : 'other';
+  let proto = parsed.get(key);
+  if (!proto) {
+    const wrap = document.createElement('div');
+    wrap.innerHTML = `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round">${ICONS[key]}</svg>`;
+    proto = wrap.firstElementChild;
+    parsed.set(key, proto);
+  }
+  return proto.cloneNode(true);
 }

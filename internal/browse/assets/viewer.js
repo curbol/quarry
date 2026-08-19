@@ -416,7 +416,7 @@ export function startViewer(container, asset, panels) {
       catch { showPlaceholder('Could not load this model.'); return; }
     }
     if (stopped) { dispose(root); return; }
-    const cs = clipsForAsset(root, asset);
+    const cs = clipsForAsset(root.animations, asset);
     if (isRenderable(root)) {
       obj = root; scene.add(root);
       // A sidekick group is many part meshes each on its own copy of the skeleton;

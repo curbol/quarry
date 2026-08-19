@@ -4,6 +4,7 @@
 // (which has no import map); it is the same file the document's import map points
 // "three" at, so a single three instance is shared across both.
 import * as THREE from '/static/vendor/three/three.module.min.js';
+import { clipsForAsset, clipsMatching, coversBones, matchRig, nameSeries, packRigCandidates } from '/static/rigmatch.js';
 import { GLTFLoader } from '/static/vendor/three/jsm/loaders/GLTFLoader.js';
 import { FBXLoader } from '/static/vendor/three/jsm/loaders/FBXLoader.js';
 
@@ -119,39 +120,6 @@ function clipBones(clip) {
   return [...new Set(clip.tracks.map((t) => t.name.split('.')[0]))];
 }
 
-// clipsForAsset returns the animation clips to preview for an asset. A per-clip
-// virtual asset (source.clip, from splitting a multi-animation model file like a
-// Quaternius library) narrows to just that named clip; every other asset previews
-// all of the file's clips. FBX prefixes a clip name with its take ("Armature|Walk"),
-// so match the suffix too.
-function clipsForAsset(obj, asset) {
-  const all = obj.animations || [];
-  const src = (asset && asset.source) || {};
-  // clipIndex is the animation's position in the file, which is how the split was made.
-  // The name cannot do this job on its own: glTF names are optional and need not be
-  // unique, so the index carries a disambiguated label ("Walk (2)", "clip 3") that no
-  // animation in the file is actually called.
-  if (Number.isInteger(src.clipIndex) && all[src.clipIndex]) return [all[src.clipIndex]];
-  const want = src.clip;
-  if (!want) return all;
-  const hit = all.filter((c) => c.name === want || c.name.endsWith('|' + want));
-  return hit.length ? hit : all;
-}
-
-// clipsMatching is clipsForAsset against a *different* file: the root-motion sibling,
-// which has its own animations and its own indices. Only a name match counts, plus the
-// whole-file case where the sibling holds exactly one clip and there is nothing to pick
-// wrong. Falling back to "all of them" the way clipsForAsset does would hand the toggle
-// an arbitrary animation and present it as this clip's travel variant.
-function clipsMatching(obj, asset) {
-  const all = obj.animations || [];
-  const want = asset && asset.source && asset.source.clip;
-  if (!want) return all;
-  const hit = all.filter((c) => c.name === want || c.name.endsWith('|' + want));
-  if (hit.length) return hit;
-  return all.length === 1 ? all : [];
-}
-
 // loadRMClips loads an animation's root-motion (travel) sibling file and returns its
 // matching clips — the same clip name as the card. The RM and in-place variants share
 // a skeleton, so the clips play on the already-loaded body; only the AnimationClips are
@@ -160,33 +128,10 @@ async function loadRMClips(asset) {
   if (!asset || !asset.rootMotionId) return null;
   try {
     const rmObj = await loadModel(contentURL(asset.rootMotionId), asset.ext);
-    const cs = clipsMatching(rmObj, asset);
+    const cs = clipsMatching(rmObj.animations, asset);
     dispose(rmObj);
     return cs.length ? cs : null;
   } catch { return null; }
-}
-
-// coversBones reports how many bone names a rig and a clip share when the rig can
-// actually play the clip, and 0 when it cannot: the clip must drive most of the rig
-// (≥60% of the rig's bones — so nearly the whole body animates) AND cover a good part
-// of the clip (≥45% of its bones). Requiring both rejects the small/partial rigs that
-// share a handful of names but pose a full clip into garbage (the shredded animation
-// thumbnails), and superset showcase rigs, while still letting a body play a richer
-// clip.
-//
-// The shared count is returned rather than a bare true because ranking candidates
-// wants it too, and a call site that recomputed the overlap to get it would end up
-// holding a second copy of these thresholds. Names are counted distinct on both sides:
-// a cached entry can repeat a name per bone instance, and coverage is about which
-// bones are driven, not how many times.
-function coversBones(have, want) {
-  if (!have || !have.length || !want || !want.length) return 0;
-  const rig = new Set(have);
-  const clip = new Set(want);
-  let hit = 0;
-  for (const b of clip) if (rig.has(b)) hit++;
-  if (hit / rig.size < 0.6 || hit / clip.size < 0.45) return 0;
-  return hit;
 }
 
 // posedBox returns the object's bounds from its posed skeleton (bone world positions), not
@@ -583,10 +528,6 @@ async function resolveRig(bones, asset, tryLoad, cancelled = () => false) {
   return attempt();
 }
 
-// nameSeries is a file name's leading word — "A" in A_POLY_BOW_Cmp_Idle, "Paladin" in
-// Paladin WProp J Nordstrom. Files a vendor generates as one series share it.
-const nameSeries = (name) => (name || '').split(/[_@\-. ]/)[0].toLowerCase();
-
 // packRigs picks what to try from the pack shipping a clip, heaviest first. Weight
 // alone finds a character body, which outweighs every clip beside it — but not a prop
 // rig: a bow its own clips animate is lighter than the character animations it ships
@@ -595,11 +536,8 @@ const nameSeries = (name) => (name || '').split(/[_@\-. ]/)[0].toLowerCase();
 // those is the rig. Only extensions loadModel can open are worth a load; a pack's
 // heaviest file is often a .blend the preview cannot read at all.
 async function packRigs(pack, vendor, name) {
-  const series = nameSeries(name);
   const page = await rigCandidates({ q: pack, vendor, limit: 500, types: ['model', 'animation'], sort: 'size' });
-  return page
-    .filter((it) => nameSeries(it.name) !== series && ['fbx', 'glb', 'gltf'].includes(it.ext))
-    .slice(0, 3);
+  return packRigCandidates(page, name);
 }
 
 // ---- character registry: match a clip-only animation to a rig it can play on ----
@@ -626,23 +564,9 @@ const CharRegistry = {
   // Auto-match is scoped to the clip's own vendor: cross-vendor skeletons share enough
   // bone names to pass the coverage bar but differ in rest pose, posing a clip into a
   // shredded/T-posed garbage still. A legacy entry with no recorded vendor is a wildcard
-  // until it is re-registered (see register), so old caches keep working.
-  match(bones, vendor) {
-    if (!bones || !bones.length) return null;
-    let best = null, bestScore = -1, bestPinned = false;
-    for (const e of this.list()) {
-      if (vendor && e.vendor && e.vendor !== vendor) continue;
-      if (e.bones.length > new Set(e.bones).size * 1.4) continue; // legacy cache: skip multi-skeleton showcase meshes, whose bones repeat per character (register now rejects them)
-      const hit = coversBones(e.bones, bones);
-      if (!hit) continue; // rig must fit the clip
-      const pinned = !!e.pinned;
-      // Rank by absolute shared bones: prefer the fullest matching body.
-      if ((pinned && !bestPinned) || (pinned === bestPinned && hit > bestScore)) {
-        best = e; bestScore = hit; bestPinned = pinned;
-      }
-    }
-    return best;
-  },
+  // until it is re-registered (see register), so old caches keep working. The ranking
+  // itself is matchRig, in rigmatch.js, where it is checked without a GL context.
+  match(bones, vendor) { return matchRig(this.list(), bones, vendor); },
   pin(id, on) {
     const l = this.list();
     const e = l.find((x) => x.id === id);
@@ -688,9 +612,17 @@ const CharRegistry = {
   },
   // When the seed didn't cover a clip's rig, look for a body in the clip's own vendor
   // (a clip's native character usually ships in the same vendor's packs).
+  discovered: new Set(),
   async discoverForVendor(asset, want) {
     const { vendor, pack, name } = asset || {};
     if (!vendor) return;
+    // Once per vendor+pack. Establishing that a pack ships no body costs up to fourteen
+    // model downloads and parses, and a candidate that turns out not to be a rig is
+    // never registered — so the seen set below cannot remember it and every clip card
+    // in the pack would pay the whole search again, on every grid rebuild.
+    const scope = vendor + '\u0000' + (pack || '');
+    if (this.discovered.has(scope)) return;
+    this.discovered.add(scope);
     // Load candidate bodies until one actually covers this clip (a single showcase mesh can
     // win by bone count yet be a multi-skeleton mesh register now rejects, and some bodies
     // ship a different skeleton family that shares no bone names). Stop at the first covering
@@ -719,8 +651,9 @@ const CharRegistry = {
 };
 
 export {
-  loadModel, loadSidekick, normalizeClip, boneNames, clipBones, clipsForAsset, loadRMClips, isSynty,
-  coversBones, resolveRig, posedBox, frameBox, isRenderable, captureRootRest, uprightRig, prepareClipRig,
+  clipsForAsset, coversBones,
+  loadModel, loadSidekick, normalizeClip, boneNames, clipBones, loadRMClips, isSynty,
+  resolveRig, posedBox, frameBox, isRenderable, captureRootRest, uprightRig, prepareClipRig,
   cloneRig, hideAlternates, poseAt, retargetedFor, stripRootMotion, dispose, disposeClone, CharRegistry, rigEntry, rigCandidates, CLAY, _posedV,
   rootBone, rootBoneName,
 };

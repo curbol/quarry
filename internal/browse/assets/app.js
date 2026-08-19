@@ -189,32 +189,56 @@ const gridWindow = {
     this.render(want.start, want.end, m);
   },
 
+  cards(from, to) {
+    const frag = document.createDocumentFragment();
+    for (let i = from; i < to; i++) frag.appendChild(card(state.items[i]));
+    return frag;
+  },
+
+  // render moves the live range to [start, end). The window slides by a fraction of
+  // its own width — needsRebuild fires on the margin, not on movement — so most of
+  // what is live stays live, and only the ends are rebuilt.
+  //
+  // Replacing all of it instead was two costs, not one. Every surviving card was
+  // recreated, and every render already in flight was cancelled along with it: the
+  // worker finished the job, the result no longer matched any live holder, and the
+  // freshly built card asked for the identical render again. A model slow enough to
+  // still be rendering when the window moved could be started and abandoned several
+  // times before it ever landed.
   render(start, end, m) {
     const total = state.items.length;
-    // Dropping the cards drops what was watching them; re-registering happens as each
-    // card is rebuilt below.
-    lazyWork.reset();
-    modelThumbs.release();
-    tagWatchers.clear();
-
     const rows = spacerRows({ start, end, total, cols: m.cols });
-    const frag = document.createDocumentFragment();
-    this.top = this.spacer('top');
-    this.top.style.height = rows.before * m.rowH + 'px';
-    frag.appendChild(this.top);
-    for (let i = start; i < end; i++) frag.appendChild(card(state.items[i]));
-    this.bottom = this.spacer('bottom');
-    this.bottom.style.height = rows.after * m.rowH + 'px';
-    frag.appendChild(this.bottom);
+    const keepFrom = Math.max(this.start, start);
+    const keepTo = Math.min(this.end, end);
 
-    els.grid.replaceChildren(frag);
+    if (this.active && keepFrom < keepTo) {
+      for (let i = this.start; i < keepFrom; i++) this.drop(this.top.nextElementSibling);
+      for (let i = keepTo; i < this.end; i++) this.drop(this.bottom.previousElementSibling);
+      if (start < keepFrom) this.top.after(this.cards(start, keepFrom));
+      if (end > keepTo) this.bottom.before(this.cards(keepTo, end));
+    } else {
+      // First activation, or a jump far enough that nothing live is still wanted. The
+      // cards being replaced include the ones fetchPage appended before recycling
+      // turned on, which have the same registrations to release.
+      for (const el of els.grid.querySelectorAll('.card')) forgetCard(el);
+      this.top = this.spacer('top');
+      this.bottom = this.spacer('bottom');
+      els.grid.replaceChildren(this.top, this.cards(start, end), this.bottom);
+    }
+    this.top.style.height = rows.before * m.rowH + 'px';
+    this.bottom.style.height = rows.after * m.rowH + 'px';
+
     els.grid.classList.remove('initial');
     this.start = start;
     this.end = end;
     this.active = true;
-    // Re-measured on the next read: the cards that back the measurement are the ones
-    // just replaced.
+    // Re-measured on the next read: the cards that back the measurement have changed.
     this.geom = null;
+  },
+
+  drop(el) {
+    forgetCard(el);
+    el.remove();
   },
 
   // append adds a freshly loaded page. Once recycling is on the page goes into the
@@ -392,6 +416,20 @@ function watchTags(asset, repaint) {
     let set = tagWatchers.get(fp);
     if (!set) tagWatchers.set(fp, (set = new Set()));
     set.add(entry);
+  }
+  return entry;
+}
+
+// unwatchTags drops one card's registration. The map is keyed by fingerprint and
+// outlives any single card, so a window that replaces part of its DOM without this
+// keeps every card the session ever drew — and repaints them.
+function unwatchTags(entry) {
+  if (!entry) return;
+  for (const fp of entry.asset.fingerprints || []) {
+    const set = tagWatchers.get(fp);
+    if (!set) continue;
+    set.delete(entry);
+    if (!set.size) tagWatchers.delete(fp);
   }
 }
 
@@ -737,6 +775,35 @@ function splitName(name) {
   return [name.slice(0, cut), name.slice(cut)];
 }
 
+// svgIcon clones a parsed glyph instead of re-running the HTML parser. Each card
+// carries two inline SVGs and a window rebuild creates fifteen hundred of them.
+const svgProtos = new Map();
+function svgIcon(markup) {
+  let proto = svgProtos.get(markup);
+  if (!proto) {
+    const wrap = document.createElement('div');
+    wrap.innerHTML = markup;
+    proto = wrap.firstElementChild;
+    svgProtos.set(markup, proto);
+  }
+  return proto.cloneNode(true);
+}
+
+// forgetThumbs releases the observers watching every deferred thumbnail in a subtree.
+// Both hold their targets, so a node dropped from the DOM without this keeps itself,
+// and the asset it points at, alive until the observer is next rebuilt wholesale.
+function forgetThumbs(root) {
+  for (const h of root.querySelectorAll('.thumb-3d')) modelThumbs.forget(h);
+  for (const f of root.querySelectorAll('.font-thumb')) lazyWork.forget(f);
+}
+
+// forgetCard is forgetThumbs plus the tag-repaint registration only a grid card has.
+function forgetCard(el) {
+  forgetThumbs(el);
+  unwatchTags(el._tagWatch);
+  el._tagWatch = null;
+}
+
 function card(a) {
   const el = document.createElement('div');
   el.className = 'card';
@@ -765,7 +832,7 @@ function card(a) {
   // Copy icon (hover), top-right; ✓ feedback without replacing the icon glyph.
   const copy = document.createElement('button');
   copy.className = 'copy-icon';
-  copy.innerHTML = COPY_SVG;
+  copy.appendChild(svgIcon(COPY_SVG));
   copy.title = 'copy path';
   copy.addEventListener('click', (e) => {
     e.stopPropagation();
@@ -780,12 +847,12 @@ function card(a) {
   bar.className = 'sliver-bar';
   renderSlivers(bar, a);
   thumb.appendChild(bar);
-  watchTags(a, () => renderSlivers(bar, a));
+  el._tagWatch = watchTags(a, () => renderSlivers(bar, a));
 
   const tagBtn = document.createElement('button');
   tagBtn.type = 'button';
   tagBtn.className = 'tag-add';
-  tagBtn.innerHTML = TAG_SVG;
+  tagBtn.appendChild(svgIcon(TAG_SVG));
   tagBtn.title = 'tags';
   if (!hasFingerprints(a)) tagBtn.classList.add('nofp');
   tagBtn.addEventListener('click', (e) => {
@@ -907,11 +974,17 @@ const COPY_FEEDBACK_MS = 1200;
 // text (rather than an icon) also say "copied ✓" and get their label back after.
 function flashCopy(btn, text, { label = false } = {}) {
   const flash = (ok) => {
-    const previous = label ? btn.textContent : null;
-    if (label) btn.textContent = ok ? 'copied ✓' : 'copy failed';
+    // Stashed on the button rather than captured per click. A second click inside the
+    // feedback window used to capture "copied ✓" as the text to restore, and its later
+    // timer won — so the button kept that label for the rest of the session.
+    if (label) {
+      if (btn.dataset.label === undefined) btn.dataset.label = btn.textContent;
+      btn.textContent = ok ? 'copied ✓' : 'copy failed';
+    }
     btn.classList.add(ok ? 'done' : 'failed');
-    setTimeout(() => {
-      if (previous !== null) btn.textContent = previous;
+    clearTimeout(btn._flashTimer);
+    btn._flashTimer = setTimeout(() => {
+      if (label) btn.textContent = btn.dataset.label;
       btn.classList.remove('done', 'failed');
     }, COPY_FEEDBACK_MS);
   };
@@ -973,6 +1046,11 @@ function tagColorInput(id, className) {
 // not a hit-rate tuning knob: a few screenfuls in either scroll direction.
 const THUMB_CACHE_MAX = 400;
 
+// NO_RENDER_MAX bounds the memo of assets with nothing to draw. Entries are ids
+// rather than blobs, so this can be far larger than the thumbnail cache, but it still
+// must not grow to one per asset in the library.
+const NO_RENDER_MAX = 5000;
+
 // lazyWork defers per-card work (a thumbnail render, a font download) until the card
 // is near the viewport, and forgets every card the grid drops. An IntersectionObserver
 // holds its targets and a card that never scrolled into view is never unobserved, so
@@ -993,6 +1071,10 @@ const lazyWork = {
     }, { rootMargin: '200px' });
   },
   when(el, run) { el._onVisible = run; this.observer.observe(el); },
+  forget(el) {
+    if (this.observer) this.observer.unobserve(el);
+    el._onVisible = null;
+  },
 };
 lazyWork.reset();
 
@@ -1007,6 +1089,10 @@ class ModelThumbnails {
     // refreshed on each hit.
     this.cache = new Map();   // asset.id -> object URL (a rendered blob)
     this.pending = new Map(); // asset.id -> { holders, seq } awaiting one render
+    // Assets the worker has already answered "nothing to draw" for. Bounded like the
+    // cache: a settled answer is worth remembering, but not for every asset in a
+    // 150k-item library at once.
+    this.noRender = new Set();
     this.seq = 0;
     this.watch();
     this.dead = false;
@@ -1064,6 +1150,13 @@ class ModelThumbnails {
     this.pending.clear();
     this.watch();
   }
+  // forget lets go of one card the grid is dropping: the render queued for it is
+  // cancelled (unless another card on screen still wants the same asset) and the
+  // observer releases the node, which it would otherwise hold indefinitely.
+  forget(holder) {
+    this.cancel(holder);
+    if (this.vis) this.vis.unobserve(holder);
+  }
   cancel(holder) {
     const asset = holder._asset;
     const p = asset && this.pending.get(asset.id);
@@ -1080,6 +1173,15 @@ class ModelThumbnails {
   request(holder) {
     const asset = holder._asset;
     if (this.dead) return;
+    // A settled "nothing to draw" outlives the card that learned it. The grid rebuilds
+    // its live window every few dozen rows, and re-asking costs the worker the whole
+    // rig discovery again — up to fourteen model downloads to re-establish that no rig
+    // in this vendor fits.
+    if (this.noRender.has(asset.id)) {
+      holder.classList.remove('loading');
+      this.vis.unobserve(holder);
+      return;
+    }
     const cached = this.cache.get(asset.id);
     if (cached) { this.touch(asset.id); this.swap(holder, cached); return; }
     holder.classList.add('loading');
@@ -1140,6 +1242,10 @@ class ModelThumbnails {
         if (holder.isConnected) this.swap(holder, url);
       }
     } else {
+      this.noRender.add(id);
+      while (this.noRender.size > NO_RENDER_MAX) {
+        this.noRender.delete(this.noRender.values().next().value);
+      }
       for (const holder of p.holders) {
         if (!holder.isConnected) continue;
         holder.classList.remove('loading'); // no render (failed / mesh-less with no rig)
@@ -1372,7 +1478,7 @@ function renderCopies(a) {
     const btn = document.createElement('button');
     btn.className = 'lb-copyicon';
     btn.title = 'copy path';
-    btn.innerHTML = COPY_SVG;
+    btn.appendChild(svgIcon(COPY_SVG));
     btn.addEventListener('click', () => flashCopy(btn, c.copyPath));
     row.append(label, code, btn);
     lb.copies.appendChild(row);
@@ -1387,6 +1493,7 @@ function renderCopies(a) {
 // append one asset's companions under the next asset's heading.
 async function renderLbRelated(a, gen) {
   const box = lb.related;
+  forgetThumbs(box);
   box.replaceChildren();
   box.hidden = true;
   if (!tagState.enabled || !hasFingerprints(a)) return;
@@ -1433,6 +1540,10 @@ function closeLightbox() {
   // over the grid with nothing to dismiss it but a stray click.
   closeTagMenu();
   if (activeViewer) { activeViewer.stop(); activeViewer = null; }
+  // The related strip and the character picker register thumbnails with the same two
+  // observers the grid uses, and both hold their targets: arrowing through a linked
+  // set would otherwise strand one strip's worth of nodes per step.
+  forgetThumbs(lb.root);
   lb.view.replaceChildren();
   lb.character.replaceChildren();
   lb.related.replaceChildren();
@@ -1502,7 +1613,7 @@ const syncGridWindow = (force) => {
 addEventListener('scroll', () => syncGridWindow(false), { passive: true });
 // A resize changes the column count and the row height, so the cached geometry is
 // stale and the spacers have to be remeasured outright. Coalesced like scroll: dragging
-// a window edge emits a continuous stream of these, and each one rebuilds every card.
+// a window edge emits a continuous stream of these, and each one forces a layout read.
 addEventListener('resize', () => {
   gridWindow.geom = null;
   syncGridWindow(true);

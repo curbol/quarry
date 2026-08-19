@@ -100,14 +100,14 @@ async function buildStandalone(asset) {
   const obj = await loadModel(contentURL(asset.id), asset.ext);
   const rootRest = captureRootRest(obj);
   if (isRenderable(obj)) {
-    const cs = clipsForAsset(obj, asset);
+    const cs = clipsForAsset(obj.animations, asset);
     const refBox = prepareClipRig(obj, null);
     if (cs.length) poseAt(obj, stripRootMotion(cs[0], rootBoneName(obj), obj.userData.upAxis));
     snap(obj, refBox);
     dispose(obj);
     return true;
   }
-  const clips = clipsForAsset(obj, asset);
+  const clips = clipsForAsset(obj.animations, asset);
   dispose(obj);
   return clips.length ? await buildPosed(clips[0], asset, rootRest) : false;
 }
@@ -122,13 +122,13 @@ async function buildShared(asset, key) {
   const ctx = await pending;
   if (!ctx) return false;
   if (ctx.renderable) {
-    const cs = clipsForAsset(ctx.obj, asset);
+    const cs = clipsForAsset(ctx.obj.animations, asset);
     const mixer = cs.length ? poseAt(ctx.obj, stripRootMotion(cs[0], ctx.rootBoneName, ctx.upAxis)) : null;
     snap(ctx.obj, ctx.refBox);
     if (mixer) mixer.stopAllAction();
     return true;
   }
-  const cs = clipsForAsset(ctx.obj, asset);
+  const cs = clipsForAsset(ctx.obj.animations, asset);
   return cs.length ? await buildPosed(cs[0], asset, ctx.rootRest) : false;
 }
 
@@ -206,8 +206,8 @@ async function buildPosed(clip, asset, rootRest) {
 // during decode, so the full-resolution bitmap is never resident on the main thread —
 // which is the whole point, since a 4096² texture atlas is ~67MB decoded and a page of
 // them is measured in gigabytes.
-async function downscale(asset) {
-  const res = await fetch(contentURL(asset.id));
+async function downscale(asset, signal) {
+  const res = await fetch(contentURL(asset.id), { signal });
   if (!res.ok) throw new Error('HTTP ' + res.status);
   const src = await createImageBitmap(await res.blob(), { resizeWidth: SIZE, resizeQuality: 'medium' });
   // Its own canvas, not the shared 3D one: this runs off the queue, so drawing onto
@@ -232,10 +232,13 @@ const jobs = new JobTracker();
 // for the rest of the session. Giving up draws the category icon instead.
 const JOB_TIMEOUT_MS = 30_000;
 
-function withTimeout(promise) {
+function withTimeout(promise, onExpire) {
   let timer;
   const deadline = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new Error('thumbnail timed out')), JOB_TIMEOUT_MS);
+    timer = setTimeout(() => {
+      if (onExpire) onExpire();
+      reject(new Error('thumbnail timed out'));
+    }, JOB_TIMEOUT_MS);
   });
   return Promise.race([promise, deadline]).finally(() => clearTimeout(timer));
 }
@@ -256,7 +259,11 @@ self.onmessage = (e) => {
   // serialize, and making them wait behind a 65MB model parse is what a grid of
   // textures would spend all its time doing.
   if (asset.thumb === 'image') {
-    downscale(asset)
+    // Off the queue, but not off the deadline. A fetch that never settles posts
+    // nothing at all — not even the null — so the card keeps its spinner and the main
+    // thread's pending entry is never cleared for a later holder to re-ask.
+    const ac = new AbortController();
+    withTimeout(downscale(asset, ac.signal), () => ac.abort())
       .then((blob) => { if (current()) self.postMessage({ id, seq, blob }); })
       .catch(() => { if (current()) self.postMessage({ id, seq, blob: null }); });
     return;

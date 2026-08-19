@@ -66,9 +66,11 @@ packages, each with a package doc comment stating its contract:
   bytes and thumbnails (three.js 3D previews, copy-path). Its frontend is plain ES
   modules under `assets/`, no build step: `app.js` is the page (grid, search, filters,
   tagging), `viewer.js` the lightbox's 3D preview and the only three.js consumer on the
-  page, `scene.js` the model/clip helpers it shares with `thumbworker.js`, and
-  `gridwindow.js` / `jobtracker.js` / `rigmatch.js` the pure decisions the Node tests
-  cover — the last of these THREE-free precisely so it can be. `includeRelated=1` folds
+  page, `thumbs.js` the three caches a scroll has to keep bounded (rendered thumbnails,
+  registered fonts, deferred per-card work), `scene.js` the model/clip helpers the page
+  shares with `thumbworker.js`, and `gridwindow.js` / `jobtracker.js` / `rigmatch.js`
+  the pure decisions the Node tests cover — the last of these THREE-free precisely so
+  it can be. `includeRelated=1` folds
   each tag match's linked companions into results; `/api/link` and `/api/related`
   write and resolve links. It also pairs each in-place animation with its root-motion
   (`_RM`) sibling (`pairing.go`): the in-place card carries `rootMotionId` and the RM

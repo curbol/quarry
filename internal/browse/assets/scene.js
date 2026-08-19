@@ -235,9 +235,24 @@ function isRenderable(object) {
 // so a mesh-less clip posed on a body from a different file can be corrected regardless of
 // what the character is doing (see uprightRig).
 function captureRootRest(obj) {
-  let rr = null;
-  obj.traverse((n) => { if (n.isBone && !rr && (!n.parent || !n.parent.isBone)) rr = n.quaternion.clone(); });
-  return rr;
+  const b = rootBone(obj);
+  return b ? b.quaternion.clone() : null;
+}
+
+// rootBone returns the first bone with no bone above it — the top of the skeleton, in
+// traversal order. Three separate things need it (the rest quaternion above, the name
+// stripRootMotion keys on, the node the lightbox measures from), and each had written
+// the same traversal with the same "first one wins" predicate.
+function rootBone(object) {
+  let found = null;
+  object.traverse((n) => { if (n.isBone && !found && (!n.parent || !n.parent.isBone)) found = n; });
+  return found;
+}
+
+// rootBoneName is rootBone's name, or null when the object has no skeleton.
+function rootBoneName(object) {
+  const b = rootBone(object);
+  return b ? b.name : null;
 }
 
 // uprightRig rotates the whole object so the character stands +Y-up, fixing the axis
@@ -615,4 +630,5 @@ export {
   loadModel, loadSidekick, normalizeClip, boneNames, clipBones, clipsForAsset, loadRMClips, isSynty,
   coversBones, posedBox, frameBox, isRenderable, captureRootRest, uprightRig, prepareClipRig,
   cloneRig, poseAt, retargetedFor, stripRootMotion, dispose, disposeClone, CharRegistry, rigEntry, rigCandidates, CLAY, _posedV,
+  rootBone, rootBoneName,
 };

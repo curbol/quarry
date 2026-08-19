@@ -4,6 +4,7 @@ import {
   contentURL, loadModel, loadSidekick, normalizeClip, clipBones, clipsForAsset, loadRMClips, isSynty,
   coversBones, posedBox, frameBox, isRenderable, captureRootRest, uprightRig,
   prepareClipRig, cloneRig, poseAt, retargetedFor, stripRootMotion, dispose, CharRegistry, rigEntry, rigCandidates, CLAY, _posedV,
+  rootBoneName,
 } from '/static/scene.js';
 
 const PAGE = 200;
@@ -854,12 +855,12 @@ function card(a) {
 }
 
 function thumbContent(a) {
-  if (a.thumb === 'image') {
-    // Downscaled in the worker rather than shown at source resolution. Every image is
-    // ThumbImage regardless of size, and a texture-heavy pack is mostly 2048² and 4096²
-    // atlases: at ~67 MB of decoded bitmap each, one screenful of 4K textures in a
-    // 158px grid is a couple of gigabytes resident. content-visibility does not help,
-    // because the decode is driven by the image loader, not by paint.
+  // Rendered in the worker: models for the obvious reason, and images because every
+  // image is ThumbImage regardless of size — a texture-heavy pack is mostly 2048² and
+  // 4096² atlases, at ~67 MB of decoded bitmap each, so one screenful of 4K textures in
+  // a 158px grid is a couple of gigabytes resident. content-visibility does not help,
+  // because the decode is driven by the image loader rather than by paint.
+  if (a.thumb === 'image' || a.thumb === 'glb' || a.thumb === 'fbx' || a.thumb === 'sidekick') {
     const holder = document.createElement('div');
     holder.className = 'thumb-3d';
     holder.appendChild(iconEl(a.category));
@@ -872,13 +873,6 @@ function thumbContent(a) {
     img.src = thumbURL(a.id);
     img.onerror = () => img.replaceWith(iconEl(a.category));
     return img;
-  }
-  if (a.thumb === 'glb' || a.thumb === 'fbx' || a.thumb === 'sidekick') {
-    const holder = document.createElement('div');
-    holder.className = 'thumb-3d';
-    holder.appendChild(iconEl(a.category));
-    modelThumbs.observe(holder, a);
-    return holder;
   }
   if (a.thumb === 'font') {
     const el = document.createElement('div');
@@ -1680,20 +1674,19 @@ function startViewer(container, asset) {
   };
 
   const buildPlayback = (mixerRoot, cs, charInfo, rootRest, rmCs) => {
-    let rootBoneName = null;
-    mixerRoot.traverse((n) => { if (n.isBone && !rootBoneName && (!n.parent || !n.parent.isBone)) rootBoneName = n.name; });
+    const rootName = rootBoneName(mixerRoot);
     mixerRoot.traverse((o) => { if (o.isMesh) o.castShadow = true; });
     // Correct orientation and measure the framing box first, from the character's constant
     // reference (bind) pose — the shared prepareClipRig, so thumbnail and lightbox stay in
     // lockstep. It records the up axis (for in-place stripping); then the clip plays inside
     // the fixed frame. scale, centering and the ground stay fixed no matter what the clip does.
     const refBox = prepareClipRig(mixerRoot, rootRest);
-    rawClips = cs; playRootName = rootBoneName; playUpAxis = mixerRoot.userData.upAxis;
+    rawClips = cs; playRootName = rootName; playUpAxis = mixerRoot.userData.upAxis;
     const rmClips = rmCs || [];
     // With a paired RM sibling, in-place is the native (non-RM) clips and the travel view is
     // the RM clips — both play on this same skeleton. Without one, fall back to stripping a
     // baked-motion clip in place algorithmically.
-    playInPlace = rmClips.length ? cs : cs.map((c) => stripRootMotion(c, rootBoneName, playUpAxis));
+    playInPlace = rmClips.length ? cs : cs.map((c) => stripRootMotion(c, rootName, playUpAxis));
     playMotion = rmClips.length ? rmClips : cs;
     clips = motionOn ? playMotion : playInPlace;
     moveBtn.hidden = !(rmClips.length || asset.bakedMotion);

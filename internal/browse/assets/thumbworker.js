@@ -31,6 +31,7 @@ import * as THREE from '/static/vendor/three/three.module.min.js';
 import {
   loadModel, loadSidekick, clipsForAsset, prepareClipRig, poseAt, stripRootMotion, isRenderable, isSynty,
   captureRootRest, cloneRig, retargetedFor, dispose, disposeClone, CharRegistry, frameBox, contentURL, clipBones,
+  rootBoneName,
 } from '/static/scene.js';
 
 const SIZE = 220;
@@ -75,12 +76,6 @@ function snap(object, box) {
   frameBox(box, camera, null);
   renderer.render(scene, camera);
   scene.remove(object);
-}
-
-function rootBoneName(root) {
-  let name = null;
-  root.traverse((n) => { if (n.isBone && !name && (!n.parent || !n.parent.isBone)) name = n.name; });
-  return name;
 }
 
 // build renders one thumbnail to the canvas and resolves true, or false when there is

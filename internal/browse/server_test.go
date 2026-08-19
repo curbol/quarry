@@ -398,26 +398,6 @@ func TestEmptyVariantFilter(t *testing.T) {
 	}
 }
 
-func TestPagination(t *testing.T) {
-	srv := testServer(t)
-	r := getAssets(t, srv, "limit=1")
-	// Fail rather than skip: the fixture is built by this test, so "too small" means
-	// the fixture regressed, and a skip would hide that.
-	if r.Total <= 1 {
-		t.Fatalf("fixture has %d assets; pagination needs at least 2", r.Total)
-	}
-	if len(r.Items) != 1 {
-		t.Errorf("limit=1 returned %d items", len(r.Items))
-	}
-	r2 := getAssets(t, srv, "limit=1&offset=1")
-	if r2.Offset != 1 || len(r2.Items) != 1 {
-		t.Errorf("offset page wrong: offset=%d items=%d", r2.Offset, len(r2.Items))
-	}
-	if r.Items[0].ID == r2.Items[0].ID {
-		t.Error("pages returned the same item")
-	}
-}
-
 func idByName(t *testing.T, srv *httptest.Server, name string) string {
 	t.Helper()
 	r := getAssets(t, srv, "q="+name)

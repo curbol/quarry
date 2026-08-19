@@ -32,11 +32,10 @@ func (s *server) paletteLocked() paletteView {
 	return paletteView{Enabled: s.tagsEnabled, Tags: tv}
 }
 
-// resolveTags fills each card's Tags with the union of tag ids over its
-// fingerprints, so a grouped card shows every tag any of its copies carries.
-func (s *server) resolveTags(dtos []assetDTO) {
-	s.tagsMu.RLock()
-	defer s.tagsMu.RUnlock()
+// resolveTagsLocked fills each card's Tags with the union of tag ids over its
+// fingerprints, so a grouped card shows every tag any of its copies carries. The
+// caller must hold the read lock (see decorate).
+func (s *server) resolveTagsLocked(dtos []assetDTO) {
 	for i := range dtos {
 		dtos[i].Tags = s.unionTagsLocked(dtos[i].Fingerprints)
 	}

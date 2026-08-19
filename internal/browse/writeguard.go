@@ -3,8 +3,8 @@ package browse
 import (
 	"encoding/json"
 	"errors"
+	"mime"
 	"net/http"
-	"strings"
 
 	"github.com/curbol/quarry/internal/tagstore"
 )
@@ -110,7 +110,13 @@ const maxTagBodyBytes = 1 << 20
 // forces a CORS preflight that this server does not answer, which is what keeps a
 // drive-by fetch from writing to the committed tag store.
 func decodeJSON(w http.ResponseWriter, r *http.Request, v any) bool {
-	if ct := r.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+	// Parsed rather than prefix-matched: a media type is case-insensitive and its
+	// parameters are not part of it, so "Application/JSON; charset=utf-8" is the same
+	// request an ordinary client sends. This cannot loosen the guard — no spelling of
+	// application/json is a content-type a form or a beacon is allowed to send without
+	// a preflight.
+	ct, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || ct != "application/json" {
 		writeErr(w, http.StatusUnsupportedMediaType, "expected application/json")
 		return false
 	}

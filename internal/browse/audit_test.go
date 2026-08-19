@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -15,29 +16,6 @@ import (
 
 	"github.com/curbol/quarry/internal/tagstore"
 )
-
-// The paging window is request-controlled, so it has to survive values the UI never
-// sends: a negative offset used to slice out of range and take the handler down.
-func TestAssetsPagingClampsOutOfRangeOffsets(t *testing.T) {
-	srv := testServer(t)
-	total := getAssets(t, srv, "").Total
-
-	for _, q := range []string{"offset=-1", "offset=-1000&limit=5", fmt.Sprintf("offset=%d", total+50)} {
-		resp, err := http.Get(srv.URL + "/api/assets?" + q)
-		if err != nil {
-			t.Fatalf("%s: %v", q, err)
-		}
-		body := resp.Body
-		code := resp.StatusCode
-		body.Close()
-		if code != http.StatusOK {
-			t.Errorf("%s: status %d", q, code)
-		}
-	}
-	if got := getAssets(t, srv, "offset=-1&limit=1").Offset; got != 0 {
-		t.Errorf("negative offset resolved to %d, want 0", got)
-	}
-}
 
 // Every tag write goes through one mutex and re-saves the store, so concurrent
 // assignments must all land and the file on disk must match what the server holds.
@@ -78,27 +56,63 @@ func TestConcurrentTagAssignmentsAllPersist(t *testing.T) {
 	}
 }
 
-// The limit is request-controlled too, and unlike the offset it is not clamped into
-// range but replaced with the default. Values the UI never sends still have to come
-// back as a well-formed page.
-func TestAssetsPagingHandlesOutOfRangeLimits(t *testing.T) {
-	srv := testServer(t)
-	total := getAssets(t, srv, "").Total
-	if total == 0 {
-		t.Fatal("fixture library is empty")
-	}
-	for _, q := range []string{"limit=-1", "limit=0", "limit=99999", "limit=abc"} {
-		r := getAssets(t, srv, q)
-		if r.Total != total {
-			t.Errorf("%s: total = %d, want %d", q, r.Total, total)
+// The browser produces reads and writes at once: the grid re-queries while a tag click
+// is still in flight. Only that shape reaches the read path at all — the write-only
+// test above never calls resolveTagsLocked or resolveRelatedLocked, which read the
+// store under a lock decorate takes on their behalf. Under -race this is what would
+// catch a store read that lost its lock, or a card decorated outside decorate.
+func TestConcurrentQueriesAndTagWrites(t *testing.T) {
+	srv, _ := enabledServer(t)
+	fps := []string{"crc32:aa:1", "crc32:bb:2", "crc32:cc:3"}
+
+	post := func(path string, body any) {
+		b, _ := json.Marshal(body)
+		resp, err := http.Post(srv.URL+path, "application/json", bytes.NewReader(b))
+		if err != nil {
+			t.Errorf("%s: %v", path, err)
+			return
 		}
-		if len(r.Items) != total {
-			t.Errorf("%s: got %d items, want the whole %d-asset library on one page", q, len(r.Items), total)
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}
+	// A link group makes resolveRelatedLocked do real work: it short-circuits on a
+	// store with no groups at all, which is every other test here.
+	post("/api/link", map[string]any{"fingerprints": fps[:2], "on": true})
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for n := 0; n < 8; n++ {
+				qs := []string{"", "q=heart", "tag=hero&includeRelated=1", "sort=size"}[(i+n)%4]
+				resp, err := http.Get(srv.URL + "/api/assets?" + qs)
+				if err != nil {
+					t.Errorf("query %q: %v", qs, err)
+					return
+				}
+				var out assetsResp
+				err = json.NewDecoder(resp.Body).Decode(&out)
+				resp.Body.Close()
+				if err != nil {
+					t.Errorf("query %q: %v", qs, err)
+					return
+				}
+			}
+		}(i)
+	}
+	for _, fp := range fps {
+		for _, tag := range []string{"hero", "prop"} {
+			wg.Add(1)
+			go func(fp, tag string) {
+				defer wg.Done()
+				post("/api/assign", map[string]any{"fingerprints": []string{fp}, "tag": tag, "on": true})
+				post("/api/link", map[string]any{"fingerprints": fps, "on": true})
+				post("/api/assign", map[string]any{"fingerprints": []string{fp}, "tag": tag, "on": false})
+			}(fp, tag)
 		}
 	}
-	if got := len(getAssets(t, srv, "limit=1").Items); got != 1 {
-		t.Errorf("limit=1 returned %d items", got)
-	}
+	wg.Wait()
 }
 
 // A patch is two edits — a rename, then a color. Validating the color only when it
@@ -475,6 +489,8 @@ func TestAssetsPagingOverALibraryBiggerThanTheLimits(t *testing.T) {
 		{"zero limit falls back to the default", "&limit=0", 0, defaultLimit},
 		{"non-numeric limit falls back to the default", "&limit=lots", 0, defaultLimit},
 		{"negative offset clamps to the start", "&offset=-5&limit=10", 0, 10},
+		{"a wildly negative offset clamps too", "&offset=-100000&limit=5", 0, 5},
+		{"non-numeric offset falls back to the start", "&offset=nowhere&limit=5", 0, 5},
 		{"offset past the end clamps to the end", fmt.Sprintf("&offset=%d&limit=10", total+50), total, 0},
 		{"last partial page", fmt.Sprintf("&offset=%d&limit=100", total-10), total - 10, 10},
 	} {

@@ -164,6 +164,28 @@ func TestMalformedQueriesDoNotMatchEverything(t *testing.T) {
 			t.Errorf("term-free query %q should be treated as no filter", q)
 		}
 	}
+	// A term the tokenizer produced with nothing in it is the same hazard one branch
+	// further in, and it arrives through two ordinary mid-keystroke states: an
+	// unterminated quote, and a field prefix whose value has not been typed yet. An
+	// empty term is the AND identity, so leaving one in the tree widened the query to
+	// the whole library.
+	for _, q := range []string{`sword OR "`, `sword OR ""`, "sword OR name:", "sword OR -name:", `"axe" OR vendor:`} {
+		if parseQuery(q).match(unrelated) {
+			t.Errorf("query %q matched an unrelated asset", q)
+		}
+	}
+	for _, q := range []string{`sword "`, "sword name:", "sword -name:"} {
+		if !parseQuery(q).match(sword) {
+			t.Errorf("query %q dropped the term it did have", q)
+		}
+	}
+	// An empty term on its own constrains nothing, so it is no filter rather than a
+	// grid that blanks the moment a quote or a colon is typed.
+	for _, q := range []string{`"`, `""`, "name:", "-name:"} {
+		if !parseQuery(q).match(unrelated) {
+			t.Errorf("query %q with only an empty term should be no filter", q)
+		}
+	}
 }
 
 // A stray ")" closes an expression that was never opened. Left in the token stream it

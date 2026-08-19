@@ -128,15 +128,11 @@ type facetValue struct {
 // fingerprint set — to throw them all away is a large transient spike at startup.
 func buildFacets(assets []assetindex.Asset, hidden map[string]bool) facets {
 	byKey := map[string][]int32{}
-	var order []string
 	for i := range assets {
 		if hidden[assets[i].ID] {
 			continue
 		}
 		k := groupKey(assets[i])
-		if _, seen := byKey[k]; !seen {
-			order = append(order, k)
-		}
 		byKey[k] = append(byKey[k], int32(i))
 	}
 	categories, vendors, variants := map[string]int{}, map[string]int{}, map[string]int{}
@@ -146,9 +142,9 @@ func buildFacets(assets []assetindex.Asset, hidden map[string]bool) facets {
 			m[v]++
 		}
 	}
-	for _, k := range order {
+	for _, group := range byKey {
 		cs, vs, vrs := map[string]bool{}, map[string]bool{}, map[string]bool{}
-		for _, i := range byKey[k] {
+		for _, i := range group {
 			a := &assets[i]
 			bump(categories, cs, string(a.Category))
 			bump(vendors, vs, a.Vendor)
@@ -204,11 +200,6 @@ func sortItems(items []assetDTO, mode string) {
 	}
 }
 
-// groupNameKey folds file names that differ only by separators/case, so the same
-// file collapses even when a variant renamed it. Synty's Unity export inserts an
-// underscore before a trailing number (SPR_..._Gem09.png -> ..._Gem_09.png), which
-// otherwise leaves the identical sprite showing as two cards. Pairing this with the
-// byte size in the group key keeps genuinely different files apart.
 // groupKey is the identity a result card is grouped on: same normalized name, same
 // size. Shared with the facet counts so the two cannot disagree about what one card
 // is — a divergence there advertises a total no filter can reach.
@@ -216,6 +207,11 @@ func groupKey(a assetindex.Asset) string {
 	return groupNameKey(a.Name) + "\x00" + strconv.FormatInt(a.Size, 10)
 }
 
+// groupNameKey folds file names that differ only by separators/case, so the same
+// file collapses even when a variant renamed it. Synty's Unity export inserts an
+// underscore before a trailing number (SPR_..._Gem09.png -> ..._Gem_09.png), which
+// otherwise leaves the identical sprite showing as two cards. Pairing this with the
+// byte size in the group key keeps genuinely different files apart.
 func groupNameKey(name string) string {
 	var b strings.Builder
 	for _, r := range strings.ToLower(name) {

@@ -98,9 +98,6 @@ func (n orNode) eval(a assetindex.Asset) bool {
 func (n notNode) eval(a assetindex.Asset) bool { return !n.kid.eval(a) }
 
 func (n termNode) eval(a assetindex.Asset) bool {
-	if n.value == "" {
-		return true
-	}
 	if n.field == "" {
 		return strings.Contains(strings.ToLower(a.Name), n.value) ||
 			strings.Contains(strings.ToLower(a.Pack), n.value) ||
@@ -333,6 +330,13 @@ func (p *parser) parsePrimary() searchNode {
 	}
 	if t.kind == tokRParen {
 		return nil // unbalanced close; nothing to match on
+	}
+	if t.value == "" {
+		// A term with nothing in it constrains nothing, and a node here would be the
+		// AND identity — so `sword OR "` and `sword OR vendor:` would each widen to the
+		// whole library on the way to being typed. An unterminated quote and a bare
+		// field prefix are both ordinary states of a query mid-keystroke.
+		return nil
 	}
 	var node searchNode = termNode{field: t.field, value: t.value}
 	if t.neg {

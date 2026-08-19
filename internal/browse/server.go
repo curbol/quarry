@@ -392,8 +392,14 @@ func (s *server) decorate(cards []assetDTO) {
 			d.BakedMotion = true
 		}
 	}
-	s.resolveTags(cards)
-	s.resolveRelated(cards)
+	// Both store passes under one acquisition. Taken separately, a tag write landing
+	// between them gives a card its tags from one state and its companions from the
+	// next; and Go's RWMutex queues a new reader behind a waiting writer, so the second
+	// acquisition is a second chance for a whole-library query to stall on one.
+	s.tagsMu.RLock()
+	defer s.tagsMu.RUnlock()
+	s.resolveTagsLocked(cards)
+	s.resolveRelatedLocked(cards)
 }
 
 func (s *server) handleContent(w http.ResponseWriter, r *http.Request) {
@@ -419,7 +425,8 @@ func (s *server) handleContent(w http.ResponseWriter, r *http.Request) {
 	defer rc.Close()
 	w.Header().Set("Content-Type", contentType(a.Ext))
 	w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
-	io.Copy(w, rc)
+	n, err := io.Copy(w, rc)
+	logShortBody(r, a, n, err)
 }
 
 func (s *server) handleThumb(w http.ResponseWriter, r *http.Request) {
@@ -444,7 +451,20 @@ func (s *server) handleThumb(w http.ResponseWriter, r *http.Request) {
 	defer rc.Close()
 	w.Header().Set("Content-Type", "image/png")
 	w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
-	io.Copy(w, rc)
+	n, err := io.Copy(w, rc)
+	logShortBody(r, a, n, err)
+}
+
+// logShortBody reports a body that stopped early. The Content-Length is already sent
+// by then, so the client sees a network error and nothing else would say why — the
+// same silence the Open failures above are logged to avoid. A client that navigated
+// away mid-download is the ordinary case and says nothing: it cancels the request
+// context, and a scrolling grid does it constantly.
+func logShortBody(r *http.Request, a assetindex.Asset, n int64, err error) {
+	if err == nil || r.Context().Err() != nil {
+		return
+	}
+	log.Printf("serve %s: stopped after %d bytes: %v", a.RelPath, n, err)
 }
 
 // contentType maps an extension to a response type. Model formats are served as

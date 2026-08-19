@@ -14,11 +14,10 @@ import (
 // still apply; /api/related resolves a fingerprint set's companions to whole cards for
 // the lightbox strip.
 
-// resolveRelated fills each card's Related with the union of link-related
-// fingerprints over its own fingerprints, minus its own set.
-func (s *server) resolveRelated(dtos []assetDTO) {
-	s.tagsMu.RLock()
-	defer s.tagsMu.RUnlock()
+// resolveRelatedLocked fills each card's Related with the union of link-related
+// fingerprints over its own fingerprints, minus its own set. The caller must hold the
+// read lock (see decorate).
+func (s *server) resolveRelatedLocked(dtos []assetDTO) {
 	// With no links at all there is nothing any card could relate to, and the loop
 	// below would allocate two maps per card across the whole result set to prove it.
 	if !s.store.HasGroups() {

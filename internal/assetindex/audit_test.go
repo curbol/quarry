@@ -52,7 +52,7 @@ func cacheFileFor(t *testing.T, cacheDir, root string) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return filepath.Join(stateDir(cacheDir, abs), "index.json")
+	return cacheFile(cacheDir, abs)
 }
 
 // A personal library is big and accumulates the odd partial copy. One unreadable
@@ -1341,5 +1341,226 @@ func TestSidekickPartIDsResolveAfterDedup(t *testing.T) {
 		if _, ok := ix.Lookup(pid); !ok {
 			t.Errorf("part id %s does not resolve through Lookup; dedup suppressed a mesh the character serves", pid)
 		}
+	}
+}
+
+// A Sidekick package extracted beside itself is an ordinary layout, and the .sk goes
+// out with the rest of the tree. Dedup keys an archive entry on its pathname and size,
+// neither of which assembly moves — so without a guard the loose twin wins and the
+// character the pack exists for disappears, along with the byproducts assembly already
+// dropped in its favour. The twin left behind is a plain data row: no parts, no
+// thumbnail, nothing to preview.
+func TestAssembledCharacterSurvivesItsLooseTwin(t *testing.T) {
+	root, mk := libRoot(t)
+	sk := "Name: Hero\nParts:\n- Name: SK_HEAD\n"
+	writeUnityPackage(t, mk("synty", "SIDEKICK_D", "SIDEKICK_D_Unity_v1.unitypackage"), []unityGUID{
+		{guid: "sk1", pathname: "Assets/S/Characters/Hero.sk", asset: sk},
+		{guid: "hd1", pathname: "Assets/S/Resources/SK_HEAD.fbx", asset: "HEADFBX"},
+	})
+	writeFile(t, mk("synty", "SIDEKICK_D", "Assets", "S", "Resources", "SK_HEAD.fbx"), "HEADFBX")
+	writeFile(t, mk("synty", "SIDEKICK_D", "Assets", "S", "Characters", "Hero.sk"), sk)
+
+	ix, err := Build(Options{Root: root, CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parts []string
+	for i := range ix.Assets {
+		if ix.Assets[i].Thumb == ThumbSidekick {
+			parts = ix.Assets[i].Source.Parts
+		}
+	}
+	if len(parts) != 1 {
+		t.Fatalf("assembled character has %d parts, want 1; dedup dropped it for the loose .sk", len(parts))
+	}
+	if _, ok := ix.Lookup(parts[0]); !ok {
+		t.Errorf("part id %s does not resolve", parts[0])
+	}
+}
+
+// --follow-symlinks widens the library to every target the walk followed, and Open
+// serves from those as readily as from the root. The cache dir has to be outside all
+// of them: inside one, the run writes its index and every unpacked archive into a tree
+// the next run walks and this run prunes.
+func TestCacheDirInsideAFollowedLinkTargetIsRefused(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "lib")
+	outside := filepath.Join(base, "drive2")
+	writeFile(t, filepath.Join(outside, "Vendor", "Pack", "a.fbx"), "FBX")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "drive2")); err != nil {
+		t.Fatal(err)
+	}
+	opt := Options{Root: root, CacheDir: filepath.Join(outside, "quarry-cache"), FollowSymlinks: true}
+	if _, err := LoadOrBuild(opt, true, func(string) {}); err == nil {
+		t.Fatal("a cache dir inside a followed symlink target was accepted")
+	}
+	// Not followed, the target is not part of the library and the cache dir is fine.
+	opt.FollowSymlinks = false
+	if _, err := LoadOrBuild(opt, true, func(string) {}); err != nil {
+		t.Errorf("unfollowed, the same cache dir is outside the library: %v", err)
+	}
+}
+
+// refresh keeps the assets of an archive whose second enumeration pass failed while
+// declining to cache its stat print, so the print is what the index will *reuse* and
+// not what it *references*. A prune keyed on the print alone deletes the extraction
+// those assets are served from.
+func TestPruneKeepsAnExtractionTheIndexStillReferences(t *testing.T) {
+	root, mk := libRoot(t)
+	pkg := mk("v", "Pack", "Pack.unitypackage")
+	writeUnityPackage(t, pkg, []unityGUID{
+		{guid: "aaa", pathname: "Assets/M/thing.fbx", asset: "FBXBYTES"},
+	})
+	ix, err := Build(Options{Root: root, CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir, err := ix.ensureExtracted(pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The state a degraded pass leaves behind: assets kept, print dropped.
+	delete(ix.ArchivePrint, pkg)
+	if err := ix.PruneUnpacked(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("prune removed the extraction of an archive the index serves %d assets from: %v", len(ix.Assets), err)
+	}
+}
+
+// An archive written with "./"-prefixed entries indexes (skipEntry tolerates the
+// segment) and displays cleaned, so its dedup key has to be cleaned too — otherwise
+// the entry and its extracted twin key differently and the library shows two cards for
+// one file, differing only by a segment neither side displays.
+func TestDotSegmentedEntriesDedupAgainstTheirTwin(t *testing.T) {
+	for _, prefix := range []string{"", "./"} {
+		t.Run("prefix"+prefix, func(t *testing.T) {
+			root, mk := libRoot(t)
+			writeUnityPackage(t, mk("v", "P", "P.unitypackage"), []unityGUID{
+				{guid: "g1", pathname: prefix + "Models/Heart.fbx", asset: "HEARTBYTES"},
+			})
+			writeFile(t, mk("v", "P", "Models", "Heart.fbx"), "HEARTBYTES")
+			ix, err := Build(Options{Root: root, CacheDir: t.TempDir()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(ix.Assets) != 1 {
+				t.Fatalf("kept %d assets, want the archive entry deduped against its loose twin", len(ix.Assets))
+			}
+			if ix.Assets[0].Source.Kind != SourceLoose {
+				t.Errorf("survivor is %s, want the loose twin", ix.Assets[0].Source.Kind)
+			}
+		})
+	}
+}
+
+// An extraction is published by a rename, which survives a crashing process but not a
+// crashing machine. Nothing revalidates a published one — the fast path is a stat of a
+// directory named for a fingerprint that does not move — so a short member would be
+// served as the asset forever. The size the scan read is the authority.
+func TestATruncatedExtractedMemberIsRebuilt(t *testing.T) {
+	root, mk := libRoot(t)
+	pkg := mk("v", "Pack", "Pack.unitypackage")
+	writeUnityPackage(t, pkg, []unityGUID{
+		{guid: "aaa", pathname: "Assets/M/thing.fbx", asset: "FBXBYTES"},
+	})
+	ix, err := Build(Options{Root: root, CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := ix.Assets[0]
+	rc, _, err := ix.Open(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc.Close()
+
+	dir, err := ix.ensureExtracted(pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	member := filepath.Join(dir, "aaa", "asset")
+	if err := os.WriteFile(member, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rc, n, err := ix.Open(a)
+	if err != nil {
+		t.Fatalf("opening an asset whose extracted member came back short: %v", err)
+	}
+	defer rc.Close()
+	b, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != a.Size || string(b) != "FBXBYTES" {
+		t.Errorf("served %d bytes %q, want %d bytes FBXBYTES", n, b, a.Size)
+	}
+}
+
+// The zip reader cache publishes a slot under the mutex and then opens it with the
+// mutex released, so waiters attach to an open already in flight, an eviction can land
+// while one is under way, and a failed open has to unpublish before the next caller
+// retries. Sequentially none of those overlap.
+func TestConcurrentZipReads(t *testing.T) {
+	root, mk := libRoot(t)
+	const archives = zipCacheSize * 3
+	for i := range archives {
+		writeZip(t, mk("v", "Pack", fmt.Sprintf("Pack_A%02d_v1.zip", i)),
+			map[string]string{"Heart.fbx": fmt.Sprintf("BYTES%02d", i)})
+	}
+	// A truncated archive so the unpublish-on-failure path runs alongside the rest.
+	writeFile(t, mk("v", "Pack", "Pack_Broken_v1.zip"), "PK\x03\x04 not really a zip")
+
+	ix, err := Build(Options{Root: root, CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ix.Assets) != archives {
+		t.Fatalf("indexed %d assets, want %d", len(ix.Assets), archives)
+	}
+	broken := Asset{Source: Source{Kind: SourceZip, ArchivePath: mk("v", "Pack", "Pack_Broken_v1.zip"), Entry: "Heart.fbx"}}
+
+	var wg sync.WaitGroup
+	errs := make(chan error, archives*8)
+	for range 4 {
+		for i := range archives {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				rc, _, err := ix.Open(ix.Assets[i])
+				if err != nil {
+					errs <- fmt.Errorf("open %s: %w", ix.Assets[i].Name, err)
+					return
+				}
+				defer rc.Close()
+				b, err := io.ReadAll(rc)
+				if err != nil {
+					errs <- err
+					return
+				}
+				if want := ix.Assets[i].Fingerprint; want == "" {
+					errs <- fmt.Errorf("asset %d has no fingerprint", i)
+				} else if len(b) != int(ix.Assets[i].Size) {
+					errs <- fmt.Errorf("read %d bytes, want %d", len(b), ix.Assets[i].Size)
+				}
+			}()
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if rc, _, err := ix.Open(broken); err == nil {
+					rc.Close()
+					errs <- errors.New("a truncated archive opened")
+				}
+			}()
+		}
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
 	}
 }

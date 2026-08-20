@@ -60,12 +60,13 @@ func psdHeader(w, h int) []byte {
 }
 
 // bmpHeader builds a BMP header (BITMAPINFOHEADER) with w,h at the fixed
-// little-endian offsets.
+// little-endian offsets. A negative h is written as the two's-complement a top-down
+// BMP actually carries.
 func bmpHeader(w, h int) []byte {
 	b := make([]byte, 26)
 	copy(b, "BM")
-	binary.LittleEndian.PutUint32(b[18:], uint32(w))
-	binary.LittleEndian.PutUint32(b[22:], uint32(h))
+	binary.LittleEndian.PutUint32(b[18:], uint32(int32(w)))
+	binary.LittleEndian.PutUint32(b[22:], uint32(int32(h)))
 	return b
 }
 
@@ -83,6 +84,10 @@ func TestImageDims(t *testing.T) {
 		{"tga", tgaHeader(6, 8), "tga", 6, 8},
 		{"psd", psdHeader(6, 8), "psd", 6, 8},
 		{"bmp", bmpHeader(6, 8), "bmp", 6, 8},
+		// A top-down BMP stores its height negative: the sign is row order, not a
+		// dimension. Without this row, dropping the abs leaves the suite green and every
+		// such file reports a height near 4.29e9, straight into the index and the cache.
+		{"top-down bmp", bmpHeader(6, -8), "bmp", 6, 8},
 		{"non-image ext", encodePNG(t, 3, 7), "fbx", 0, 0},
 		{"svg has no raster dims", []byte(`<svg width="10"/>`), "svg", 0, 0},
 		{"garbage png bytes", []byte("not a png"), "png", 0, 0},

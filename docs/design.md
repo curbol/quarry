@@ -65,7 +65,9 @@ delete the other root's extractions — including out from under a server still 
 Where the state lives is derived inside `assetindex` from the options, so no caller can pair
 one root's index with another's path. The cache dir may not sit inside the scan root: the
 tree quarry promises not to write to is not somewhere to put the index and every unpacked
-archive, and the next run would index its own output.
+archive, and the next run would index its own output. Under `--follow-symlinks` the library
+is the root *and* every target the walk followed, so the same refusal applies to those —
+checked after the walk, since that is when they are known.
 
 Reuse is keyed on a file's stat print alone, never on whether it left assets behind — an
 archive whose every entry is deduped away by an extracted twin contributes nothing, and

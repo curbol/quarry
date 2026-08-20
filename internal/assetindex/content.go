@@ -40,13 +40,63 @@ func (ix *Index) Open(a Asset) (io.ReadCloser, int64, error) {
 		if !ix.underRoot(a.Source.ArchivePath) {
 			return nil, 0, ErrOutsideRoot
 		}
-		p, err := ix.unpackedEntry(a, "asset")
-		if err != nil {
-			return nil, 0, err
-		}
-		return openFile(p)
+		return ix.openUnpacked(a, "asset", a.Size)
 	}
 	return nil, 0, errors.New("unknown source kind")
+}
+
+// openUnpacked serves one extracted unitypackage member, rebuilding the extraction
+// once if what is on disk is not the size the scan read out of the archive.
+//
+// An extraction is published by renaming a staged tree into place, which survives a
+// crashing process but not a crashing machine: the rename can reach the journal with
+// the data blocks still unwritten, and the members come back short. Nothing else would
+// notice — the fast path is a stat of the directory, and the directory is named for
+// the archive's fingerprint, which does not move for a file whose bytes did not change
+// — so a pack torn that way would serve empty models until the cache dir was deleted
+// by hand. Not even --reindex clears it.
+//
+// The check is a stat openFile already does. Fsyncing every member at extraction time
+// would close the same hole, but a Synty package holds tens of thousands of them and
+// the extraction is on the path a user is waiting on.
+//
+// want is the size the scan recorded; -1 for a member the index does not size.
+func (ix *Index) openUnpacked(a Asset, member string, want int64) (io.ReadCloser, int64, error) {
+	p, err := ix.unpackedEntry(a, member)
+	if err != nil {
+		return nil, 0, err
+	}
+	rc, n, err := openFile(p)
+	// Only a member that opened and disagreed is evidence of a torn tree. A missing one
+	// is an ordinary miss — a guid this package does not hold — and re-extracting
+	// hundreds of MB to confirm that would be its own bug.
+	if err != nil || want < 0 || n == want {
+		return rc, n, err
+	}
+	rc.Close()
+	if err := ix.discardExtraction(a.Source.ArchivePath); err != nil {
+		return nil, 0, err
+	}
+	if p, err = ix.unpackedEntry(a, member); err != nil {
+		return nil, 0, err
+	}
+	rc, n, err = openFile(p)
+	if err == nil && n != want {
+		rc.Close()
+		return nil, 0, fmt.Errorf("extracted %s is %d bytes, want %d", a.RelPath, n, want)
+	}
+	return rc, n, err
+}
+
+// discardExtraction removes a published extraction so the next request rebuilds it.
+// ensureExtracted clears its single-flight entry after every call precisely so a dest
+// that disappears is extracted again rather than reported present by a spent Once.
+func (ix *Index) discardExtraction(archivePath string) error {
+	fp, err := fingerprint(archivePath)
+	if err != nil {
+		return err
+	}
+	return os.RemoveAll(filepath.Join(ix.unpackedDir(), fp))
 }
 
 // unpackedEntry is where one extracted unitypackage member sits, with the guid
@@ -73,11 +123,9 @@ func (ix *Index) OpenThumbnail(a Asset) (io.ReadCloser, int64, error) {
 	if !ix.underRoot(a.Source.ArchivePath) {
 		return nil, 0, ErrOutsideRoot
 	}
-	p, err := ix.unpackedEntry(a, "preview.png")
-	if err != nil {
-		return nil, 0, err
-	}
-	return openFile(p)
+	// A preview's size is not indexed — nothing reads it during enumeration — so there
+	// is nothing to check it against.
+	return ix.openUnpacked(a, "preview.png", -1)
 }
 
 func openFile(p string) (io.ReadCloser, int64, error) {
@@ -209,9 +257,26 @@ func (ix *Index) PruneUnpacked() error {
 	if err != nil {
 		return err
 	}
+	// Keyed on what the index references, not on what it is willing to reuse. A
+	// refresh whose second pass over an archive failed drops it from ArchivePrint while
+	// keeping the assets its first pass produced, so a keep-set built from the print
+	// alone deletes the extraction those assets are served from — re-decompressing the
+	// package on every run, and, with a second quarry sharing this cache dir, deleting
+	// it out from under one already serving it.
 	live := make(map[string]bool, len(ix.ArchivePrint))
 	for _, fp := range ix.ArchivePrint {
 		live[fp] = true
+	}
+	referenced := map[string]bool{}
+	for i := range ix.Assets {
+		p := ix.Assets[i].Source.ArchivePath
+		if ix.Assets[i].Source.Kind != SourceUnityPackage || p == "" || referenced[p] {
+			continue
+		}
+		referenced[p] = true
+		if fp, err := fingerprint(p); err == nil {
+			live[fp] = true
+		}
 	}
 	for _, e := range entries {
 		if !e.IsDir() || live[e.Name()] {

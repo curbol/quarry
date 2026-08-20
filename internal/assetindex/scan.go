@@ -486,6 +486,14 @@ func dedup(assets []Asset) (kept, dropped []Asset) {
 			kept = append(kept, a)
 			continue
 		}
+		// An assembled character is no longer the file its loose twin is: this entry was
+		// upgraded into a card with parts, a name, and a thumbnail the plain .sk beside it
+		// never gets, and the byproducts that would otherwise stand in for it were dropped
+		// in its favour. Deduping it away loses the character outright.
+		if len(a.Source.Parts) > 0 {
+			kept = append(kept, a)
+			continue
+		}
 		if _, twinned := looseKeys[archiveDedupKey(a)]; !twinned {
 			kept = append(kept, a)
 			continue
@@ -524,6 +532,11 @@ func packSubpath(relPath, vendor, pack string) string {
 	return strings.TrimPrefix(relPath, prefix)
 }
 
+// archiveDedupKey cleans the entry path so it normalises the way archiveRel already
+// normalises RelPath. An archive written with "./" -prefixed entries is indexed
+// (skipEntry tolerates a "." segment), and without this its entries key on a path no
+// extracted twin can ever produce — two cards for one file, differing only by a
+// segment neither side displays.
 func archiveDedupKey(a Asset) string {
-	return dedupKey(a.Vendor, a.Pack, a.Source.EntryPath(), a.Size)
+	return dedupKey(a.Vendor, a.Pack, path.Clean(a.Source.EntryPath()), a.Size)
 }

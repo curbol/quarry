@@ -108,19 +108,24 @@ func TestSidekickPrefersThePartsTreeMesh(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Collected rather than asserted in place: the preference only matters once a
+	// character assembles, so a scan that upgraded nothing would otherwise run the body
+	// zero times and pass — which is the regression this exists to catch.
+	var parts []string
 	for i := range ix.Assets {
-		if ix.Assets[i].Thumb != ThumbSidekick {
-			continue
+		if ix.Assets[i].Thumb == ThumbSidekick {
+			parts = ix.Assets[i].Source.Parts
 		}
-		for _, pid := range ix.Assets[i].Source.Parts {
-			part, ok := ix.Lookup(pid)
-			if !ok {
-				t.Fatalf("part id %s does not resolve", pid)
-			}
-			if !strings.Contains(part.Source.Pathname, "/Resources/") {
-				t.Errorf("part resolved to %s, want the mesh under Resources/", part.Source.Pathname)
-			}
-		}
+	}
+	if len(parts) != 1 {
+		t.Fatalf("character assembled with %d parts, want 1", len(parts))
+	}
+	part, ok := ix.Lookup(parts[0])
+	if !ok {
+		t.Fatalf("part id %s does not resolve", parts[0])
+	}
+	if !strings.Contains(part.Source.Pathname, "/Resources/") {
+		t.Errorf("part resolved to %s, want the mesh under Resources/", part.Source.Pathname)
 	}
 }
 

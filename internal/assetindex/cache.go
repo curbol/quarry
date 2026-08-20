@@ -117,6 +117,25 @@ func checkCacheDir(root, cacheDir string) error {
 	return fmt.Errorf("cache dir %s is inside the scan root %s; pick one outside it with --cache", cacheDir, root)
 }
 
+// checkCacheDirLinks applies the same rule to the symlink targets a walk followed.
+// checkCacheDir runs before the walk, when the root is the only part of the library
+// anyone knows about; --follow-symlinks widens the library to these targets, which
+// Open serves from as readily as the root, so containment has to be asked again once
+// they are known. Without it a cache dir on the far side of a link is written to, then
+// walked and indexed by the next run, then swept by PruneUnpacked.
+func checkCacheDirLinks(cacheDir string, linkRoots []string) error {
+	if cacheDir == "" {
+		return nil
+	}
+	rc := resolve(cacheDir)
+	for _, lr := range linkRoots {
+		if contains(resolve(lr), rc) {
+			return fmt.Errorf("cache dir %s is inside %s, a directory this scan follows a symlink into; pick one outside the library with --cache", cacheDir, lr)
+		}
+	}
+	return nil
+}
+
 // Build scans a library from scratch into a fresh index. It is Refresh over an
 // empty index: with nothing cached to reuse, every entry takes the re-derive path.
 func Build(opt Options) (*Index, error) {
@@ -158,29 +177,40 @@ func (ix *Index) refresh() error {
 		return err
 	}
 	ix.LinkRoots = linkRoots
-	// Positions, not values: an Asset is ~20 strings, so mapping the whole set by value
-	// would hold a second copy of a 150k-asset library alongside the one being rebuilt.
-	// Indexed over the survivors and the suppressed together, so an archive's cached
-	// enumeration is reused whole and dedup gets the same full set to decide over
-	// that a fresh scan would.
-	prev := make([]Asset, 0, len(ix.Assets)+len(ix.Suppressed))
-	prev = append(prev, ix.Assets...)
-	prev = append(prev, ix.Suppressed...)
+	if err := checkCacheDirLinks(ix.cacheDir, linkRoots); err != nil {
+		return err
+	}
+	// Positions, not values: an Asset is ~350 bytes, so both mapping the previous set
+	// and flattening it would hold a second copy of a 150k-asset library alongside the
+	// one being rebuilt. The survivors and the suppressed are addressed as one space so
+	// an archive's cached enumeration is reused whole and dedup gets the same full set
+	// to decide over that a fresh scan would.
+	nKept := len(ix.Assets)
+	prevAt := func(i int) Asset {
+		if i < nKept {
+			return ix.Assets[i]
+		}
+		return ix.Suppressed[i-nKept]
+	}
 	oldByArchive := map[string][]int{}
 	oldByLoose := map[string][]int{}
-	for i, a := range prev {
-		if a.Source.Kind == SourceLoose {
-			oldByLoose[a.Source.FilePath] = append(oldByLoose[a.Source.FilePath], i)
-		} else {
-			oldByArchive[a.Source.ArchivePath] = append(oldByArchive[a.Source.ArchivePath], i)
+	indexPrev := func(base int, set []Asset) {
+		for i := range set {
+			if set[i].Source.Kind == SourceLoose {
+				oldByLoose[set[i].Source.FilePath] = append(oldByLoose[set[i].Source.FilePath], base+i)
+			} else {
+				oldByArchive[set[i].Source.ArchivePath] = append(oldByArchive[set[i].Source.ArchivePath], base+i)
+			}
 		}
 	}
+	indexPrev(0, ix.Assets)
+	indexPrev(nKept, ix.Suppressed)
 	newPrint := map[string]string{}
 	newLoose := map[string]string{}
 	var assets []Asset
 	reuse := func(idx []int) {
 		for _, i := range idx {
-			assets = append(assets, prev[i])
+			assets = append(assets, prevAt(i))
 		}
 	}
 	for _, e := range entries {
@@ -294,14 +324,19 @@ func stateDir(cacheDir, absRoot string) string {
 
 func (ix *Index) stateDir() string { return stateDir(ix.cacheDir, ix.Root) }
 
-// cachePath is where this index's JSON lives. Empty when the index has no cache dir,
-// which is also the state in which nothing is written.
-func (ix *Index) cachePath() string {
-	if ix.cacheDir == "" {
+// cacheFile is where one library's index JSON lives. Empty when there is no cache
+// dir, which is also the state in which nothing is written. It takes the two values
+// rather than an index because LoadOrBuild needs the path before it has one, and the
+// layout is worth keeping a single decision.
+func cacheFile(cacheDir, absRoot string) string {
+	if cacheDir == "" {
 		return ""
 	}
-	return filepath.Join(ix.stateDir(), "index.json")
+	return filepath.Join(stateDir(cacheDir, absRoot), "index.json")
 }
+
+// cachePath is where this index's JSON lives.
+func (ix *Index) cachePath() string { return cacheFile(ix.cacheDir, ix.Root) }
 
 // LoadOrBuild returns a usable index: a fresh build when reindex is set or no valid
 // cache exists for these options, otherwise the cached index refreshed against the
@@ -321,10 +356,7 @@ func LoadOrBuild(opt Options, reindex bool, warn func(string)) (*Index, error) {
 	if err := checkCacheDir(absRoot, opt.CacheDir); err != nil {
 		return nil, err
 	}
-	cachePath := ""
-	if opt.CacheDir != "" {
-		cachePath = filepath.Join(stateDir(opt.CacheDir, absRoot), "index.json")
-	}
+	cachePath := cacheFile(opt.CacheDir, absRoot)
 	if !reindex && cachePath != "" {
 		// FollowSymlinks is part of the match: it decides what the walk covers, so a
 		// cache built the other way is describing a different library.

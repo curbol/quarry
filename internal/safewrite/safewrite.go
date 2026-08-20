@@ -141,6 +141,15 @@ func resolveLinks(path string) string {
 // contents of dst with it. Use it where dst is a fresh path — a temp dir about to be
 // renamed, a download staged beside its target — and Atomic where dst is a file
 // something else may already be reading.
+//
+// Also unlike Atomic, the bytes are not fsynced, so this survives a crashing process
+// but not a crashing machine: dst can come back short. Callers writing thousands of
+// files at a time cannot afford a commit each, so a caller that needs the stronger
+// guarantee has to establish it — by syncing, or by being able to tell a short file
+// from a real one afterwards.
+//
+// perm applies only when dst is created. An existing dst keeps its own mode, so a
+// caller for whom the mode matters must remove dst first or chmod it after.
 func Stream(dst string, src io.Reader, perm os.FileMode) error {
 	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
 	if err != nil {

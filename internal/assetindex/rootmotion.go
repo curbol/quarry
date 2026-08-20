@@ -20,17 +20,21 @@ func RootMotionVariant(base string) (string, bool) {
 	if i := strings.Index(base, "[RM]"); i >= 0 {
 		return strings.TrimRight(base[:i], " ") + base[i+len("[RM]"):], true
 	}
-	if i := strings.Index(base, "_RootMotion_"); i >= 0 {
-		return base[:i] + base[i+len("_RootMotion"):], true
-	}
-	if s, ok := strings.CutSuffix(base, "_RootMotion"); ok {
-		return s, true
-	}
-	if i := strings.Index(base, "_RM_"); i >= 0 {
-		return base[:i] + base[i+len("_RM"):], true
-	}
-	if s, ok := strings.CutSuffix(base, "_RM"); ok {
-		return s, true
+	for _, tok := range []string{"_RootMotion", "_RM"} {
+		if s, ok := stripToken(base, tok); ok {
+			return s, true
+		}
 	}
 	return base, false
+}
+
+// stripToken removes tok as a whole "_"-delimited element, leaving a name the in-place
+// variant could actually be called: an infix keeps the trailing separator
+// ("A_RM_B" -> "A_B") and a suffix drops it ("A_RM" -> "A"). Bounded on both sides, so
+// "Warm" and "Storm" are left alone.
+func stripToken(base, tok string) (string, bool) {
+	if i := strings.Index(base, tok+"_"); i >= 0 {
+		return base[:i] + base[i+len(tok):], true
+	}
+	return strings.CutSuffix(base, tok)
 }

@@ -105,6 +105,8 @@ packages, each with a package doc comment stating its contract:
   root is refused by `assetindex` itself, since that is the package that does the
   writing — comparing paths resolved to their deepest existing ancestor, because the
   run that has to be caught is the first one, when the cache dir does not exist yet.
+  Under `--follow-symlinks` the same refusal covers every target the walk followed,
+  which is only known once it has.
 - **Tagging is never silently off.** With no project store discoverable, the
   user-wide store in the config dir is used. `browse.Serve` still honors an empty
   `tagsPath` as "disabled" so the package stays usable that way, but the CLI never

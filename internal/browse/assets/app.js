@@ -2,6 +2,7 @@ import { contentURL, thumbURL } from '/static/scene.js';
 import { lazyWork, modelThumbs, forgetThumbs, ensureFont } from '/static/thumbs.js';
 import { LIVE, wantedRange, visibleRange, needsRebuild, spacerRows } from '/static/gridwindow.js';
 import { iconEl } from '/static/icons.js';
+import { nextTags } from '/static/tagedit.js';
 import { startViewer } from '/static/viewer.js';
 
 const PAGE = 200;
@@ -15,11 +16,12 @@ const els = {
   sentinel: document.getElementById('sentinel'),
   empty: document.getElementById('empty'),
   error: document.getElementById('load-error'),
+  tagError: document.getElementById('tag-error'),
 };
 
 // gen is bumped by reset() so a page still in flight from the previous filter can
 // tell that its results are stale and drop them.
-const state = { gen: 0, offset: 0, total: 0, loading: false, done: false, facetsLoaded: false, items: [] };
+const state = { gen: 0, offset: 0, total: 0, loading: false, done: false, failed: false, facetsLoaded: false, items: [] };
 
 // ---- data ----
 
@@ -70,6 +72,7 @@ async function fetchPage() {
     if (data.items.length === 0 || state.offset >= data.total) state.done = true;
     els.count.textContent = state.total + (state.total === 1 ? ' asset' : ' assets');
     els.empty.hidden = state.total !== 0;
+    state.failed = false;
     els.error.hidden = true;
   } catch (e) {
     // Everything that consumes the response is inside the try, not just the fetch: a
@@ -79,18 +82,26 @@ async function fetchPage() {
     // stopping is indistinguishable from having reached the end.
     if (gen !== state.gen) return;
     console.error('loading assets failed', e);
+    state.failed = true;
     els.error.textContent = 'Could not load assets (' + (e && e.message ? e.message : 'unknown error') + '). Scroll or change a filter to retry.';
     els.error.hidden = false;
   }
   state.loading = false;
   // A page may not push the sentinel off-screen (big monitor, short page); the
   // IntersectionObserver won't re-fire while it stays visible, so keep filling.
-  if (!state.done && sentinelNear()) fetchPage();
+  //
+  // Not after a failure, though. The sentinel is still exactly where it was and
+  // state.done is still false, so this would call straight back into a request that
+  // fails again — and against a quarry that has stopped, fetch rejects in about a
+  // millisecond. The latch is what makes the message above true: the retry comes from
+  // a scroll, which is a person deciding to ask again.
+  if (!state.done && !state.failed && sentinelNear()) fetchPage();
 }
 
 function reset() {
   state.gen++;
   state.offset = 0; state.total = 0; state.done = false; state.loading = false;
+  state.failed = false;
   state.items = [];
   // Let go of the outgoing cards before dropping them: what is observing them, what is
   // still being rendered for them, and what would repaint them on a tag edit all
@@ -397,10 +408,12 @@ async function loadPalette(attempt = 0) {
       return;
     }
     console.error('could not load the tag palette', e);
-    // Appended rather than assigned: a failing page load writes here too, and this
-    // arrives second.
-    els.error.textContent = 'Tagging is unavailable (' + (e && e.message ? e.message : 'unknown error') + '). Reload to try again.';
-    els.error.hidden = false;
+    // Its own element, not the grid's. Sharing one meant whichever wrote second won —
+    // and the palette retries on a timer, so it always did — and then the next page
+    // that loaded successfully hid it again. Tagging silently unavailable is the one
+    // thing this message exists to prevent.
+    els.tagError.textContent = 'Tagging is unavailable (' + (e && e.message ? e.message : 'unknown error') + '). Reload to try again.';
+    els.tagError.hidden = false;
   }
 }
 
@@ -434,21 +447,21 @@ function unwatchTags(entry) {
   }
 }
 
-// applyTagChange folds one edit into every card that shares a fingerprint with it. A
-// card's tags are the union over its fingerprints, so any card holding a fingerprint
-// that just gained the tag gains it too. Losing it is only certain when every one of
-// the card's fingerprints was in the edit — otherwise another copy may still carry it,
-// and guessing would blank a tag that is still there.
+// applyTagChange folds one edit into every card that shares a fingerprint with it.
+// What the edit does to a card is nextTags; this is which cards it reaches.
 function applyTagChange(fingerprints, tag, on) {
   const done = new Set();
   for (const fp of fingerprints) {
     for (const e of tagWatchers.get(fp) || []) {
       if (done.has(e)) continue;
       done.add(e);
-      const tags = new Set(e.asset.tags || []);
-      if (on) tags.add(tag);
-      else if ((e.asset.fingerprints || []).every((f) => fingerprints.includes(f))) tags.delete(tag);
-      e.asset.tags = [...tags].sort();
+      e.asset.tags = nextTags({
+        cardFingerprints: e.asset.fingerprints,
+        cardTags: e.asset.tags,
+        edited: fingerprints,
+        tag,
+        on,
+      });
       e.repaint();
     }
   }
@@ -895,7 +908,7 @@ function thumbContent(a) {
     // Deferred like the model thumbnails: a FontFace load fetches the whole file, and
     // a page of a font pack would otherwise pull every one of them at card creation.
     lazyWork.when(el, () => {
-      ensureFont(a).then((fam) => { el.style.fontFamily = `"${fam}", serif`; })
+      ensureFont(a, el).then((fam) => { el.style.fontFamily = `"${fam}", serif`; })
         .catch(() => el.replaceWith(iconEl(a.category)));
     });
     return el;
@@ -1341,7 +1354,12 @@ const syncGridWindow = (force) => {
     gridWindow.sync(f);
   });
 };
-addEventListener('scroll', () => syncGridWindow(false), { passive: true });
+addEventListener('scroll', () => {
+  syncGridWindow(false);
+  // The sentinel stays intersecting after a failed page, so the IntersectionObserver
+  // never fires again. A scroll is the gesture the error message asks for.
+  if (state.failed) { state.failed = false; fetchPage(); }
+}, { passive: true });
 // A resize changes the column count and the row height, so the cached geometry is
 // stale and the spacers have to be remeasured outright. Coalesced like scroll: dragging
 // a window edge emits a continuous stream of these, and each one forces a layout read.

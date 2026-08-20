@@ -43,8 +43,11 @@ test('a whole-file asset previews every clip', () => {
 test('a take-prefixed FBX name matches on its suffix', () => {
   const all = clips('Armature|Walk', 'Armature|Run');
   assert.deepEqual(clipsForAsset(all, forClip('Walk')), [all[0]]);
-  // ...but only on a "|" boundary, or "Walk" would claim "SideWalk".
-  assert.deepEqual(clipsForAsset(clips('SideWalk'), forClip('Walk')), clips('SideWalk'));
+  // ...but only on a "|" boundary, or "Walk" would claim "SideWalk". Two clips, so a
+  // wrong suffix match and the "no match, take them all" fallback do not look alike:
+  // with one clip both produce the same array and the assertion proves nothing.
+  const neither = clips('SideWalk', 'Run');
+  assert.deepEqual(clipsForAsset(neither, forClip('Walk')), neither);
 });
 
 // The root-motion sibling is a different file with its own indices, so only a name can
@@ -60,6 +63,9 @@ test('the root-motion sibling matches by name, or not at all', () => {
   assert.deepEqual(clipsMatching(many, { source: {} }), many);
   // clipsForAsset's "all of them" fallback is exactly what this must not do.
   assert.notDeepEqual(clipsMatching(many, forClip('Sprint')), many);
+  // The same "|" boundary clipsForAsset needs, where getting it wrong costs more than a
+  // widened selection: the toggle would play SideWalk and present it as Walk's travel.
+  assert.deepEqual(clipsMatching(clips('SideWalk', 'Sprint'), forClip('Walk')), []);
 });
 
 const bones = (n, prefix = 'b') => Array.from({ length: n }, (_, i) => prefix + i);

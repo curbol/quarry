@@ -21,9 +21,16 @@ function worker() {
       return s;
     },
     cancel(id) { jobs.cancel(id); },
-    // run drains the queue and returns the jobs that actually rendered.
+    // run drains the queue and returns the jobs that actually rendered. A job that runs
+    // also settles: the worker retires it as it posts the result, which is what keeps
+    // the map one entry per wanted asset rather than one per id ever asked for.
     run() {
-      const ran = queued.filter((j) => jobs.isCurrent(j.id, j.seq));
+      const ran = [];
+      for (const j of queued) {
+        if (!jobs.isCurrent(j.id, j.seq)) continue;
+        jobs.cancel(j.id);
+        ran.push(j);
+      }
       queued.length = 0;
       return ran;
     },
@@ -102,6 +109,17 @@ test('the tracker holds one entry per wanted asset, not per id ever seen', () =>
 
   w.request('still-here');
   assert.equal(w.tracker.size, 1);
+});
+
+test('a job that completes retires itself, with no cancel from the page', () => {
+  // How the live path actually retires a job. The page drops its pending entry the
+  // moment a result lands, so the cancel it would otherwise send is skipped — leaving
+  // the worker to retire the job as it posts, or every id it ever rendered stays in the
+  // map for the life of the page. The cancel-driven test above never reaches this.
+  const w = worker();
+  for (let i = 0; i < 1000; i++) w.request('asset-' + i);
+  assert.equal(w.run().length, 1000);
+  assert.equal(w.tracker.size, 0, 'completed jobs are still being tracked');
 });
 
 test('a result is matched to its own request, not merely to its asset', () => {

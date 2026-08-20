@@ -16,6 +16,7 @@ import {
   rigEntry, rigCandidates, rootBoneName, hideAlternates, CLAY, _posedV,
 } from '/static/scene.js';
 import { iconEl } from '/static/icons.js';
+import { modelThumbs } from '/static/thumbs.js';
 
 // One WebGL context for every preview, created on first use and reused for the life
 // of the page.
@@ -161,10 +162,17 @@ export function startViewer(container, asset, panels) {
   const ensureCanvas = () => {
     if (stopped) return;
     if (!renderer.domElement.isConnected) container.appendChild(renderer.domElement);
+    // The loop stops itself when the canvas leaves the DOM, so put it back.
+    if (!raf) loop();
   };
   const showPlaceholder = (text) => {
     if (stopped) return;
     if (obj) { scene.remove(obj); dispose(obj); obj = null; }
+    // The canvas goes, and with it the reason to keep rendering: a placeholder lightbox
+    // would otherwise drive a full scene pass plus a gizmo pass every frame into a
+    // canvas nobody can see, for as long as it stays open.
+    cancelAnimationFrame(raf);
+    raf = 0;
     renderer.domElement.remove();
     clearOverlays();
     const box = document.createElement('div');
@@ -240,7 +248,7 @@ export function startViewer(container, asset, panels) {
     return loadModel(contentURL(item.id), item.ext).then(async (char) => {
       if (superseded()) { dispose(char); return true; }
       const entry = rigEntry(item, char);
-      if (entry) CharRegistry.add(entry);
+      if (entry && CharRegistry.add(entry)) modelThumbs.reseed();
       hideAlternates(char);
       const clips = await Promise.all(soloClips.map((c) => retargetedFor(c, asset.vendor, char)));
       let rmCs = null;
@@ -347,7 +355,10 @@ export function startViewer(container, asset, panels) {
         ? 'Default character for this rig — click to unset'
         : 'Save as the default character for this rig';
     };
-    def.addEventListener('click', () => { CharRegistry.pin(charInfo.id, !CharRegistry.isPinned(charInfo.id)); refreshDef(); });
+    def.addEventListener('click', () => {
+      if (CharRegistry.pin(charInfo.id, !CharRegistry.isPinned(charInfo.id))) modelThumbs.reseed();
+      refreshDef();
+    });
     refreshDef();
     row.appendChild(def);
 
@@ -423,7 +434,7 @@ export function startViewer(container, asset, panels) {
       // registering it as a rig would pollute the registry with duplicate bone names.
       if (asset.thumb !== 'sidekick') {
         const entry = rigEntry(asset, root);
-        if (entry) CharRegistry.add(entry);
+        if (entry && CharRegistry.add(entry)) modelThumbs.reseed();
       }
       // buildPlayback corrects orientation and frames from the reference box; do the same
       // for a static (clip-less) renderable so a Z-up model still stands upright and framed.
@@ -465,6 +476,7 @@ export function startViewer(container, asset, panels) {
   const ro = new ResizeObserver(onResize);
   ro.observe(container);
   const loop = () => {
+    if (stopped || !renderer.domElement.isConnected) { raf = 0; return; }
     raf = requestAnimationFrame(loop);
     if (mixer) { const dt = clock.getDelta(); if (playing) { mixer.update(dt); if (action && ctrls) ctrls.sync(action.time); } }
     controls.update();

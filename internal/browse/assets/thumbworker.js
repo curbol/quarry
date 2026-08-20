@@ -255,6 +255,17 @@ self.onmessage = (e) => {
   const { id, seq, asset } = e.data;
   jobs.note(id, seq);
   const current = () => jobs.isCurrent(id, seq);
+  // settle posts a result and retires the job. Retiring here rather than waiting for a
+  // cancel from the page is what keeps the tracker one entry per *wanted* asset: the
+  // page drops its pending entry when a result lands, so the cancel it would otherwise
+  // send is skipped, and every job that succeeded would sit in the map for the life of
+  // the worker. Only a current job retires — a superseded one's id already belongs to
+  // the newer request.
+  const settle = (blob) => {
+    if (!current()) return;
+    jobs.cancel(id);
+    self.postMessage({ id, seq, blob });
+  };
   // Images bypass the queue: they never touch the shared GL canvas the queue exists to
   // serialize, and making them wait behind a 65MB model parse is what a grid of
   // textures would spend all its time doing.
@@ -264,8 +275,8 @@ self.onmessage = (e) => {
     // thread's pending entry is never cleared for a later holder to re-ask.
     const ac = new AbortController();
     withTimeout(downscale(asset, ac.signal), () => ac.abort())
-      .then((blob) => { if (current()) self.postMessage({ id, seq, blob }); })
-      .catch(() => { if (current()) self.postMessage({ id, seq, blob: null }); });
+      .then((blob) => settle(blob))
+      .catch(() => settle(null));
     return;
   }
   queue = queue.then(async () => {
@@ -279,9 +290,9 @@ self.onmessage = (e) => {
         if (!(await build(asset))) return null;
         return canvas.convertToBlob({ type: 'image/png' });
       })());
-      self.postMessage({ id, seq, blob: ok || null });
+      settle(ok || null);
     } catch {
-      self.postMessage({ id, seq, blob: null });
+      settle(null);
     }
   });
 };

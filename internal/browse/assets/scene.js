@@ -21,7 +21,15 @@ const store = {
 
 const BLANK_PIXEL = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
 const loadingManager = new THREE.LoadingManager();
-loadingManager.setURLModifier((url) => (url.includes('/api/content') ? url : BLANK_PIXEL));
+loadingManager.setURLModifier((url) => {
+  if (url.includes('/api/content')) return url;
+  // The FBX loader mints an object URL per embedded texture and, unlike the glTF one,
+  // never revokes it. Swapping in a blank pixel here means nothing ever loads that URL
+  // either, so the bytes behind it would stay resident for the life of the worker —
+  // which is the life of the page, across every card a scroll ever touched.
+  if (url.startsWith('blob:')) URL.revokeObjectURL(url);
+  return BLANK_PIXEL;
+});
 const CLAY = new THREE.MeshStandardMaterial({ color: 0xc7ccd6, roughness: 0.72, metalness: 0.0 });
 
 // normalizeClip rebases a clip to its first real keyframe. Synty source FBX keep each
@@ -551,11 +559,20 @@ const CharRegistry = {
   seeded: false,
   list() { try { return JSON.parse(store.get(this.key)) || []; } catch { return []; } },
   save(l) { try { store.set(this.key, JSON.stringify(l.slice(0, 40))); } catch { /* quota */ } },
+  // add records a character's rig, most recent first, and reports whether what the
+  // matcher can pick actually changed — the order is refreshed on every lightbox open
+  // and nothing downstream reads it.
   add(entry) {
-    if (!entry.bones || entry.bones.length < 10) return;
-    const l = this.list().filter((e) => e.id !== entry.id);
-    l.unshift(entry);
-    this.save(l);
+    if (!entry.bones || entry.bones.length < 10) return false;
+    const l = this.list();
+    const prev = l.find((e) => e.id === entry.id);
+    // rigEntry rebuilds an entry from the model and knows nothing about pinning, so the
+    // flag is carried across here. Without it, opening a pinned character un-pins it.
+    if (prev && prev.pinned) entry = { ...entry, pinned: true };
+    const rest = l.filter((e) => e.id !== entry.id);
+    rest.unshift(entry);
+    this.save(rest);
+    return !prev || JSON.stringify(prev) !== JSON.stringify(entry);
   },
   remove(id) { this.save(this.list().filter((e) => e.id !== id)); },
   // match picks the registered character whose skeleton best covers a clip's bones.
@@ -567,12 +584,15 @@ const CharRegistry = {
   // until it is re-registered (see register), so old caches keep working. The ranking
   // itself is matchRig, in rigmatch.js, where it is checked without a GL context.
   match(bones, vendor) { return matchRig(this.list(), bones, vendor); },
+  // pin reports whether the flag moved, so a caller can tell a real change from a
+  // click that re-asserted what was already true.
   pin(id, on) {
     const l = this.list();
     const e = l.find((x) => x.id === id);
-    if (!e) return;
+    if (!e || !!e.pinned === !!on) return false;
     e.pinned = on;
     this.save(l);
+    return true;
   },
   isPinned(id) { return !!(this.list().find((x) => x.id === id) || {}).pinned; },
   async register(item) {

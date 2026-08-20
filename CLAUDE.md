@@ -22,8 +22,9 @@ gofmt -l .                      # list unformatted files
 ```
 
 The frontend's pure decisions — the grid's card recycling, the thumbnail worker's job
-dispatch, and matching a mesh-less clip to a rig — are checked separately, because a
-mistake in any of them leaves the UI working and merely slow or subtly wrong:
+dispatch, matching a mesh-less clip to a rig, and folding a tag edit into a card — are
+checked separately, because a mistake in any of them leaves the UI working and merely
+slow or subtly wrong:
 
 ```bash
 node --test 'internal/browse/jstest/*.test.mjs'
@@ -68,9 +69,9 @@ packages, each with a package doc comment stating its contract:
   tagging), `viewer.js` the lightbox's 3D preview and the only three.js consumer on the
   page, `thumbs.js` the three caches a scroll has to keep bounded (rendered thumbnails,
   registered fonts, deferred per-card work), `scene.js` the model/clip helpers the page
-  shares with `thumbworker.js`, and `gridwindow.js` / `jobtracker.js` / `rigmatch.js`
-  the pure decisions the Node tests cover — the last of these THREE-free precisely so
-  it can be. `includeRelated=1` folds
+  shares with `thumbworker.js`, and `gridwindow.js` / `jobtracker.js` / `rigmatch.js` /
+  `tagedit.js` the pure decisions the Node tests cover — all four THREE-free precisely
+  so they can be. `includeRelated=1` folds
   each tag match's linked companions into results; `/api/link` and `/api/related`
   write and resolve links. It also pairs each in-place animation with its root-motion
   (`_RM`) sibling (`pairing.go`): the in-place card carries `rootMotionId` and the RM

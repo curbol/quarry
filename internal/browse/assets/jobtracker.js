@@ -17,7 +17,8 @@
 export class JobTracker {
   constructor() {
     // id -> the sequence number of the newest request for it. One entry per asset
-    // currently wanted, rather than one per id ever cancelled.
+    // currently wanted, rather than one per id ever asked for: the worker retires a job
+    // when it posts its result, and the page cancels the ones it stops wanting first.
     this.wanted = new Map();
   }
 

@@ -106,6 +106,11 @@ func TestResolveDirs(t *testing.T) {
 				{name: "flag wins", flag: "/explicit", env: map[string]string{r.ownEnv: "/env", r.xdgEnv: "/xdg"}, want: "/explicit"},
 				{name: "own env beats xdg", env: map[string]string{r.ownEnv: "/env", r.xdgEnv: "/xdg"}, want: "/env"},
 				{name: "xdg", env: map[string]string{r.xdgEnv: "/xdg"}, want: filepath.Join("/xdg", "quarry")},
+				// The XDG spec calls a relative value invalid and says to ignore it, which
+				// is also the only reading that keeps the promise below: joined instead, it
+				// resolves against whatever directory quarry was run from.
+				{name: "relative xdg is ignored", env: map[string]string{r.xdgEnv: ".cache"}, want: filepath.Join(r.homeSub, "quarry"), isDir: true},
+				{name: "relative xdg with a segment is ignored", env: map[string]string{r.xdgEnv: "a/b"}, want: filepath.Join(r.homeSub, "quarry"), isDir: true},
 				{name: "empty env is not set", env: map[string]string{r.ownEnv: "", r.xdgEnv: ""}, want: filepath.Join(r.homeSub, "quarry"), isDir: true},
 				{name: "home fallback", want: filepath.Join(r.homeSub, "quarry"), isDir: true},
 			} {
@@ -228,18 +233,50 @@ func TestExpandHomeReportsAMissingHome(t *testing.T) {
 // A key quarry does not know is a setting the user believes is in effect. Silently
 // ignoring `follow_symlink` (singular) means a whole drive missing from the index
 // with nothing said about it.
+// A key this version does not know is a setting the user believes is in effect, and
+// the shapes it arrives in differ: a misspelled sibling, a whole table from a newer
+// quarry, and a known key given the wrong type. Only the first was covered, and the
+// second rides on Undecoded() reporting nested keys — which is not obvious from the
+// call site.
 func TestLoadRejectsUnknownKeys(t *testing.T) {
+	for _, tc := range []struct {
+		name, body, wantIn string
+	}{
+		{"misspelled sibling", "root = \"/x\"\nfollow_symlink = true\n", "follow_symlink"},
+		{"table from a newer version", "root = \"/x\"\n\n[index]\n  workers = 4\n", "index"},
+		{"known key, wrong type", "root = \"/x\"\nfollow_symlinks = \"yes\"\n", "follow_symlinks"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearQuarryEnv(t)
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte(tc.body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			_, err := Load(dir)
+			if err == nil {
+				t.Fatal("the config was accepted silently")
+			}
+			if !strings.Contains(err.Error(), tc.wantIn) {
+				t.Errorf("error %q does not name %q", err, tc.wantIn)
+			}
+		})
+	}
+}
+
+// A config that cannot be read is not a config that is absent: the settings the user
+// wrote are not in effect and nothing else will say so.
+func TestLoadRejectsAnUnreadableConfig(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads a 0000 file regardless")
+	}
 	clearQuarryEnv(t)
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte("root = \"/x\"\nfollow_symlink = true\n"), 0o644); err != nil {
+	p := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(p, []byte("root = \"/x\"\n"), 0o000); err != nil {
 		t.Fatal(err)
 	}
-	_, err := Load(dir)
-	if err == nil {
-		t.Fatal("an unrecognized key was accepted silently")
-	}
-	if !strings.Contains(err.Error(), "follow_symlink") {
-		t.Errorf("error %q does not name the offending key", err)
+	if _, err := Load(dir); err == nil {
+		t.Fatal("an unreadable config.toml was treated as an absent one")
 	}
 }
 

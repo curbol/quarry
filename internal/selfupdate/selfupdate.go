@@ -160,7 +160,9 @@ func fetchRelease(token, target string) (*release, error) {
 		return nil, fmt.Errorf("GitHub API %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	var r release
-	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
+	// Bounded like the error path above, and for the same reason: the size of this is
+	// the far end's choice, and a release listing is kilobytes.
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxReleaseBytes)).Decode(&r); err != nil {
 		return nil, fmt.Errorf("parsing release: %w", err)
 	}
 	return &r, nil
@@ -229,7 +231,10 @@ func installTo(token, assetURL, exe string) error {
 	// (a temp dir under /tmp is often a separate device, and rename can't cross it).
 	tmp, err := os.MkdirTemp(filepath.Dir(exe), ".quarry-update-*")
 	if err != nil {
-		return err
+		// The usual cause is a binary living somewhere the invoking user cannot write —
+		// /usr/local/bin, a system package dir, a read-only mount — and a bare mkdir
+		// error says nothing about quarry needing to stage an update there.
+		return fmt.Errorf("staging the update beside %s (is that directory writable?): %w", exe, err)
 	}
 	defer os.RemoveAll(tmp)
 
@@ -245,7 +250,7 @@ func installTo(token, assetURL, exe string) error {
 		return err
 	}
 	if err := os.Chmod(binPath, 0o755); err != nil {
-		return err
+		return fmt.Errorf("making the downloaded binary executable: %w", err)
 	}
 	return replaceBinary(binPath, exe)
 }
@@ -298,6 +303,15 @@ var installRename = os.Rename
 // so the current binary is moved out of the way first and restored if the install
 // then fails. exe is never truncated in place, on any platform.
 func replaceBinary(newPath, exe string) error {
+	// One rename where one is enough. Renaming over a running image is legal on POSIX
+	// — it is what install.sh relies on — and moving the old one aside first opens a
+	// window in which there is no quarry at all: a crash there leaves the user with
+	// nothing to run and no `quarry update` to recover with.
+	if runtime.GOOS != "windows" {
+		if err := installRename(newPath, exe); err == nil {
+			return nil
+		}
+	}
 	aside := exe + ".old"
 	os.Remove(aside) // a leftover from an interrupted update must not block this one
 	if err := os.Rename(exe, aside); err != nil {
@@ -308,7 +322,16 @@ func replaceBinary(newPath, exe string) error {
 		// on, rather than written over exe directly: a copy interrupted by a signal or
 		// a power cut would otherwise leave a half-written binary that looks whole.
 		staged := exe + ".new"
+		// Cleared first, and the mode set after: a copy writes into an existing file
+		// without touching its mode, so a leftover from an update killed between the
+		// copy and the rename below would carry its own mode onto exe. A 0600 one lands
+		// a binary nobody can execute, including the update that would replace it.
+		os.Remove(staged)
 		if err := copyFile(newPath, staged); err != nil {
+			os.Remove(staged)
+			return restoreAside(aside, exe, fmt.Errorf("installing the new binary: %w", err))
+		}
+		if err := os.Chmod(staged, 0o755); err != nil {
 			os.Remove(staged)
 			return restoreAside(aside, exe, fmt.Errorf("installing the new binary: %w", err))
 		}
@@ -346,12 +369,24 @@ func download(token, url, dst string) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("download failed: HTTP %d", resp.StatusCode)
+		// The same failure fetchRelease explains, arriving one request later: a 404 on an
+		// asset URL of a private repo is a token without the scope to read it, and
+		// "HTTP 404" on its own sends the user looking for a missing release.
+		hint := ""
+		if resp.StatusCode == http.StatusNotFound && token == "" {
+			hint = " (no GitHub token found; set GITHUB_TOKEN or run `gh auth login`)"
+		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
+		return fmt.Errorf("download failed: HTTP %d%s: %s", resp.StatusCode, hint, strings.TrimSpace(string(body)))
 	}
 	// Bounded for the same reason the extraction below is: this writes beside the
 	// running binary, and a response that never ends would fill the user's disk.
 	return safewrite.Stream(dst, io.LimitReader(resp.Body, maxBinaryBytes), 0o644)
 }
+
+// maxReleaseBytes caps the release listing. It is JSON from the far end and a listing
+// of a handful of releases is kilobytes.
+const maxReleaseBytes = 8 << 20
 
 // maxBinaryBytes caps what is unpacked from a release archive. quarry builds are a
 // few tens of MB; this is generous enough to never bite a real one. A var so a test

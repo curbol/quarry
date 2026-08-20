@@ -70,12 +70,19 @@ func resolveXDG(flag, ownEnv, xdgEnv, homeSub, failure string) (string, error) {
 	if v := os.Getenv(ownEnv); v != "" {
 		return expand(v)
 	}
+	// A relative value is invalid per the XDG base-directory spec and is ignored rather
+	// than joined, which is also what keeps this function's promise: XDG_CACHE_HOME=.cache
+	// otherwise resolves to a different directory for every directory quarry is run
+	// from, each holding its own full re-index — and quarry is most naturally run from
+	// inside the library.
 	if v := os.Getenv(xdgEnv); v != "" {
 		base, err := expand(v)
 		if err != nil {
 			return "", err
 		}
-		return filepath.Join(base, "quarry"), nil
+		if filepath.IsAbs(base) {
+			return filepath.Join(base, "quarry"), nil
+		}
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {

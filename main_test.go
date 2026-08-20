@@ -111,6 +111,20 @@ func TestUpdateRejectsExtraArguments(t *testing.T) {
 	}
 }
 
+// chdirCleanTree moves into a fresh temp dir and confirms no tag store sits above it.
+// Discover walks to the filesystem root, so a stray quarry.tags.toml anywhere up the
+// real tree — someone having run quarry from /tmp once — decides these tests, and the
+// failure names a path nothing in the test wrote.
+func chdirCleanTree(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	t.Chdir(dir)
+	if p, ok := tagstore.Discover(dir); ok {
+		t.Skipf("a tag store above the temp tree (%s) would decide this test", p)
+	}
+	return dir
+}
+
 func TestResolveTagsPath(t *testing.T) {
 	cfgDir := t.TempDir()
 
@@ -130,7 +144,7 @@ func TestResolveTagsPath(t *testing.T) {
 
 	// With no project store in sight, the user-wide store in the config dir is used
 	// rather than tagging being switched off.
-	t.Chdir(t.TempDir())
+	chdirCleanTree(t)
 	if got, want := mustResolve(""), filepath.Join(cfgDir, tagstore.FileName); got != want {
 		t.Errorf("fallback tags path = %q, want %q", got, want)
 	}
@@ -141,7 +155,9 @@ func TestResolveTagsPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	sub := filepath.Join(dir, "a", "b")
-	os.MkdirAll(sub, 0o755)
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	t.Chdir(sub)
 	if got, want := mustResolve(""), filepath.Join(dir, tagstore.FileName); got != want {
 		t.Errorf("discovered tags path = %q, want %q", got, want)
@@ -152,8 +168,9 @@ func TestResolveTagsPath(t *testing.T) {
 // covers the first two hops; the last one lives here, so only a run through the CLI
 // proves the flag actually wins.
 func TestRootFlagBeatsEnvironment(t *testing.T) {
-	t.Chdir(t.TempDir()) // resolveTagsPath walks up from cwd; keep it off the real tree
+	chdirCleanTree(t) // resolveTagsPath walks up from cwd
 	cfgDir := t.TempDir()
+	cacheDir := t.TempDir() // passed explicitly, or the run resolves the caller's real one
 	envRoot := t.TempDir()
 	flagRoot := t.TempDir()
 	if err := os.WriteFile(filepath.Join(cfgDir, "config.toml"), []byte("root = "+strconv.Quote(t.TempDir())+"\n"), 0o644); err != nil {
@@ -168,7 +185,7 @@ func TestRootFlagBeatsEnvironment(t *testing.T) {
 	}
 	t.Cleanup(func() { served = serve })
 
-	if err := run([]string{"--config", cfgDir, "--root", flagRoot}); err != nil {
+	if err := run([]string{"--config", cfgDir, "--cache", cacheDir, "--root", flagRoot}); err != nil {
 		t.Fatal(err)
 	}
 	if got != flagRoot {
@@ -176,7 +193,7 @@ func TestRootFlagBeatsEnvironment(t *testing.T) {
 	}
 
 	got = ""
-	if err := run([]string{"--config", cfgDir}); err != nil {
+	if err := run([]string{"--config", cfgDir, "--cache", cacheDir}); err != nil {
 		t.Fatal(err)
 	}
 	if got != envRoot {
@@ -187,12 +204,14 @@ func TestRootFlagBeatsEnvironment(t *testing.T) {
 // A bool flag's value cannot say whether it was passed, so config.toml has to win
 // until --follow-symlinks actually appears on the command line.
 func TestFollowSymlinksFlagOverridesConfig(t *testing.T) {
-	t.Chdir(t.TempDir()) // resolveTagsPath walks up from cwd; keep it off the real tree
+	chdirCleanTree(t) // resolveTagsPath walks up from cwd
 	t.Setenv("QUARRY_ROOT", "")
 	cfgDir := t.TempDir()
 	root := t.TempDir()
-	os.WriteFile(filepath.Join(cfgDir, "config.toml"),
-		[]byte("root = "+strconv.Quote(root)+"\nfollow_symlinks = true\n"), 0o644)
+	if err := os.WriteFile(filepath.Join(cfgDir, "config.toml"),
+		[]byte("root = "+strconv.Quote(root)+"\nfollow_symlinks = true\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	var got settings
 	served = func(s settings) error { got = s; return nil }

@@ -189,8 +189,8 @@ func serve(s settings) error {
 	if err != nil {
 		return fmt.Errorf("build asset index: %w", err)
 	}
-	for _, s := range ix.Skipped {
-		warn(fmt.Sprintf("skipped %s: %s", s.RelPath, s.Reason))
+	for _, sk := range ix.Skipped {
+		warn(fmt.Sprintf("skipped %s: %s", sk.RelPath, sk.Reason))
 	}
 	// Each pack update extracts to a new fingerprint-keyed dir; without this the
 	// previous extraction stays in the cache forever.

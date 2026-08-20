@@ -619,3 +619,86 @@ func TestFetchReleaseRefusesATargetThatIsNotAVersion(t *testing.T) {
 		t.Errorf("release requests = %v, want one per accepted version", asked)
 	}
 }
+
+// The copy fallback writes into exe+".new" and renames it on. A leftover from an
+// update killed between those two steps keeps its own mode, because a copy into an
+// existing file does not touch one — and a 0600 leftover lands a binary the user
+// cannot execute, which takes `quarry update` with it.
+func TestCopyFallbackDoesNotInheritALeftoverMode(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "quarry")
+	if err := os.WriteFile(exe, fakeBinary("OLD"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	staged := filepath.Join(dir, "staged")
+	if err := os.WriteFile(staged, fakeBinary("NEW"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(exe+".new", []byte("half a binary"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	forceInstallRenameFailure(t)
+
+	if err := replaceBinary(staged, exe); err != nil {
+		t.Fatalf("replaceBinary: %v", err)
+	}
+	fi, err := os.Stat(exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm()&0o111 == 0 {
+		t.Errorf("installed binary is mode %v; nothing can run it, including the next update", fi.Mode().Perm())
+	}
+	got, err := os.ReadFile(exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, fakeBinary("NEW")) {
+		t.Errorf("binary content = %q, want the new one", got)
+	}
+}
+
+// Renaming over a running image is legal on POSIX, and doing it in one step is what
+// keeps a crash from leaving no binary at all. Moving the old one aside first is a
+// Windows requirement, not a general one.
+func TestReplaceBinaryDoesNotMoveTheOldOneAsideOnPOSIX(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows cannot rename over a running image")
+	}
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "quarry")
+	if err := os.WriteFile(exe, fakeBinary("OLD"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	staged := filepath.Join(dir, "staged")
+	if err := os.WriteFile(staged, fakeBinary("NEW"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var renames int
+	orig := installRename
+	installRename = func(from, to string) error { renames++; return orig(from, to) }
+	t.Cleanup(func() { installRename = orig })
+
+	if err := replaceBinary(staged, exe); err != nil {
+		t.Fatal(err)
+	}
+	if renames != 1 {
+		t.Errorf("installRename called %d times, want 1", renames)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".old") || strings.HasSuffix(e.Name(), ".new") {
+			t.Errorf("left %s behind", e.Name())
+		}
+	}
+	got, err := os.ReadFile(exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, fakeBinary("NEW")) {
+		t.Errorf("binary content = %q, want the new one", got)
+	}
+}

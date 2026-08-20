@@ -9,11 +9,13 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
 	"testing"
 
+	"github.com/curbol/quarry/internal/assetindex"
 	"github.com/curbol/quarry/internal/tagstore"
 )
 
@@ -259,34 +261,36 @@ func firstFingerprint(t *testing.T, srv *httptest.Server) string {
 	return ""
 }
 
-// writeEndpoints is every route that mutates the tag store, with a body each accepts.
-// The protections below are per-handler, so testing one of them proves nothing about
-// the other four: a new handler that forgot decodeJSON or requireEnabled would ship
-// green against a single-endpoint test.
-var writeEndpoints = []struct {
-	method, path, body string
-}{
-	{http.MethodPost, "/api/tags", `{"id":"hero","color":"#112233"}`},
-	{http.MethodPatch, "/api/tags", `{"id":"hero","newId":"champion"}`},
-	{http.MethodDelete, "/api/tags", `{"id":"hero"}`},
-	{http.MethodPost, "/api/assign", `{"fingerprints":["crc32:1:1"],"tag":"hero","on":true}`},
-	{http.MethodPost, "/api/link", `{"fingerprints":["crc32:1:1","crc32:2:2"],"on":true}`},
+// writeBodies gives each write route a body it accepts. The routes themselves come
+// from the server (see writeEndpoints), so this only has to answer "what does it
+// take", never "which routes are there".
+var writeBodies = map[string]string{
+	"POST /api/tags":   `{"id":"hero","color":"#112233"}`,
+	"PATCH /api/tags":  `{"id":"hero","newId":"champion"}`,
+	"DELETE /api/tags": `{"id":"hero"}`,
+	"POST /api/assign": `{"fingerprints":["crc32:1:1"],"tag":"hero","on":true}`,
+	"POST /api/link":   `{"fingerprints":["crc32:1:1","crc32:2:2"],"on":true}`,
 }
 
-func request(t *testing.T, srv *httptest.Server, method, path, contentType, body string) *http.Response {
+type writeEndpoint struct{ method, path, body string }
+
+// writeEndpoints pairs every route the server registers as a write with a body it
+// accepts. The routes are read off the server rather than restated here, so a handler
+// added to the mux arrives in the two tests below as well: both guards are per-handler,
+// and a route neither covers is an open write surface. A route with no body listed
+// fails rather than being quietly skipped.
+func writeEndpoints(t *testing.T) []writeEndpoint {
 	t.Helper()
-	req, err := http.NewRequest(method, srv.URL+path, strings.NewReader(body))
-	if err != nil {
-		t.Fatal(err)
+	var out []writeEndpoint
+	for _, r := range (&server{}).writeRoutes() {
+		key := r.method + " " + r.pattern
+		body, ok := writeBodies[key]
+		if !ok {
+			t.Fatalf("write route %s has no body in writeBodies; add one so the guards are exercised against it", key)
+		}
+		out = append(out, writeEndpoint{r.method, r.pattern, body})
 	}
-	if contentType != "" {
-		req.Header.Set("Content-Type", contentType)
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return resp
+	return out
 }
 
 // browse has no session by design, so its write surface is reachable from any page the
@@ -294,7 +298,7 @@ func request(t *testing.T, srv *httptest.Server, method, path, contentType, body
 // answers, which is what closes the drive-by path — on every endpoint, not just one.
 func TestEveryWriteEndpointRequiresJSONContentType(t *testing.T) {
 	srv, _ := enabledServer(t)
-	for _, e := range writeEndpoints {
+	for _, e := range writeEndpoints(t) {
 		for _, ct := range []string{"text/plain", "application/x-www-form-urlencoded", "multipart/form-data", ""} {
 			resp := request(t, srv, e.method, e.path, ct, e.body)
 			resp.Body.Close()
@@ -326,7 +330,7 @@ func TestEveryWriteEndpointRequiresJSONContentType(t *testing.T) {
 // rather than accept the edit into a store that is never persisted.
 func TestEveryWriteEndpointRefusesWhenTaggingIsDisabled(t *testing.T) {
 	srv := serverWith(t, fixtureLibrary(t))
-	for _, e := range writeEndpoints {
+	for _, e := range writeEndpoints(t) {
 		resp := request(t, srv, e.method, e.path, "application/json", e.body)
 		resp.Body.Close()
 		if resp.StatusCode != http.StatusConflict {
@@ -354,7 +358,14 @@ func TestHostGuardRejectsARebindingHost(t *testing.T) {
 		{"127.0.0.1:8788", http.StatusOK},
 		{"[::1]:8788", http.StatusOK},
 		{"localhost", http.StatusOK},
+		// An FQDN written absolute. The dot sits at the end of the host, which is the
+		// middle of the header once a port is on it — and a listener always has a port,
+		// so a trim that runs before the split never fires and this 403s.
+		{"localhost.", http.StatusOK},
+		{"localhost.:8788", http.StatusOK},
+		{"127.0.0.1.:8788", http.StatusOK},
 		{"evil.example:8788", http.StatusForbidden},
+		{"evil.example.:8788", http.StatusForbidden},
 		{"quarry.attacker.test", http.StatusForbidden},
 		{"192.168.1.9:8788", http.StatusForbidden},
 	} {
@@ -774,6 +785,61 @@ func TestNothingUserDerivedReachesInnerHTML(t *testing.T) {
 				!strings.HasPrefix(check, "'") && !strings.HasPrefix(check, `"`) {
 				t.Errorf("%s: innerHTML is assigned %q, which is neither a constant nor escaped", name, check)
 			}
+		}
+	}
+}
+
+// Card grouping folds separators and case so a renamed copy of one file collapses.
+// What it must not fold is the name itself: an allow-list of a-z0-9 erases every
+// script but one, and two files left with nothing but their extension collapse onto a
+// single card if their sizes agree. A library not named in English would browse as a
+// handful of cards.
+func TestGroupingKeepsNonASCIINamesApart(t *testing.T) {
+	if groupNameKey("武器_剣.fbx") == groupNameKey("盾.fbx") {
+		t.Error("two distinct non-ASCII names share a group key")
+	}
+	if got := groupNameKey("Épée.fbx"); got != "épée.fbx" {
+		t.Errorf("groupNameKey(Épée.fbx) = %q, want the name folded rather than stripped", got)
+	}
+	// The Synty case this exists for still folds.
+	if groupNameKey("SPR_Gem09.png") != groupNameKey("SPR_Gem_09.png") {
+		t.Error("the separator fold regressed")
+	}
+}
+
+// Tagging on means a store that was loaded from the path. A store nobody read from it
+// has never seen the file, so the check that makes a save refuse to clobber an outside
+// edit has nothing to compare against and the first write renames an empty store over
+// whatever was there. The two arguments are not independent, and the constructor is
+// where that is enforceable.
+func TestServerRefusesTaggingWithoutALoadedStore(t *testing.T) {
+	ix, err := assetindex.Build(assetindex.Options{Root: t.TempDir(), CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := newServer(ix, nil, filepath.Join(t.TempDir(), tagstore.FileName)); err == nil {
+		t.Error("a nil store paired with a tags path was accepted; the first write would overwrite the file")
+	}
+	if _, err := newServer(ix, nil, ""); err != nil {
+		t.Errorf("a nil store with tagging off is the documented read-only mode: %v", err)
+	}
+}
+
+// includeRelated widens a tag match with its linked companions. With no tag filter
+// there is nothing to widen, and the short-circuit that says so exists to avoid copying
+// a library-sized slice to guarantee a no-op — so what it must guarantee is that the
+// result is the same set as no parameter at all.
+func TestIncludeRelatedWithoutTagsChangesNothing(t *testing.T) {
+	srv, _ := enabledServer(t)
+	var plain, widened assetsResp
+	decode(t, doJSON(t, "GET", srv.URL+"/api/assets", nil), &plain)
+	decode(t, doJSON(t, "GET", srv.URL+"/api/assets?includeRelated=1", nil), &widened)
+	if plain.Total != widened.Total || len(plain.Items) != len(widened.Items) {
+		t.Fatalf("includeRelated=1 alone returned %d/%d, want %d/%d", widened.Total, len(widened.Items), plain.Total, len(plain.Items))
+	}
+	for i := range plain.Items {
+		if plain.Items[i].ID != widened.Items[i].ID {
+			t.Errorf("item %d = %s, want %s", i, widened.Items[i].ID, plain.Items[i].ID)
 		}
 	}
 }

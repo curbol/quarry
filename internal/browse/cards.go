@@ -4,6 +4,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/curbol/quarry/internal/assetindex"
 )
@@ -212,10 +213,15 @@ func groupKey(a assetindex.Asset) string {
 // underscore before a trailing number (SPR_..._Gem09.png -> ..._Gem_09.png), which
 // otherwise leaves the identical sprite showing as two cards. Pairing this with the
 // byte size in the group key keeps genuinely different files apart.
+//
+// Separators are what it drops, so the test is what a rune *is* rather than whether it
+// is ASCII. An allow-list of a-z0-9 reduces a name written in any other script to its
+// extension alone, which collapses every such file of one size onto a single card —
+// the whole library, for a library that is not named in English.
 func groupNameKey(name string) string {
 	var b strings.Builder
 	for _, r := range strings.ToLower(name) {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '.' {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '.' {
 			b.WriteRune(r)
 		}
 	}

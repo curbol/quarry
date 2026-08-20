@@ -97,6 +97,35 @@ func serveLibrary(t *testing.T, tagsPath string, seed func(mk func(...string) st
 	return srv
 }
 
+// httpDo is the one request primitive these tests build on. body is sent verbatim, so
+// a test can send something no client would; contentType is omitted when empty, which
+// is itself a case the write guards have to answer.
+func httpDo(t *testing.T, method, url, contentType, body string) *http.Response {
+	t.Helper()
+	var r io.Reader
+	if body != "" {
+		r = strings.NewReader(body)
+	}
+	req, err := http.NewRequest(method, url, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
+}
+
+// request sends a raw body to a path on srv.
+func request(t *testing.T, srv *httptest.Server, method, path, contentType, body string) *http.Response {
+	t.Helper()
+	return httpDo(t, method, srv.URL+path, contentType, body)
+}
+
 // serverWith serves seed's library with tagging off.
 func serverWith(t *testing.T, seed func(mk func(...string) string)) *httptest.Server {
 	t.Helper()

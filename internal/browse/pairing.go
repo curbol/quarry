@@ -66,8 +66,8 @@ func assetFileBase(s assetindex.Source) string {
 // covers for suppression from the grid (suppressed: RM assetID -> true). Assets are
 // grouped by (vendor, pack, canonical file base); a group with both variants pairs
 // only when its visible side includes an animation, so an unrelated "_RM" file never
-// hijacks a card. For each in-place asset the RM with the same clip is preferred, then
-// a whole-file RM (the lightbox plays the in-place asset's clip name from it).
+// hijacks a card. Which RM an in-place asset gets is pickRM's decision: same directory
+// first, then same archive, then same clip.
 func buildRootMotionPairs(assets []assetindex.Asset) (sibling map[string]string, suppressed map[string]bool) {
 	type group struct{ nonRM, rm []int }
 	groups := map[string]*group{}
@@ -121,13 +121,20 @@ func buildRootMotionPairs(assets []assetindex.Asset) (sibling map[string]string,
 // no sibling to offer, and pairing it anyway would both break the toggle and hide a
 // file the grid should still show.
 //
-// Among same-format candidates, the same archive wins over another, then the same
-// clip over a whole-file RM. The archive term matters because Pack is a directory
-// name: one pack commonly ships as both a SourceFiles zip and a unitypackage holding
-// the same animations, which lands both copies in one group. Without it every in-place
-// card in that group picks the same first RM — so the other archive's RM is never
-// suppressed and shows up beside the card it belongs to, while that card's toggle
-// fetches a different archive than the one it is displaying.
+// Among same-format candidates the terms are weighted, not ordered: the same
+// directory scores above the same archive, which scores above the same clip, so a
+// same-directory RM in another archive beats a different-directory RM in this one.
+// That is deliberate. A pack laid out per character keeps a clip and its RM together,
+// and the directory is the only thing telling one character's "Walk" from another's;
+// where the layout puts every RM in one folder the term simply never fires and the
+// archive term decides.
+//
+// The archive term matters because Pack is a directory name: one pack commonly ships
+// as both a SourceFiles zip and a unitypackage holding the same animations, which lands
+// both copies in one group. Without it every in-place card in that group picks the same
+// first RM — so the other archive's RM is never suppressed and shows up beside the card
+// it belongs to, while that card's toggle fetches a different archive than the one it
+// is displaying.
 func pickRM(assets []assetindex.Asset, rm []int, nonRM assetindex.Asset) string {
 	best, bestScore := "", -1
 	for _, ri := range rm {

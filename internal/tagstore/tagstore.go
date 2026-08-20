@@ -105,8 +105,9 @@ type Store struct {
 	// loadedFrom and stamp describe the file this store was read from, so Save can tell
 	// whether anything else has written it since. A zero stamp means the file did not
 	// exist at the time, which is itself worth detecting: something creating it before
-	// the first save is the same lost edit. Saving to a different path is a fresh write
-	// rather than a rewrite, so the check does not apply there.
+	// the first save is the same lost edit. Saving to a different path is an export
+	// rather than a rewrite, so the stamp check does not apply there — and neither does
+	// the path: an export must not become the file this store guards.
 	loadedFrom string
 	stamp      fileStamp
 }
@@ -312,7 +313,7 @@ func (s *Store) Related(fp string) []string {
 	if set == nil {
 		return nil
 	}
-	out := make([]string, 0, len(set)-1)
+	out := make([]string, 0, len(set))
 	for m := range set {
 		if m != fp {
 			out = append(out, m)
@@ -483,13 +484,27 @@ const storeHeader = "# quarry tag store. Rewritten whole on every edit, so comme
 // the user-wide one — is destroyed with no trace. Stat-then-rename leaves a window
 // too small to matter here and too expensive to close: this is one user's file, and
 // the failure being guarded against is measured in minutes, not microseconds.
-// A successful save records the file it wrote, which is what that staleness check
-// reads next time — so this mutates the store. A caller sharing a Store across
-// goroutines must hold the lock it holds for an edit, not the one it holds for a
-// read.
+// The first save of a store that has never read a file adopts that file, and a store
+// that has one keeps it: a save elsewhere is an export and leaves the guard where it
+// was. Either way a successful save re-stamps the guarded file, which is what the
+// check reads next time — so this mutates the store, and a caller sharing a Store
+// across goroutines must hold the lock it holds for an edit, not the one it holds for
+// a read.
 func (s *Store) Save(path string) error {
-	if s.loadedFrom == path && s.stamp != stampOf(path) {
-		return fmt.Errorf("%s: %w", path, ErrStale)
+	switch {
+	case s.loadedFrom == path:
+		if s.stamp != stampOf(path) {
+			return fmt.Errorf("%s: %w", path, ErrStale)
+		}
+	case s.loadedFrom == "":
+		// A store from New() has read nothing. Rewriting an existing file whole from it
+		// is the same total loss ErrStale exists to prevent, minus even the chance to
+		// notice: there is no earlier state to compare against because there was never a
+		// read. Only Load leaves loadedFrom empty-handed, and Load records the path even
+		// for a file that is not there yet, so this is exactly the never-loaded case.
+		if _, err := os.Stat(path); err == nil {
+			return fmt.Errorf("%s: %w", path, ErrStale)
+		}
 	}
 	f := fileTOML{Tags: s.Tags()}
 	fps := make([]string, 0, len(s.assign))
@@ -518,7 +533,16 @@ func (s *Store) Save(path string) error {
 	}); err != nil {
 		return err
 	}
-	s.loadedFrom, s.stamp = path, stampOf(path)
+	// A home is adopted once and never moves. Re-homing onto whatever was written last
+	// would leave the store the user is actually editing unguarded from then on: an
+	// export elsewhere, then an outside edit to the real file, then a save that sails
+	// through its staleness check because it is no longer checking that file.
+	if s.loadedFrom == "" {
+		s.loadedFrom = path
+	}
+	if s.loadedFrom == path {
+		s.stamp = stampOf(path)
+	}
 	return nil
 }
 

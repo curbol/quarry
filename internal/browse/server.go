@@ -60,13 +60,21 @@ type server struct {
 
 // newServer wires an index, its precomputed facets, and the tag store to the
 // embedded frontend. An empty tagsPath disables tagging (the UI still browses
-// read-only). A nil store is treated as empty.
+// read-only), and is the only thing a nil store pairs with.
+//
+// The two are not independent: a store nobody read from tagsPath has never seen the
+// file, so the staleness check that makes a save refuse to clobber an edit has nothing
+// to compare against, and the first tag click would rename an empty store over
+// whatever the user had. Tagging on means a store that was loaded.
 func newServer(ix *assetindex.Index, store *tagstore.Store, tagsPath string) (*server, error) {
 	static, err := fs.Sub(assetsFS, "assets")
 	if err != nil {
 		return nil, err
 	}
 	if store == nil {
+		if tagsPath != "" {
+			return nil, fmt.Errorf("tagging is enabled for %s but no store was loaded from it", tagsPath)
+		}
 		store = tagstore.New()
 	}
 	byFP := map[string][]int32{}
@@ -104,17 +112,42 @@ func guardHost(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Browsers send a lowercase host without the trailing dot, but a hand-typed
 		// curl or an FQDN written "localhost." does not, and a 403 there reads as a bug
-		// rather than as the protection it is.
-		host := strings.TrimSuffix(strings.ToLower(r.Host), ".")
+		// rather than as the protection it is. The port comes off first: the dot is at
+		// the end of the *host*, which is the middle of a "localhost.:8788" — and a
+		// listener always has a port, so trimming first would never fire.
+		host := strings.ToLower(r.Host)
 		if h, _, err := net.SplitHostPort(host); err == nil {
 			host = h
 		}
+		host = strings.TrimSuffix(host, ".")
 		if !loopbackHosts[host] {
 			http.Error(w, "unexpected Host header", http.StatusForbidden)
 			return
 		}
 		h.ServeHTTP(w, r)
 	})
+}
+
+// writeRoute is one endpoint that mutates the tag store.
+type writeRoute struct {
+	method  string
+	pattern string
+	handler http.HandlerFunc
+}
+
+// writeRoutes is every endpoint that writes to the tag store. It is a list rather than
+// a run of registrations because the two guards each write endpoint depends on — a
+// JSON content-type, and a refusal when tagging is off — are per-handler, so what
+// holds them is a test that iterates every route. Registering the mux from the same
+// list is what stops a new handler reaching the server without reaching those tests.
+func (s *server) writeRoutes() []writeRoute {
+	return []writeRoute{
+		{http.MethodPost, "/api/tags", s.handleTagCreate},
+		{http.MethodPatch, "/api/tags", s.handleTagPatch},
+		{http.MethodDelete, "/api/tags", s.handleTagDelete},
+		{http.MethodPost, "/api/assign", s.handleAssign},
+		{http.MethodPost, "/api/link", s.handleLink},
+	}
 }
 
 // handler builds the route mux; shared by Serve and tests.
@@ -126,12 +159,10 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("/api/content", s.handleContent)
 	mux.HandleFunc("/api/thumb", s.handleThumb)
 	mux.HandleFunc("GET /api/tags", s.handleTags)
-	mux.HandleFunc("POST /api/tags", s.handleTagCreate)
-	mux.HandleFunc("PATCH /api/tags", s.handleTagPatch)
-	mux.HandleFunc("DELETE /api/tags", s.handleTagDelete)
-	mux.HandleFunc("POST /api/assign", s.handleAssign)
-	mux.HandleFunc("POST /api/link", s.handleLink)
 	mux.HandleFunc("GET /api/related", s.handleRelated)
+	for _, r := range s.writeRoutes() {
+		mux.HandleFunc(r.method+" "+r.pattern, r.handler)
+	}
 	return mux
 }
 
@@ -331,7 +362,7 @@ func (s *server) computeResults(query url.Values) []assetDTO {
 		if guids != nil && !guids[a.Source.Guid] {
 			continue
 		}
-		if !matcher.match(*a) {
+		if !matcher.match(a) {
 			continue
 		}
 		matched = append(matched, int32(i))

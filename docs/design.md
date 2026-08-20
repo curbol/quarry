@@ -194,6 +194,8 @@ in `Host`. A listener bound to a routable interface is a deliberate choice to se
 machines, which have their own names for this one, so the check does not apply there.
 
 A save rewrites the whole file, so it first checks the file is still the one it loaded and
-returns `ErrStale` if not. The store is meant to be hand-edited and committed to source
+returns `ErrStale` if not. The file it guards is the one it read: a save elsewhere is an
+export and does not move the guard, and a store that has read nothing refuses to rewrite a
+file that already exists at all. The store is meant to be hand-edited and committed to source
 control, so an edit arriving from an editor, a `git checkout`, or a second quarry sharing the
 user-wide store is a real possibility, and overwriting it would be total and silent.

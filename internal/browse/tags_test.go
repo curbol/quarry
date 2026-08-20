@@ -1,7 +1,6 @@
 package browse
 
 import (
-	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -51,25 +50,17 @@ func enabledServer(t *testing.T) (*httptest.Server, string) {
 	})
 }
 
+// doJSON marshals body (nil sends no body and no content-type) to a full URL.
 func doJSON(t *testing.T, method, url string, body any) *http.Response {
 	t.Helper()
-	var r io.Reader
-	if body != nil {
-		b, _ := json.Marshal(body)
-		r = bytes.NewReader(b)
+	if body == nil {
+		return httpDo(t, method, url, "", "")
 	}
-	rq, err := http.NewRequest(method, url, r)
+	b, err := json.Marshal(body)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if body != nil {
-		rq.Header.Set("Content-Type", "application/json")
-	}
-	resp, err := http.DefaultClient.Do(rq)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return resp
+	return httpDo(t, method, url, "application/json", string(b))
 }
 
 func decode(t *testing.T, resp *http.Response, v any) {
@@ -331,15 +322,7 @@ func TestFailedSaveDoesNotLeaveMemoryAheadOfDisk(t *testing.T) {
 // told the client rather than only on its status.
 func post(t *testing.T, srv *httptest.Server, path, body string, wantStatus int) []byte {
 	t.Helper()
-	req, err := http.NewRequest(http.MethodPost, srv.URL+path, strings.NewReader(body))
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
+	resp := request(t, srv, http.MethodPost, path, "application/json", body)
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != wantStatus {

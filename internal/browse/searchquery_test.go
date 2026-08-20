@@ -83,7 +83,7 @@ func TestSearchQueryMatch(t *testing.T) {
 	}
 
 	for _, c := range cases {
-		got := parseQuery(c.query).match(c.asset)
+		got := parseQuery(c.query).match(&c.asset)
 		if got != c.want {
 			t.Errorf("parseQuery(%q).match(%q) = %v, want %v", c.query, c.asset.Name, got, c.want)
 		}
@@ -134,7 +134,7 @@ func TestSearchQueryEndpoint(t *testing.T) {
 }
 
 func TestSearchQueryEmptyIsNil(t *testing.T) {
-	if parseQuery("").match(assetindex.Asset{Name: "anything"}) != true {
+	if parseQuery("").match(&assetindex.Asset{Name: "anything"}) != true {
 		t.Error("empty query must match everything")
 	}
 }
@@ -146,21 +146,21 @@ func TestMalformedQueriesDoNotMatchEverything(t *testing.T) {
 	unrelated := assetindex.Asset{Name: "barrel", Pack: "polygon-dungeon", Category: "props"}
 	// A real term OR'd with an empty branch must not widen to everything.
 	for _, q := range []string{"sword OR ", "sword |", "sword OR", "(sword OR )", "sword OR ()", "sword OR (", "(sword OR "} {
-		if parseQuery(q).match(unrelated) {
+		if parseQuery(q).match(&unrelated) {
 			t.Errorf("query %q matched an unrelated asset", q)
 		}
 	}
 	// The terms that are present still have to work.
 	sword := assetindex.Asset{Name: "sword", Pack: "polygon-fantasy", Category: "models"}
 	for _, q := range []string{"sword OR ", "sword |", "sword OR axe"} {
-		if !parseQuery(q).match(sword) {
+		if !parseQuery(q).match(&sword) {
 			t.Errorf("query %q dropped the term it did have", q)
 		}
 	}
 	// A query carrying no terms at all is no filter, whether it is blank or the user
 	// has typed only operators so far.
 	for _, q := range []string{"", "   ", "OR", "|", ")", "()"} {
-		if !parseQuery(q).match(unrelated) {
+		if !parseQuery(q).match(&unrelated) {
 			t.Errorf("term-free query %q should be treated as no filter", q)
 		}
 	}
@@ -170,19 +170,19 @@ func TestMalformedQueriesDoNotMatchEverything(t *testing.T) {
 	// empty term is the AND identity, so leaving one in the tree widened the query to
 	// the whole library.
 	for _, q := range []string{`sword OR "`, `sword OR ""`, "sword OR name:", "sword OR -name:", `"axe" OR vendor:`} {
-		if parseQuery(q).match(unrelated) {
+		if parseQuery(q).match(&unrelated) {
 			t.Errorf("query %q matched an unrelated asset", q)
 		}
 	}
 	for _, q := range []string{`sword "`, "sword name:", "sword -name:"} {
-		if !parseQuery(q).match(sword) {
+		if !parseQuery(q).match(&sword) {
 			t.Errorf("query %q dropped the term it did have", q)
 		}
 	}
 	// An empty term on its own constrains nothing, so it is no filter rather than a
 	// grid that blanks the moment a quote or a colon is typed.
 	for _, q := range []string{`"`, `""`, "name:", "-name:"} {
-		if !parseQuery(q).match(unrelated) {
+		if !parseQuery(q).match(&unrelated) {
 			t.Errorf("query %q with only an empty term should be no filter", q)
 		}
 	}
@@ -218,10 +218,10 @@ func TestMalformedGroupingKeepsTheTermsThatWereTyped(t *testing.T) {
 		{"pack:weapons", true, false},
 	} {
 		q := parseQuery(tc.q)
-		if got := q.match(sword); got != tc.wantSword {
+		if got := q.match(&sword); got != tc.wantSword {
 			t.Errorf("parseQuery(%q).match(Sword) = %v, want %v", tc.q, got, tc.wantSword)
 		}
-		if got := q.match(rock); got != tc.wantRock {
+		if got := q.match(&rock); got != tc.wantRock {
 			t.Errorf("parseQuery(%q).match(Rock) = %v, want %v", tc.q, got, tc.wantRock)
 		}
 	}
@@ -247,7 +247,7 @@ func TestPathologicalQueriesDoNotBlowTheStack(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			q := parseQuery(tc.q) // must return, not recurse without bound
-			q.match(asset)        // and must be evaluable
+			q.match(&asset)       // and must be evaluable
 		})
 	}
 }
@@ -263,7 +263,7 @@ func TestOverlongQueryIsTruncatedNotWidened(t *testing.T) {
 
 	// Padded with spaces, the surviving text is exactly the leading term.
 	q := parseQuery("sword" + strings.Repeat(" ", maxQueryBytes*4))
-	if q == nil || !q.match(sword) || q.match(rock) {
+	if q == nil || !q.match(&sword) || q.match(&rock) {
 		t.Errorf("an overlong but otherwise ordinary query did not behave like %q", "sword")
 	}
 
@@ -273,7 +273,7 @@ func TestOverlongQueryIsTruncatedNotWidened(t *testing.T) {
 	if q == nil {
 		t.Fatal("an overlong query compiled to nil, which matches the whole library")
 	}
-	if q.match(rock) {
+	if q.match(&rock) {
 		t.Error("an overlong query matched an unrelated asset")
 	}
 }

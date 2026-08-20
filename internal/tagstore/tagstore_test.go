@@ -784,3 +784,106 @@ func TestAwkwardLabelsAndFingerprintsRoundTrip(t *testing.T) {
 		t.Errorf("re-saving changed the file:\n--- first ---\n%s\n--- second ---\n%s", first, second)
 	}
 }
+
+// The staleness check is what stands between an outside edit and a rewrite that
+// destroys it, and the file it checks has to stay the file the store reads. A save
+// elsewhere — a backup, an export — is not a change of home: if it were, the real
+// store would be unguarded from then on, and the very next tag click would overwrite
+// whatever an editor or a checkout had put there.
+func TestSaveElsewhereDoesNotMoveTheGuardedFile(t *testing.T) {
+	dir := t.TempDir()
+	real := filepath.Join(dir, FileName)
+	if err := os.WriteFile(real, []byte("[[tag]]\n  id = \"hero\"\n  color = \"#e11d48\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Load(real)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Save(filepath.Join(dir, "backup.toml")); err != nil {
+		t.Fatal(err)
+	}
+	// Someone else edits the store this one is actually for.
+	if err := os.WriteFile(real, []byte("[[tag]]\n  id = \"villain\"\n  color = \"#00ff00\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Save(real); !errors.Is(err, ErrStale) {
+		t.Fatalf("Save after an outside edit = %v, want ErrStale; the export moved the guard", err)
+	}
+	b, err := os.ReadFile(real)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "villain") {
+		t.Errorf("the outside edit was overwritten: %s", b)
+	}
+}
+
+// A store from New() has read nothing, so it has no earlier state to compare a file
+// against and no business rewriting one whole. Saving to a path that is not there yet
+// is the ordinary first save and has to keep working.
+func TestNewStoreWillNotOverwriteAnExistingFile(t *testing.T) {
+	dir := t.TempDir()
+	occupied := filepath.Join(dir, FileName)
+	original := "[[tag]]\n  id = \"hero\"\n  color = \"#e11d48\"\n"
+	if err := os.WriteFile(occupied, []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := New().Save(occupied); !errors.Is(err, ErrStale) {
+		t.Fatalf("New().Save over an existing store = %v, want ErrStale", err)
+	}
+	b, err := os.ReadFile(occupied)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != original {
+		t.Errorf("the existing store was rewritten: %s", b)
+	}
+
+	fresh := filepath.Join(dir, "new.toml")
+	s := New()
+	s.Assign("crc32:1:1", "hero")
+	if err := s.Save(fresh); err != nil {
+		t.Fatalf("first save to a path that does not exist: %v", err)
+	}
+	// Having adopted it, the same store keeps writing there.
+	if err := s.Save(fresh); err != nil {
+		t.Fatalf("second save to the file it just wrote: %v", err)
+	}
+}
+
+// Groups() is the only funnel between the shared-set representation and the file, so
+// the persistence half of unlinking lives there: a shrunk group has to come back
+// shrunk, and a dissolved one has to leave no row at all — a one-member [[group]]
+// would load as a fingerprint linked to nothing.
+func TestUnlinkSurvivesARoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), FileName)
+	s := New()
+	s.Link([]string{"A", "B", "C"})
+	s.Unlink([]string{"B"})
+	if err := s.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	back, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := back.Related("A"); !reflect.DeepEqual(got, []string{"C"}) {
+		t.Errorf("Related(A) after a round trip = %v, want [C]", got)
+	}
+	if got := back.Related("B"); len(got) != 0 {
+		t.Errorf("Related(B) = %v, want nothing; B was unlinked", got)
+	}
+
+	back.Unlink([]string{"A"})
+	if err := back.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), "[[group]]") {
+		t.Errorf("a dissolved group still wrote a row:\n%s", b)
+	}
+}

@@ -2,6 +2,7 @@ package browse
 
 import (
 	"strings"
+	"unicode/utf8"
 
 	"github.com/curbol/quarry/internal/assetindex"
 )
@@ -57,14 +58,16 @@ func parseQuery(s string) *searchQuery {
 	return &searchQuery{root: andNode{kids: kids}}
 }
 
-func (q *searchQuery) match(a assetindex.Asset) bool {
+func (q *searchQuery) match(a *assetindex.Asset) bool {
 	if q == nil || q.root == nil {
 		return true
 	}
 	return q.root.eval(a)
 }
 
-type searchNode interface{ eval(a assetindex.Asset) bool }
+type searchNode interface {
+	eval(a *assetindex.Asset) bool
+}
 
 type andNode struct{ kids []searchNode }
 type orNode struct{ kids []searchNode }
@@ -77,7 +80,7 @@ type termNode struct {
 	value string
 }
 
-func (n andNode) eval(a assetindex.Asset) bool {
+func (n andNode) eval(a *assetindex.Asset) bool {
 	for _, k := range n.kids {
 		if !k.eval(a) {
 			return false
@@ -86,7 +89,7 @@ func (n andNode) eval(a assetindex.Asset) bool {
 	return true
 }
 
-func (n orNode) eval(a assetindex.Asset) bool {
+func (n orNode) eval(a *assetindex.Asset) bool {
 	for _, k := range n.kids {
 		if k.eval(a) {
 			return true
@@ -95,27 +98,76 @@ func (n orNode) eval(a assetindex.Asset) bool {
 	return false
 }
 
-func (n notNode) eval(a assetindex.Asset) bool { return !n.kid.eval(a) }
+func (n notNode) eval(a *assetindex.Asset) bool { return !n.kid.eval(a) }
 
-func (n termNode) eval(a assetindex.Asset) bool {
+func (n termNode) eval(a *assetindex.Asset) bool {
 	if n.field == "" {
-		return strings.Contains(strings.ToLower(a.Name), n.value) ||
-			strings.Contains(strings.ToLower(a.Pack), n.value) ||
-			strings.Contains(strings.ToLower(a.RelPath), n.value)
+		return containsFold(a.Name, n.value) ||
+			containsFold(a.Pack, n.value) ||
+			containsFold(a.RelPath, n.value)
 	}
-	return strings.Contains(strings.ToLower(searchFields[n.field](a)), n.value)
+	return containsFold(searchFields[n.field](a), n.value)
+}
+
+// containsFold reports whether s contains lower, case-insensitively. lower is already
+// lowercased, which tokenize guarantees.
+//
+// This is strings.Contains(strings.ToLower(s), lower) without the copy of s. It runs
+// once per term per asset, and an unfielded term runs it three times: over a
+// 150k-asset library that is half a million throwaway strings for one query, and
+// every keystroke is its own query with its own memo key, so nothing amortizes it.
+// Asset names and paths are mixed case in practice, which is exactly when ToLower
+// allocates rather than returning s.
+func containsFold(s, lower string) bool {
+	if lower == "" {
+		return true
+	}
+	if !isASCII(s) || !isASCII(lower) {
+		// Case folding is not a per-byte operation outside ASCII — İ, ẞ and the Turkish
+		// dotless i fold across lengths — so anything carrying a high byte pays for the
+		// copy rather than getting a wrong answer.
+		return strings.Contains(strings.ToLower(s), lower)
+	}
+	for i := 0; i+len(lower) <= len(s); i++ {
+		if equalFoldASCII(s[i:i+len(lower)], lower) {
+			return true
+		}
+	}
+	return false
+}
+
+func equalFoldASCII(s, lower string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		if c != lower[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= utf8.RuneSelf {
+			return false
+		}
+	}
+	return true
 }
 
 // searchFields maps a field:value operator name to the asset field it scopes to.
-var searchFields = map[string]func(assetindex.Asset) string{
-	"name":    func(a assetindex.Asset) string { return a.Name },
-	"pack":    func(a assetindex.Asset) string { return a.Pack },
-	"vendor":  func(a assetindex.Asset) string { return a.Vendor },
-	"type":    func(a assetindex.Asset) string { return string(a.Category) },
-	"variant": func(a assetindex.Asset) string { return a.Variant },
-	"ext":     func(a assetindex.Asset) string { return a.Ext },
-	"guid":    func(a assetindex.Asset) string { return a.Source.Guid },
-	"path":    func(a assetindex.Asset) string { return a.RelPath },
+var searchFields = map[string]func(*assetindex.Asset) string{
+	"name":    func(a *assetindex.Asset) string { return a.Name },
+	"pack":    func(a *assetindex.Asset) string { return a.Pack },
+	"vendor":  func(a *assetindex.Asset) string { return a.Vendor },
+	"type":    func(a *assetindex.Asset) string { return string(a.Category) },
+	"variant": func(a *assetindex.Asset) string { return a.Variant },
+	"ext":     func(a *assetindex.Asset) string { return a.Ext },
+	"guid":    func(a *assetindex.Asset) string { return a.Source.Guid },
+	"path":    func(a *assetindex.Asset) string { return a.RelPath },
 }
 
 type tokKind int

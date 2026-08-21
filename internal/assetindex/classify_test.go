@@ -94,29 +94,41 @@ func TestRefineImage(t *testing.T) {
 
 func TestRefineModel(t *testing.T) {
 	cases := []struct {
-		pack string
-		name string
-		want Category
+		relPath      string
+		vendor, pack string
+		name         string
+		want         Category
 	}{
-		// Animation packs across all three vendor conventions: Synty ANIMATION_*,
-		// the explosive "RPG Animations" vendor, and kevdev "*_Animations"/"*_Motions".
-		{"ANIMATION_Sword_Combat", "A_Block_Loop_Sword.fbx", CategoryAnimation},
-		{"RPG Animations GLB-0.1.0", "2Hand Sword.glb", CategoryAnimation},
-		{"Human_Melee_Animations", "HumanF@Attack1H01_L.fbx", CategoryAnimation},
-		{"Human_Basic_Motions", "HumanM@Idle.fbx", CategoryAnimation},
+		// The pack name carries the signal across every vendor convention: Synty
+		// ANIMATION_*, the explosive "RPG Animations" vendor, and kevdev
+		// "*_Animations"/"*_Motions". The path inside the pack need not repeat it.
+		{"synty/ANIMATION_Sword_Combat/x.zip::SourceFiles/Polygon/A_Block_Loop_Sword.fbx", "synty", "ANIMATION_Sword_Combat", "A_Block_Loop_Sword.fbx", CategoryAnimation},
+		{"explosive/RPG Animations GLB-0.1.0/2Hand Sword.glb", "explosive", "RPG Animations GLB-0.1.0", "2Hand Sword.glb", CategoryAnimation},
+		{"kevdev/Human_Melee_Animations/x.zip::src/HumanF@Attack1H01_L.fbx", "kevdev", "Human_Melee_Animations", "HumanF@Attack1H01_L.fbx", CategoryAnimation},
+		{"kevdev/Human_Basic_Motions/x.zip::src/HumanM@Idle.fbx", "kevdev", "Human_Basic_Motions", "HumanM@Idle.fbx", CategoryAnimation},
+		// A vendor that ships a whole engine project puts a container like "Assets" in
+		// the pack slot, leaving the signal to a directory deeper inside the pack.
+		{"doublel/Assets/DoubleL/FBX_Animations/Base Move/Run/Run_F.fbx", "doublel", "Assets", "Run_F.fbx", CategoryAnimation},
+		{"doublel/Assets/DoubleL/FBX_Unreal_Animations/Bow/Bow_Aim.fbx", "doublel", "Assets", "Bow_Aim.fbx", CategoryAnimation},
+		// A sibling directory in that same pack holds meshes, not clips.
+		{"doublel/Assets/DoubleL/Model/SM_Wep_Sword_03.fbx", "doublel", "Assets", "SM_Wep_Sword_03.fbx", CategoryModel},
 		// Reference rig/skeleton/character meshes bundled in an animation pack are
 		// not clips: they stay model.
-		{"RPG Animations GLB-0.1.0", "RPG-Character-Bones.FBX", CategoryModel},
-		{"Human_Melee_Animations", "HumanF_Model.fbx", CategoryModel},
-		{"Human_Melee_Animations", "HumanM_Model.fbx", CategoryModel},
-		// A non-animation pack: models stay models even for a mesh named like a motion.
-		{"POLYGON_Nature", "SM_Env_Tree_01.fbx", CategoryModel},
-		// "Animation"/"Motion" must be a whole token, not an incidental substring.
-		{"POLYGON_Automation_Kit", "SM_Prop.fbx", CategoryModel},
+		{"explosive/RPG Animations GLB-0.1.0/RPG-Character-Bones.FBX", "explosive", "RPG Animations GLB-0.1.0", "RPG-Character-Bones.FBX", CategoryModel},
+		{"kevdev/Human_Melee_Animations/x.zip::Models/HumanF_Model.fbx", "kevdev", "Human_Melee_Animations", "HumanF_Model.fbx", CategoryModel},
+		{"synty/ANIMATION_Base_Locomotion/x.zip::SourceFiles/Animations/TPose/A_TPose_Neut.fbx", "synty", "ANIMATION_Base_Locomotion", "A_TPose_Neut.fbx", CategoryModel},
+		// A non-animation pack: models stay models.
+		{"synty/POLYGON_Nature/x.zip::SourceFiles/SM_Env_Tree_01.fbx", "synty", "POLYGON_Nature", "SM_Env_Tree_01.fbx", CategoryModel},
+		// "Animation"/"Motion" must be a whole token, not an incidental substring, in
+		// the pack name and in the path inside it alike.
+		{"synty/POLYGON_Automation_Kit/x.zip::SourceFiles/SM_Prop.fbx", "synty", "POLYGON_Automation_Kit", "SM_Prop.fbx", CategoryModel},
+		{"synty/POLYGON_Kit/x.zip::SourceFiles/Automation/SM_Prop.fbx", "synty", "POLYGON_Kit", "SM_Prop.fbx", CategoryModel},
+		// The filename is not a promotion signal: a prop named for motion is a prop.
+		{"synty/POLYGON_Kit/x.zip::SourceFiles/Props/SM_Prop_Motion_Sensor.fbx", "synty", "POLYGON_Kit", "SM_Prop_Motion_Sensor.fbx", CategoryModel},
 	}
 	for _, c := range cases {
-		if got := refineModel(c.pack, c.name); got != c.want {
-			t.Errorf("refineModel(%q, %q) = %s, want %s", c.pack, c.name, got, c.want)
+		if got := refineModel(c.relPath, c.vendor, c.pack, c.name); got != c.want {
+			t.Errorf("refineModel(%q, %q, %q, %q) = %s, want %s", c.relPath, c.vendor, c.pack, c.name, got, c.want)
 		}
 	}
 }
@@ -129,6 +141,12 @@ func TestNewAssetRefinesAnimationCategory(t *testing.T) {
 	}
 	if anim.Thumb != ThumbFBX {
 		t.Errorf("animation fbx thumb = %s, want fbx (still three.js-renderable)", anim.Thumb)
+	}
+
+	deep := newAsset(Source{Kind: SourceLoose, FilePath: "/lib/doublel/Assets/DoubleL/FBX_Animations/Base Move/Run/Run_F.fbx"},
+		"Run_F.fbx", "doublel/Assets/DoubleL/FBX_Animations/Base Move/Run/Run_F.fbx", "doublel", "Assets", "", 10, "")
+	if deep.Category != CategoryAnimation {
+		t.Errorf("clip under an animation dir inside a project-shaped pack = %s, want animation", deep.Category)
 	}
 
 	skel := newAsset(Source{Kind: SourceLoose, FilePath: "/lib/explosive/RPG Animations GLB-0.1.0/RPG-Character-Bones.FBX"},

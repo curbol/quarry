@@ -1,6 +1,7 @@
 package assetindex
 
 import (
+	"path"
 	"regexp"
 	"strings"
 )
@@ -72,12 +73,18 @@ var (
 )
 
 // refineModel promotes a file already classified as a model to animation when it is
-// a clip inside an animation pack. The pack name is the signal (Synty ships every
-// clip as a .fbx, byte-indistinguishable by extension from a static mesh), and the
-// reference rig/character mesh each pack bundles is excluded by filename so only the
-// clips are reclassified.
-func refineModel(pack, name string) Category {
-	if !animPackRe.MatchString(strings.ToLower(pack)) {
+// a clip inside an animation pack. Some signal beyond the extension is needed because
+// Synty ships every clip as a .fbx, byte-indistinguishable from a static mesh. The
+// pack name carries it for a pack released as itself; a vendor that ships a whole
+// engine project instead puts a container like "Assets" in the pack slot, leaving a
+// directory further inside the pack to carry it. The reference rig/character mesh
+// each pack bundles is excluded by filename so only the clips are reclassified.
+//
+// The filename is deliberately not a promotion signal, only an exclusion one: a prop
+// named for motion is a prop, and no vendor here names a clip for the pack it is in.
+func refineModel(relPath, vendor, pack, name string) Category {
+	dir := path.Dir(withinPack(relPath, vendor, pack))
+	if !animPackRe.MatchString(strings.ToLower(pack)) && !animPackRe.MatchString(strings.ToLower(dir)) {
 		return CategoryModel
 	}
 	if rigRefRe.MatchString(strings.ToLower(name)) {
@@ -86,23 +93,25 @@ func refineModel(pack, name string) Category {
 	return CategoryAnimation
 }
 
+// withinPack returns the path inside the pack: the part after "::" for an archive
+// entry, the library-relative path minus the vendor/pack prefix for a loose file.
+// The two forms have to agree, since an extracted file and the archive entry it came
+// from are the same asset and must classify the same way.
+func withinPack(relPath, vendor, pack string) string {
+	if i := strings.LastIndex(relPath, "::"); i >= 0 {
+		return relPath[i+len("::"):]
+	}
+	return packSubpath(relPath, vendor, pack)
+}
+
 // refineImage narrows a file already classified as an image to ui, texture, or plain
 // image using its path. UI containers win (a HUD sprite is UI even if the pack also
 // ships textures), then texture folders and material-map suffixes, else a plain image.
 //
-// It matches only the path within the pack — after "::" for an archive entry, after
-// the vendor/pack prefix for a loose file — never the pack or archive name: a pack
-// called "POLYGON_Icons" must not make its textures read as UI. Matching a loose
-// file's whole library-relative path would do exactly that, and would also classify
-// it differently from the byte-identical copy inside the pack's own archive.
+// It matches only the path within the pack, never the pack or archive name: a pack
+// called "POLYGON_Icons" must not make its textures read as UI.
 func refineImage(relPath, vendor, pack string) Category {
-	p := relPath
-	if i := strings.LastIndex(p, "::"); i >= 0 {
-		p = p[i+len("::"):]
-	} else {
-		p = packSubpath(p, vendor, pack)
-	}
-	p = strings.ToLower(p)
+	p := strings.ToLower(withinPack(relPath, vendor, pack))
 	switch {
 	case uiTokenRe.MatchString(p):
 		return CategoryUI

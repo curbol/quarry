@@ -19,7 +19,7 @@ import (
 // also keys the unpacked-archive tree, so a change to what extraction writes belongs
 // here too: an archive whose bytes never changed keeps its fingerprint, and only the
 // version tells the old extraction apart from what the current code would produce.
-const indexVersion = 19
+const indexVersion = 20
 
 // SkippedFile records a library file the scan could not read. A damaged archive
 // costs its own contents, not the rest of the library, so the failure is carried

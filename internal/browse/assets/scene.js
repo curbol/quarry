@@ -4,7 +4,7 @@
 // (which has no import map); it is the same file the document's import map points
 // "three" at, so a single three instance is shared across both.
 import * as THREE from '/static/vendor/three/three.module.min.js';
-import { clipsForAsset, clipsMatching, coversBones, matchRig, nameSeries, packRigCandidates } from '/static/rigmatch.js';
+import { clipsForAsset, clipsMatching, coversBones, matchRig, nameSeries, packRigCandidates, stackedCharacter } from '/static/rigmatch.js';
 import { GLTFLoader } from '/static/vendor/three/jsm/loaders/GLTFLoader.js';
 import { FBXLoader } from '/static/vendor/three/jsm/loaders/FBXLoader.js';
 
@@ -270,6 +270,40 @@ function prepareClipRig(rig, rootRest) {
   return posedBox(rig);
 }
 
+// oneCharacter reduces a file that stacks a pack's whole cast — each character skinned to
+// its own copy of one rig, all of them at the origin under the same bone names — to the
+// single built copy, so that every bone name resolves to exactly one node. Which copy
+// that is, and whether the file is such a stack at all, is stackedCharacter's decision.
+//
+// The copies that go are unlinked rather than left hidden: they are what breaks posing.
+// A track binds to the first bone of its name and a rest rotation is read from the first
+// too, so with the copies still in the hierarchy half the reads land on a namesake that
+// holds a collapsed rest and never moves. Their meshes are rebound to the surviving
+// skeleton — every copy is the same rig at the same origin, so they wear the kept
+// character's pose, and hideAlternates thins the stack of bodies afterwards.
+function oneCharacter(root) {
+  const skels = [];
+  root.traverse((n) => { if (n.isSkinnedMesh && n.skeleton && !skels.includes(n.skeleton)) skels.push(n.skeleton); });
+  const i = stackedCharacter(skels.map((s) => ({
+    names: s.bones.map((b) => b.name),
+    placed: s.bones.filter((b) => b.position.lengthSq() > 1e-8).length,
+  })));
+  if (i < 0) return root;
+  const keep = skels[i];
+  const kept = new Set(keep.bones);
+  const drop = [];
+  root.traverse((n) => { if (n.isBone && !kept.has(n)) drop.push(n); });
+  const dropped = new Set(drop);
+  // A copy's bones can carry the kept character's below them, so lift those out before
+  // unlinking, or removing a namesake takes the character with it.
+  for (const b of drop) {
+    for (const child of b.children.slice()) if (!dropped.has(child)) b.parent.add(child);
+  }
+  for (const b of drop) if (b.parent) b.parent.remove(b);
+  root.traverse((n) => { if (n.isSkinnedMesh) n.bind(keep, n.bindMatrix); });
+  return root;
+}
+
 // cloneRig deep-clones a skinned character (three's Object3D.clone shares the skeleton, so
 // posing one clone would move them all). Same algorithm as three's SkeletonUtils.clone: clone
 // the hierarchy, then rebind each SkinnedMesh to a cloned skeleton whose bones point at the
@@ -372,8 +406,12 @@ function syntyNeutral() {
 // original clip when no rotation maps (so a native rig still plays).
 function retargetClip(clip, neutral, rig) {
   rig.traverse((o) => { if (o.isSkinnedMesh && o.skeleton) o.skeleton.pose(); });
+  // First of a repeated name wins, because that is the bone the mixer will drive:
+  // three resolves a track to the first node carrying its name. Rebasing through a
+  // later namesake's rest rotation poses every one of those bones from a rest it is
+  // not in, which is the difference between a body and a shredded one.
   const bind = new Map();
-  rig.traverse((n) => { if (n.isBone) bind.set(n.name, n.quaternion.clone()); });
+  rig.traverse((n) => { if (n.isBone && !bind.has(n.name)) bind.set(n.name, n.quaternion.clone()); });
   const src = new THREE.Quaternion(), delta = new THREE.Quaternion(), inv = new THREE.Quaternion(), out = new THREE.Quaternion();
   const tracks = [];
   let rotated = 0;
@@ -475,13 +513,14 @@ function disposeClone(object) {
 }
 
 // rigEntry describes an asset as a rig a clip can play on, or null when it is not one.
-// Several skeletons carrying the same bone names is one character whose props (a sword,
-// a helmet) each ship as their own skinned mesh on a copy of the rig — nested, so posing
-// the outer copy carries the props with it. Several *different* skeletons is a showcase
-// file packing many characters into one mesh; there the duplicate names bind ambiguously
-// and shred the pose, so it never becomes a rig. Bone names are recorded deduped: a
-// replicated skeleton would otherwise count its bones once per copy, which reads as a
-// showcase mesh to match().
+// Several skeletons carrying the same bone names is one rig replicated: a character
+// whose props (a sword, a helmet) each ship on a copy of it, or a pack's whole cast
+// stacked in one file. Either way oneCharacter reduces the file to a single body before
+// anything poses on it. Several *different* skeletons is a file packing unrelated rigs
+// together, where no one of them stands in for the rest, so it never becomes a rig —
+// there the duplicate names bind ambiguously and shred the pose. Bone names are recorded
+// deduped: a replicated skeleton would otherwise count its bones once per copy, which
+// reads as a showcase mesh to match().
 function rigEntry(item, root) {
   const skels = new Set();
   root.traverse((n) => { if (n.isSkinnedMesh && n.skeleton) skels.add(n.skeleton); });
@@ -674,6 +713,6 @@ export {
   clipsForAsset, coversBones,
   loadModel, loadSidekick, normalizeClip, boneNames, clipBones, loadRMClips, isSynty,
   resolveRig, posedBox, frameBox, isRenderable, captureRootRest, uprightRig, prepareClipRig,
-  cloneRig, hideAlternates, poseAt, retargetedFor, stripRootMotion, dispose, disposeClone, CharRegistry, rigEntry, rigCandidates, CLAY, _posedV,
+  cloneRig, oneCharacter, hideAlternates, poseAt, retargetedFor, stripRootMotion, dispose, disposeClone, CharRegistry, rigEntry, rigCandidates, CLAY, _posedV,
   rootBone, rootBoneName,
 };

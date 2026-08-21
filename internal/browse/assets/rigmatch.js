@@ -109,3 +109,30 @@ export function packRigCandidates(items, clipName, limit = 3) {
     .filter((it) => nameSeries(it.name) !== series && LOADABLE_RIG_EXTS.includes(it.ext))
     .slice(0, limit);
 }
+
+// stackedCharacter picks which skeleton is the character in a file that stacks several
+// copies of one rig. A vendor ships a pack's whole cast that way, each character skinned
+// to its own copy of the same bone names; only one copy is built, its bones carrying the
+// rest offsets that give a body its proportions, while the others collapse to the
+// armature origin. Returns that copy's index, or -1 when the file is not that shape and
+// has to be left as it is: a lone skeleton, copies that are all built (a character whose
+// props ride on rig copies of their own), or skeletons that are not the same rig at all.
+//
+// A stack has to be collapsed before anything poses on it, because a repeated bone name
+// resolves to one node and one node only — three binds each animation track to the first
+// bone of that name — so every copy past that one holds a rest pose nothing drives while
+// its mesh is skinned as though it moved.
+export function stackedCharacter(skeletons) {
+  const skels = skeletons || [];
+  if (skels.length < 2) return -1;
+  const sameRig = (s) => [...new Set(s.names)].sort().join('|');
+  const rig = sameRig(skels[0]);
+  let built = -1;
+  for (let i = 0; i < skels.length; i++) {
+    if (sameRig(skels[i]) !== rig) return -1;
+    if (!skels[i].placed) continue;
+    if (built >= 0) return -1; // two built copies: nothing marks out which is the character
+    built = i;
+  }
+  return built;
+}

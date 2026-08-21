@@ -9,7 +9,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  clipsForAsset, clipsMatching, coversBones, matchRig, nameSeries, packRigCandidates,
+  clipsForAsset, clipsMatching, coversBones, matchRig, nameSeries, packRigCandidates, stackedCharacter,
 } from '../assets/rigmatch.js';
 
 const clips = (...names) => names.map((name) => ({ name }));
@@ -167,4 +167,43 @@ test('pack candidates drop the clip series and anything unloadable', () => {
   // Heaviest-first order is the caller's; this only narrows and caps.
   assert.equal(packRigCandidates(page, 'A_Walk', 10).length, 4);
   assert.deepEqual(packRigCandidates(null, 'A_Walk'), []);
+});
+
+const skel = (names, placed = 0) => ({ names, placed });
+
+// Synty ships a pack's characters stacked in one file, every one of them on its own
+// copy of the same bone names. Only the built copy carries rest offsets.
+test('the built copy is the character in a stack of one rig', () => {
+  const rig = bones(50);
+  assert.equal(stackedCharacter([skel(rig), skel(rig, 49)]), 1);
+  // A pack's whole cast: 25 copies, one of them built.
+  const cast = Array.from({ length: 25 }, (_, i) => skel(rig, i === 22 ? 49 : 0));
+  assert.equal(stackedCharacter(cast), 22);
+});
+
+// The stack is only safe to collapse when every copy really is the same rig, and when
+// exactly one of them is built. Anything else is a file this knows nothing about.
+test('only a stack of one rig with a single built copy collapses', () => {
+  const rig = bones(50);
+  // One skeleton: a plain character, nothing to collapse.
+  assert.equal(stackedCharacter([skel(rig, 49)]), -1);
+  // Every copy built: a character carrying props on rig copies, which poses correctly
+  // as it is — the outer copy drags the props with it.
+  assert.equal(stackedCharacter([skel(rig, 49), skel(rig, 49)]), -1);
+  // No copy built at all: not the shape this reads.
+  assert.equal(stackedCharacter([skel(rig), skel(rig)]), -1);
+  // Two built among many: nothing marks out which one is the character.
+  assert.equal(stackedCharacter([skel(rig), skel(rig, 49), skel(rig, 49)]), -1);
+  // Different rigs sharing a file: a showcase of genuinely different skeletons, where
+  // no one of them stands in for the rest.
+  assert.equal(stackedCharacter([skel(rig), skel(bones(30, 'z'), 29)]), -1);
+  assert.equal(stackedCharacter([]), -1);
+  assert.equal(stackedCharacter(null), -1);
+});
+
+// A single character's own rig can repeat a name (the Synty body names both hands'
+// finger bones alike), so copies are compared on the names they carry, not the count.
+test('a rig that repeats a name within itself still stacks', () => {
+  const rig = [...bones(50), 'Thumb_01', 'Thumb_01'];
+  assert.equal(stackedCharacter([skel(rig), skel(rig, 49)]), 1);
 });

@@ -13,7 +13,7 @@ import {
   contentURL, thumbURL, loadModel, loadSidekick, normalizeClip, clipBones, clipsForAsset,
   loadRMClips, isSynty, coversBones, resolveRig, posedBox, frameBox, isRenderable, captureRootRest,
   uprightRig, prepareClipRig, poseAt, retargetedFor, stripRootMotion, dispose, CharRegistry,
-  rigEntry, rigCandidates, rootBoneName, hideAlternates, CLAY, _posedV,
+  rigEntry, rigCandidates, rootBoneName, oneCharacter, hideAlternates, CLAY, _posedV,
 } from '/static/scene.js';
 import { iconEl } from '/static/icons.js';
 import { modelThumbs } from '/static/thumbs.js';
@@ -247,6 +247,7 @@ export function startViewer(container, asset, panels) {
     const superseded = () => stopped || mine !== charSeq;
     return loadModel(contentURL(item.id), item.ext).then(async (char) => {
       if (superseded()) { dispose(char); return true; }
+      oneCharacter(char);
       const entry = rigEntry(item, char);
       if (entry && CharRegistry.add(entry)) modelThumbs.reseed();
       hideAlternates(char);

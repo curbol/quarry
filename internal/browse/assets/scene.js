@@ -304,6 +304,59 @@ function oneCharacter(root) {
   return root;
 }
 
+// A file's skin carries a bind pose and its skeleton nodes carry a rest pose, and the two
+// name the same thing: the pose in which the mesh is undeformed. Nearly every file has
+// them agree, and for those alignBindToRest does nothing at all.
+//
+// BIND_REST_TOL is how far apart they may sit and still count as the same pose. Loaders
+// and exporters round; a body a whole limb out of place does not.
+const BIND_REST_TOL = THREE.MathUtils.degToRad(5);
+
+// bindMatchesRest reports whether a skinned object's stored bind pose is the pose its
+// skeleton nodes are actually in, comparing rotation only: bone lengths are shared between
+// the two by construction, and it is the rotations that come apart.
+function bindMatchesRest(rig) {
+  const pos = new THREE.Vector3(), scl = new THREE.Vector3();
+  const bindQ = new THREE.Quaternion(), restQ = new THREE.Quaternion();
+  const bindWorld = new THREE.Matrix4();
+  let match = true;
+  rig.updateMatrixWorld(true);
+  rig.traverse((m) => {
+    if (!match || !m.isSkinnedMesh || !m.skeleton) return;
+    const { bones, boneInverses } = m.skeleton;
+    for (let i = 0; i < bones.length; i++) {
+      if (!bones[i] || !boneInverses[i]) continue;
+      bindWorld.copy(boneInverses[i]).invert().decompose(pos, bindQ, scl);
+      bones[i].matrixWorld.decompose(pos, restQ, scl);
+      if (restQ.angleTo(bindQ) > BIND_REST_TOL) { match = false; return; }
+    }
+  });
+  return match;
+}
+
+// alignBindToRest makes a borrowed rig's undeformed pose the one its skeleton nodes are in.
+// A rig borrowed for a mesh-less clip is only a coordinate frame for someone else's motion,
+// and that motion is authored as node transforms on the rig's own family — so when the two
+// poses disagree, the nodes are the frame the clip means and the stored bind is the one
+// that cannot be right. Left alone, every such clip poses into a shredded body.
+//
+// Only for a borrowed rig. A file that ships its own mesh and its own clips exported
+// together is authoritative about its own bind even when its nodes rest elsewhere, which is
+// what a "Character@Animation" file is: its nodes hold frame one, not a reference pose.
+function alignBindToRest(rig) {
+  if (bindMatchesRest(rig)) return rig; // which left every world matrix current
+  rig.traverse((m) => {
+    if (!m.isSkinnedMesh || !m.skeleton) return;
+    // The bind matrix carries the mesh into the space the bone inverses are written in, so
+    // moving the inverses without it leaves the two describing different poses — which is
+    // the shredded body this exists to prevent, arrived at from the other side.
+    m.skeleton.calculateInverses();
+    m.bindMatrix.copy(m.matrixWorld);
+    m.bindMatrixInverse.copy(m.matrixWorld).invert();
+  });
+  return rig;
+}
+
 // cloneRig deep-clones a skinned character (three's Object3D.clone shares the skeleton, so
 // posing one clone would move them all). Same algorithm as three's SkeletonUtils.clone: clone
 // the hierarchy, then rebind each SkinnedMesh to a cloned skeleton whose bones point at the
@@ -713,6 +766,6 @@ export {
   clipsForAsset, coversBones,
   loadModel, loadSidekick, normalizeClip, boneNames, clipBones, loadRMClips, isSynty,
   resolveRig, posedBox, frameBox, isRenderable, captureRootRest, uprightRig, prepareClipRig,
-  cloneRig, oneCharacter, hideAlternates, poseAt, retargetedFor, stripRootMotion, dispose, disposeClone, CharRegistry, rigEntry, rigCandidates, CLAY, _posedV,
+  cloneRig, oneCharacter, alignBindToRest, hideAlternates, poseAt, retargetedFor, stripRootMotion, dispose, disposeClone, CharRegistry, rigEntry, rigCandidates, CLAY, _posedV,
   rootBone, rootBoneName,
 };

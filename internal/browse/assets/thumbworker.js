@@ -30,7 +30,7 @@ if (typeof window === 'undefined') {
 import * as THREE from '/static/vendor/three/three.module.min.js';
 import {
   loadModel, loadSidekick, clipsForAsset, prepareClipRig, poseAt, stripRootMotion, isRenderable, isSynty,
-  captureRootRest, cloneRig, oneCharacter, hideAlternates, retargetedFor, dispose, disposeClone, CharRegistry, frameBox, contentURL, clipBones,
+  captureRootRest, cloneRig, oneCharacter, alignBindToRest, hideAlternates, retargetedFor, dispose, disposeClone, CharRegistry, frameBox, contentURL, clipBones,
   rootBoneName, resolveRig,
 } from '/static/scene.js';
 import { JobTracker } from '/static/jobtracker.js';
@@ -178,7 +178,7 @@ async function rigFor(clip, asset) {
     const cached = rigs.get(m.id);
     if (cached) return cached;
     const rig = await loadModel(contentURL(m.id), m.ext)
-      .then((r) => (isRenderable(r) ? oneCharacter(r) : (dispose(r), null)))
+      .then((r) => (isRenderable(r) ? alignBindToRest(oneCharacter(r)) : (dispose(r), null)))
       .catch(() => null);
     if (rig) {
       rigs.set(m.id, rig);

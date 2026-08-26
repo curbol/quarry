@@ -1071,7 +1071,10 @@ function openLightbox(a) {
   // lives in the copies list below, so there's a single copy system either way.
   const bitmap = /^(png|jpe?g|gif|webp|bmp)$/i.test(a.ext || '');
   const hasDims = a.width > 0 && a.height > 0;
-  const fields = [['Category', a.category], ['Format', a.ext || '—'], ['Size', humanSize(a.size)]];
+  // A card groups by name and size, so its copies can come from different vendors;
+  // the panel names every one rather than only the representative's.
+  const vendors = [...new Set(copiesOf(a).map((c) => c.vendor).filter(Boolean))];
+  const fields = [['Vendor', vendors.join(', ') || '—'], ['Category', a.category], ['Format', a.ext || '—'], ['Size', humanSize(a.size)]];
   if (hasDims) fields.push(['Dimensions', `${a.width} × ${a.height}`]);
   else if (bitmap) fields.push(['Dimensions', '…']);
   lb.fields.innerHTML = fields.map(([k, v]) => `<dt>${escapeHTML(k)}</dt><dd data-field="${escapeHTML(k)}">${escapeHTML(v)}</dd>`).join('');
@@ -1187,14 +1190,20 @@ function lbTagChip(a, id) {
   return chip;
 }
 
+// copiesOf is the card's occurrences, falling back to the representative's own
+// fields for a payload that carries no copies list.
+function copiesOf(a) {
+  return (a.copies && a.copies.length)
+    ? a.copies
+    : [{ variant: a.variant, vendor: a.vendor, pack: a.pack, copyPath: a.copyPath }];
+}
+
 // renderCopies lists where the file lives — one row for a unique file, or every
 // occurrence for a file shipped across variants/packs — each with its own copy
 // button, plus a copy-all when there's more than one. One system, one or many.
 function renderCopies(a) {
   lb.copies.replaceChildren();
-  const copies = (a.copies && a.copies.length)
-    ? a.copies
-    : [{ variant: a.variant, vendor: a.vendor, pack: a.pack, copyPath: a.copyPath }];
+  const copies = copiesOf(a);
   const many = copies.length > 1;
 
   const head = document.createElement('div');

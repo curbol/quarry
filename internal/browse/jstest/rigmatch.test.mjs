@@ -9,7 +9,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  clipsForAsset, clipsMatching, coversBones, matchRig, nameSeries, packRigCandidates, stackedCharacter,
+  clipsForAsset, clipsMatching, coversBones, matchRig, nameSeries, packRigCandidates, searchedSkeleton,
+  stackedCharacter,
 } from '../assets/rigmatch.js';
 
 const clips = (...names) => names.map((name) => ({ name }));
@@ -137,6 +138,25 @@ test('no bones, no entries, no match', () => {
   assert.equal(matchRig([entry({ id: 'a', bones: bones(20) })], [], 'synty'), null);
   assert.equal(matchRig([], bones(20), 'synty'), null);
   assert.equal(matchRig(null, bones(20), 'synty'), null);
+});
+
+// A pack that ships two skeletons is the case this exists for: DoubleL ships Unity-named
+// clips beside a Unity-named body and Unreal-named clips beside an Unreal-named body, and
+// the two share no bone name. One search per pack registers whichever body covers the clip
+// that reached it first and stops, leaving the other skeleton's clips with nothing to pose
+// on for the session.
+test('a skeleton sharing no bone with one already searched for is searched on its own', () => {
+  const unity = bones(70);
+  const unreal = bones(90, 'u');
+  assert.equal(searchedSkeleton([unity], unity), true);
+  assert.equal(searchedSkeleton([unity], unreal), false);
+  assert.equal(searchedSkeleton([unity, unreal], unreal), true);
+});
+
+// Nothing searched for yet: the first clip of a pack has to reach the search.
+test('an empty history has searched for nothing', () => {
+  assert.equal(searchedSkeleton([], bones(20)), false);
+  assert.equal(searchedSkeleton(undefined, bones(20)), false);
 });
 
 test('nameSeries is the leading word, on any of the separators a vendor uses', () => {

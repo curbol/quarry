@@ -4,7 +4,7 @@
 // (which has no import map); it is the same file the document's import map points
 // "three" at, so a single three instance is shared across both.
 import * as THREE from '/static/vendor/three/three.module.min.js';
-import { clipsForAsset, clipsMatching, coversBones, matchRig, nameSeries, packRigCandidates, stackedCharacter } from '/static/rigmatch.js';
+import { clipsForAsset, clipsMatching, coversBones, matchRig, nameSeries, packRigCandidates, searchedSkeleton, stackedCharacter } from '/static/rigmatch.js';
 import { GLTFLoader } from '/static/vendor/three/jsm/loaders/GLTFLoader.js';
 import { FBXLoader } from '/static/vendor/three/jsm/loaders/FBXLoader.js';
 
@@ -724,17 +724,21 @@ const CharRegistry = {
   },
   // When the seed didn't cover a clip's rig, look for a body in the clip's own vendor
   // (a clip's native character usually ships in the same vendor's packs).
-  discovered: new Set(),
+  discovered: new Map(),
   async discoverForVendor(asset, want) {
     const { vendor, pack, name } = asset || {};
     if (!vendor) return;
-    // Once per vendor+pack. Establishing that a pack ships no body costs up to fourteen
-    // model downloads and parses, and a candidate that turns out not to be a rig is
-    // never registered — so the seen set below cannot remember it and every clip card
-    // in the pack would pay the whole search again, on every grid rebuild.
+    // Once per vendor+pack per skeleton, remembering the skeletons already searched for.
+    // Establishing that a pack ships no body costs up to fourteen model downloads and
+    // parses, and a candidate that turns out not to be a rig is never registered — so the
+    // seen set below cannot remember it and every clip card in the pack would pay the
+    // whole search again, on every grid rebuild. The skeleton belongs in the scope
+    // because the search stops at the first rig covering the clip that reached it: a
+    // second skeleton in the same pack would be left with nothing registered to play it.
     const scope = vendor + '\u0000' + (pack || '');
-    if (this.discovered.has(scope)) return;
-    this.discovered.add(scope);
+    const tried = this.discovered.get(scope);
+    if (tried && searchedSkeleton(tried, want)) return;
+    this.discovered.set(scope, (tried || []).concat([want]));
     // Load candidate bodies until one actually covers this clip (a single showcase mesh can
     // win by bone count yet be a multi-skeleton mesh register now rejects, and some bodies
     // ship a different skeleton family that shares no bone names). Stop at the first covering

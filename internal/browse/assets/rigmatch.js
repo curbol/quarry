@@ -89,6 +89,20 @@ export function matchRig(entries, bones, vendor) {
   return best;
 }
 
+// searchedSkeleton reports whether one of the bone sets already searched for is the same
+// skeleton as this clip's, so searching again would load the same models to the same end.
+// A pack can ship two skeletons that share no bone name — a Unity-named body and clips
+// beside an Unreal-named body and clips — and a search that came up empty for one says
+// nothing about the other, so each has to be searched on its own.
+//
+// Sameness is the coverage test read the other way round: a rig that could play this clip
+// would have had to cover an already-searched set too, and the search that set made found
+// none. Erring toward searching again costs a repeated pass; erring the other way leaves
+// a whole skeleton's clips with no body for the session.
+export function searchedSkeleton(tried, bones) {
+  return (tried || []).some((prev) => coversBones(prev, bones) > 0);
+}
+
 // nameSeries is a file name's leading word — "A" in A_POLY_BOW_Cmp_Idle, "Paladin" in
 // Paladin WProp J Nordstrom. Files a vendor generates as one series share it.
 export const nameSeries = (name) => (name || '').split(/[_@\-. ]/)[0].toLowerCase();

@@ -1644,3 +1644,87 @@ func TestRebuildingATornExtractionDoesNotFailHealthySiblings(t *testing.T) {
 		t.Errorf("%d of %d members failed while the torn one rebuilt", n, members)
 	}
 }
+
+// browse tells a miss from a real failure by fs.ErrNotExist alone, answering the first
+// with a 404 and the second with a 500 naming the cause. The loose and unpacked
+// branches of Open get that from the filesystem; the zip branch builds its own error
+// for an entry the central directory does not carry, and unwrapped it was the one miss
+// in the set that came back as a server failure.
+func TestAMissingZipEntryReportsAMiss(t *testing.T) {
+	root, mk := libRoot(t)
+	archive := mk("v", "Pack", "Pack_A_v1.zip")
+	writeZip(t, archive, map[string]string{"Heart.fbx": "BYTES"})
+	ix, err := Build(Options{Root: root, CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ix.Assets) != 1 {
+		t.Fatalf("indexed %d assets, want 1", len(ix.Assets))
+	}
+
+	// The asset the index holds, for an entry the archive stopped carrying — a pack
+	// re-shipped under the same name while quarry was running.
+	gone := ix.Assets[0]
+	gone.Source.Entry = "Gone.fbx"
+	_, _, err = ix.Open(gone)
+	if !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("Open = %v, want it to wrap fs.ErrNotExist so browse answers 404 rather than 500", err)
+	}
+	// Still legible: the wrap must not cost the message naming what was looked for.
+	if err == nil || !strings.Contains(err.Error(), "Gone.fbx") {
+		t.Errorf("Open error %v does not name the entry", err)
+	}
+}
+
+// The reader cache holds an archive's parsed central directory, which maps an entry
+// name to an offset in the file it was read from. A pack re-shipped in place keeps its
+// path and its inode, so reusing that directory across the rewrite resolves names into
+// a file that no longer has that shape. The entry removed outright was the worst of it:
+// an empty body under the old entry's Content-Length, with nothing reporting a problem.
+func TestARewrittenArchiveIsNotServedFromTheCachedDirectory(t *testing.T) {
+	root, mk := libRoot(t)
+	archive := mk("v", "Pack", "Pack_A_v1.zip")
+	writeZip(t, archive, map[string]string{"Heart.fbx": "ORIGINAL-BYTES"})
+	ix, err := Build(Options{Root: root, CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ix.Assets) != 1 {
+		t.Fatalf("indexed %d assets, want 1", len(ix.Assets))
+	}
+	a := ix.Assets[0]
+	read := func() (string, int64, error) {
+		rc, n, err := ix.Open(a)
+		if err != nil {
+			return "", 0, err
+		}
+		defer rc.Close()
+		b, err := io.ReadAll(rc)
+		return string(b), n, err
+	}
+
+	// Populates the cache with this archive's directory.
+	if got, _, err := read(); err != nil || got != "ORIGINAL-BYTES" {
+		t.Fatalf("read = %q, %v; want the original bytes", got, err)
+	}
+
+	// Re-shipped in place, the entry still there but longer.
+	writeZip(t, archive, map[string]string{"Heart.fbx": "REPLACED-BYTES-AND-THEN-SOME"})
+	got, n, err := read()
+	if err != nil {
+		t.Fatalf("read after the rewrite: %v", err)
+	}
+	if got != "REPLACED-BYTES-AND-THEN-SOME" {
+		t.Errorf("read = %q, want the bytes the archive holds now", got)
+	}
+	if n != int64(len(got)) {
+		t.Errorf("reported size %d, want %d: a Content-Length from the stale directory truncates the response", n, len(got))
+	}
+
+	// Re-shipped without the entry at all.
+	writeZip(t, archive, map[string]string{"Other.fbx": "SOMETHING-ELSE-ENTIRELY"})
+	got, _, err = read()
+	if !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("read = %q, %v; want fs.ErrNotExist for an entry the archive no longer carries", got, err)
+	}
+}

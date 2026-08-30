@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"fmt"
 	"io"
+	"io/fs"
 	"path"
 	"path/filepath"
 	"strings"
@@ -73,7 +74,11 @@ func (ix *Index) openZipEntry(archivePath, entry string) (io.ReadCloser, int64, 
 	f := ref.byName[entry]
 	if f == nil {
 		ix.zips.release(ref)
-		return nil, 0, fmt.Errorf("entry %q not found in %s", entry, filepath.Base(archivePath))
+		// Wrapped so this reads as the miss it is: the loose and unpacked branches of
+		// Open return an fs.ErrNotExist from the filesystem, and browse tells a miss
+		// from a real failure by that alone. Bare, an entry the archive stopped
+		// carrying since the scan answered 500 where its siblings answer 404.
+		return nil, 0, fmt.Errorf("entry %q not found in %s: %w", entry, filepath.Base(archivePath), fs.ErrNotExist)
 	}
 	rc, err := f.Open()
 	if err != nil {
@@ -118,6 +123,14 @@ const zipCacheSize = 8
 // Readers are handed out under a reference count: eviction unpublishes an archive
 // immediately but closes the file only once the last stream over it has finished, so
 // a reader is never closed out from under a response in flight.
+//
+// A cached reader is only reused while the archive it was opened from is still the one
+// on disk, which is what the stat print records. A pack re-shipped in place keeps its
+// path and its inode, so without that check the cached central directory would go on
+// resolving entry names to offsets in a file that no longer has that shape: the entry
+// removed outright came back as an empty body under the old entry's Content-Length,
+// with no error anywhere. That is the same silent-wrong-bytes failure openUnpacked
+// guards against with its size check, arriving by a different route.
 type zipReaders struct {
 	mu    sync.Mutex
 	open  map[string]*zipRef
@@ -127,6 +140,7 @@ type zipReaders struct {
 type zipRef struct {
 	rc      *zip.ReadCloser
 	byName  map[string]*zip.File
+	print   string // the archive's stat print when this was opened
 	refs    int
 	evicted bool
 	// ready is closed once rc/byName are populated (or err is set). It lets acquire
@@ -138,19 +152,31 @@ type zipRef struct {
 }
 
 func (c *zipReaders) acquire(path string) (*zipRef, error) {
+	// Stat outside the lock: it is I/O, and every other content request would wait on
+	// it. A racing writer can move the file between here and the lookup below, which
+	// costs a reopen on the next request and never a stale read.
+	print, err := fingerprint(path)
+	if err != nil {
+		return nil, err
+	}
 	c.mu.Lock()
 	if ref := c.open[path]; ref != nil {
-		ref.refs++
-		c.touchLocked(path)
-		c.mu.Unlock()
-		<-ref.ready
-		if ref.err != nil {
-			c.release(ref)
-			return nil, ref.err
+		if ref.print == print {
+			ref.refs++
+			c.touchLocked(path)
+			c.mu.Unlock()
+			<-ref.ready
+			if ref.err != nil {
+				c.release(ref)
+				return nil, ref.err
+			}
+			return ref, nil
 		}
-		return ref, nil
+		// The archive moved under the cache. Retire the old reader rather than closing
+		// it: a stream over the bytes it describes may still be in flight.
+		c.retireLocked(path)
 	}
-	ref := &zipRef{refs: 1, ready: make(chan struct{})}
+	ref := &zipRef{refs: 1, print: print, ready: make(chan struct{})}
 	if c.open == nil {
 		c.open = map[string]*zipRef{}
 	}
@@ -159,7 +185,8 @@ func (c *zipReaders) acquire(path string) (*zipRef, error) {
 	c.evictLocked()
 	c.mu.Unlock()
 
-	zr, err := zip.OpenReader(path)
+	zr, openErr := zip.OpenReader(path)
+	err = openErr
 	if err == nil {
 		byName := make(map[string]*zip.File, len(zr.File))
 		for _, f := range zr.File {
@@ -214,18 +241,23 @@ func (c *zipReaders) dropOrderLocked(path string) {
 	}
 }
 
+// retireLocked unpublishes an archive so the next acquire opens it afresh, and closes
+// it only if nothing is reading it. A reader still holding it closes it on release.
+func (c *zipReaders) retireLocked(path string) {
+	ref := c.open[path]
+	delete(c.open, path)
+	c.dropOrderLocked(path)
+	if ref == nil {
+		return
+	}
+	ref.evicted = true
+	if ref.refs == 0 && ref.rc != nil {
+		ref.rc.Close()
+	}
+}
+
 func (c *zipReaders) evictLocked() {
 	for len(c.order) > zipCacheSize {
-		oldest := c.order[0]
-		c.order = c.order[1:]
-		ref := c.open[oldest]
-		delete(c.open, oldest)
-		if ref == nil {
-			continue
-		}
-		ref.evicted = true
-		if ref.refs == 0 && ref.rc != nil {
-			ref.rc.Close()
-		}
+		c.retireLocked(c.order[0])
 	}
 }

@@ -1,7 +1,7 @@
 import { contentURL, thumbURL } from '/static/scene.js';
 import { lazyWork, modelThumbs, forgetThumbs, ensureFont } from '/static/thumbs.js';
 import { LIVE, wantedRange, visibleRange, needsRebuild, spacerRows } from '/static/gridwindow.js';
-import { iconEl } from '/static/icons.js';
+import { iconEl, protoClone } from '/static/icons.js';
 import { nextTags } from '/static/tagedit.js';
 import { startViewer } from '/static/viewer.js';
 
@@ -789,19 +789,10 @@ function splitName(name) {
   return [name.slice(0, cut), name.slice(cut)];
 }
 
-// svgIcon clones a parsed glyph instead of re-running the HTML parser. Each card
-// carries two inline SVGs and a window rebuild creates fifteen hundred of them.
+// The page's inline glyphs are keyed by their own markup, which is a module constant
+// here — the category icons keep their own cache keyed by category name.
 const svgProtos = new Map();
-function svgIcon(markup) {
-  let proto = svgProtos.get(markup);
-  if (!proto) {
-    const wrap = document.createElement('div');
-    wrap.innerHTML = markup;
-    proto = wrap.firstElementChild;
-    svgProtos.set(markup, proto);
-  }
-  return proto.cloneNode(true);
-}
+const svgIcon = (markup) => protoClone(svgProtos, markup, markup);
 
 // forgetCard is forgetThumbs plus the tag-repaint registration only a grid card has.
 function forgetCard(el) {

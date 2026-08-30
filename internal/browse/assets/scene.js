@@ -109,10 +109,19 @@ async function loadModel(url, ext) {
 // bind pose and root transform, so overlaying them at the origin reconstructs the whole
 // figure. Parts that fail to load are skipped; null when none load. The parts keep their
 // own (identical) skeletons — enough for a static clay preview.
+//
+// The parts are fetched together rather than in turn: each is its own FBX and none of
+// them informs how the next is loaded, so awaiting them one at a time made a character
+// cost the sum of a dozen round trips — once per grid thumbnail and again in the
+// lightbox. They are added in declaration order so the scene graph does not depend on
+// which request happened to land first.
 async function loadSidekick(parts) {
+  const loaded = await Promise.all((parts || []).map(
+    (pid) => loadModel(contentURL(pid), 'fbx').catch(() => null), // skip a bad part
+  ));
   const group = new THREE.Group();
-  for (const pid of parts || []) {
-    try { group.add(await loadModel(contentURL(pid), 'fbx')); } catch { /* skip a bad part */ }
+  for (const part of loaded) {
+    if (part) group.add(part);
   }
   return group.children.length ? group : null;
 }

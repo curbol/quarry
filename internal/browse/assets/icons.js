@@ -18,19 +18,25 @@ export const ICONS = {
   other: '<circle cx="12" cy="12" r="9"/><path d="M12 8v4l3 2"/>',
 };
 
-// Each glyph is parsed once and cloned per use. The grid draws one icon per card and
-// rebuilds its live window as the user scrolls, so building the markup and handing it
-// to the HTML parser per call runs the parser thousands of times over a long scroll.
+// protoClone parses markup once per key and clones it thereafter. The grid draws two
+// inline SVGs per card and rebuilds its live window as the user scrolls, so handing the
+// same markup to the HTML parser on every call runs it thousands of times over a long
+// scroll. Exported because the page's own inline glyphs need the same treatment for the
+// same reason; each caller brings its own cache so the keyspaces stay separate.
+export function protoClone(cache, key, markup) {
+  let proto = cache.get(key);
+  if (!proto) {
+    const wrap = document.createElement('div');
+    wrap.innerHTML = markup;
+    proto = wrap.firstElementChild;
+    cache.set(key, proto);
+  }
+  return proto.cloneNode(true);
+}
+
 const parsed = new Map();
 
 export function iconEl(category) {
   const key = ICONS[category] ? category : 'other';
-  let proto = parsed.get(key);
-  if (!proto) {
-    const wrap = document.createElement('div');
-    wrap.innerHTML = `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round">${ICONS[key]}</svg>`;
-    proto = wrap.firstElementChild;
-    parsed.set(key, proto);
-  }
-  return proto.cloneNode(true);
+  return protoClone(parsed, key, `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round">${ICONS[key]}</svg>`);
 }

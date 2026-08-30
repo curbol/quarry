@@ -1564,3 +1564,83 @@ func TestConcurrentZipReads(t *testing.T) {
 		t.Error(err)
 	}
 }
+
+// A torn member rebuilds the whole extraction, and the rebuild used to remove the tree
+// out from under readers that had already passed ensureExtracted's stat of it. The
+// removal is not instantaneous over a package holding thousands of members, so sibling
+// after sibling whose own bytes were never torn opened a path that had just gone away —
+// and browse answers that with a plain 404, indistinguishable from an asset that never
+// existed.
+func TestRebuildingATornExtractionDoesNotFailHealthySiblings(t *testing.T) {
+	root, mk := libRoot(t)
+	pkg := mk("v", "Pack", "Pack.unitypackage")
+	const members = 400
+	guids := make([]unityGUID, 0, members)
+	for i := range members {
+		guids = append(guids, unityGUID{
+			guid:     fmt.Sprintf("g%04d", i),
+			pathname: fmt.Sprintf("Assets/M/thing%04d.fbx", i),
+			asset:    fmt.Sprintf("FBXBYTES-%04d", i),
+		})
+	}
+	writeUnityPackage(t, pkg, guids)
+	ix, err := Build(Options{Root: root, CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ix.Assets) != members {
+		t.Fatalf("indexed %d assets, want %d", len(ix.Assets), members)
+	}
+	dir, err := ix.ensureExtracted(pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// One member torn the way a crash mid-extraction leaves it: the rename landed, the
+	// data blocks did not.
+	torn := ix.Assets[0]
+	if err := os.WriteFile(filepath.Join(dir, torn.Source.Guid, "asset"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	errs := make(chan error, members)
+	start := make(chan struct{})
+	open := func(a Asset) error {
+		rc, _, err := ix.Open(a)
+		if err != nil {
+			return fmt.Errorf("open %s: %w", a.Name, err)
+		}
+		defer rc.Close()
+		b, err := io.ReadAll(rc)
+		if err != nil {
+			return fmt.Errorf("read %s: %w", a.Name, err)
+		}
+		if len(b) != int(a.Size) {
+			return fmt.Errorf("%s: read %d bytes, want %d", a.Name, len(b), a.Size)
+		}
+		return nil
+	}
+	for i := range members {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			if err := open(ix.Assets[i]); err != nil {
+				errs <- err
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	n := 0
+	for err := range errs {
+		if n < 3 {
+			t.Error(err)
+		}
+		n++
+	}
+	if n > 0 {
+		t.Errorf("%d of %d members failed while the torn one rebuilt", n, members)
+	}
+}

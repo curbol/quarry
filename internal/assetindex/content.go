@@ -62,11 +62,7 @@ func (ix *Index) Open(a Asset) (io.ReadCloser, int64, error) {
 //
 // want is the size the scan recorded; -1 for a member the index does not size.
 func (ix *Index) openUnpacked(a Asset, member string, want int64) (io.ReadCloser, int64, error) {
-	p, err := ix.unpackedEntry(a, member)
-	if err != nil {
-		return nil, 0, err
-	}
-	rc, n, err := openFile(p)
+	rc, n, err := ix.openUnpackedMember(a, member)
 	// Only a member that opened and disagreed is evidence of a torn tree. A missing one
 	// is an ordinary miss — a guid this package does not hold — and re-extracting
 	// hundreds of MB to confirm that would be its own bug.
@@ -77,10 +73,7 @@ func (ix *Index) openUnpacked(a Asset, member string, want int64) (io.ReadCloser
 	if err := ix.discardExtraction(a.Source.ArchivePath); err != nil {
 		return nil, 0, err
 	}
-	if p, err = ix.unpackedEntry(a, member); err != nil {
-		return nil, 0, err
-	}
-	rc, n, err = openFile(p)
+	rc, n, err = ix.openUnpackedMember(a, member)
 	if err == nil && n != want {
 		rc.Close()
 		return nil, 0, fmt.Errorf("extracted %s is %d bytes, want %d", a.RelPath, n, want)
@@ -88,14 +81,60 @@ func (ix *Index) openUnpacked(a Asset, member string, want int64) (io.ReadCloser
 	return rc, n, err
 }
 
-// discardExtraction removes a published extraction so the next request rebuilds it.
-// ensureExtracted clears its single-flight entry after every call precisely so a dest
-// that disappears is extracted again rather than reported present by a spent Once.
+// openUnpackedMember opens one extracted member, holding the archive's read lock from
+// the extraction check through the open. A discard takes the same lock exclusively, so
+// a reader can no longer pass ensureExtracted's stat of a published tree and then open
+// a path a concurrent discard has already removed. That window was not an instruction
+// gap but the whole duration of the removal, which over a package holding tens of
+// thousands of members answered 404 for sibling after sibling whose own bytes were
+// never torn.
+//
+// The lock is released once the file is open rather than held for the stream: the
+// descriptor keeps the member's bytes readable through an unlink, so a rebuild landing
+// mid-read costs the reader nothing.
+func (ix *Index) openUnpackedMember(a Asset, member string) (io.ReadCloser, int64, error) {
+	mu := ix.archiveMu(a.Source.ArchivePath)
+	mu.RLock()
+	defer mu.RUnlock()
+	p, err := ix.unpackedEntry(a, member)
+	if err != nil {
+		return nil, 0, err
+	}
+	return openFile(p)
+}
+
+// archiveMu is the lock serialising one archive's readers against its rebuild. It is
+// keyed on the archive path rather than on the fingerprint naming the extraction
+// directory, because what has to be serialised is this archive's readers against this
+// archive's discard, and the fingerprint is a stat that can move under a file being
+// replaced while the lock is held.
+func (ix *Index) archiveMu(archivePath string) *sync.RWMutex {
+	ix.extractMu.Lock()
+	defer ix.extractMu.Unlock()
+	if ix.archiveMus == nil {
+		ix.archiveMus = map[string]*sync.RWMutex{}
+	}
+	mu := ix.archiveMus[archivePath]
+	if mu == nil {
+		mu = &sync.RWMutex{}
+		ix.archiveMus[archivePath] = mu
+	}
+	return mu
+}
+
+// discardExtraction removes a published extraction so the next request rebuilds it,
+// under the archive's write lock so no reader is between its extraction check and its
+// open while the tree goes away. ensureExtracted clears its single-flight entry after
+// every call precisely so a dest that disappears is extracted again rather than
+// reported present by a spent Once.
 func (ix *Index) discardExtraction(archivePath string) error {
 	fp, err := fingerprint(archivePath)
 	if err != nil {
 		return err
 	}
+	mu := ix.archiveMu(archivePath)
+	mu.Lock()
+	defer mu.Unlock()
 	return os.RemoveAll(filepath.Join(ix.unpackedDir(), fp))
 }
 

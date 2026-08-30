@@ -66,8 +66,11 @@ type Index struct {
 	rootsOnce     sync.Once
 	resolvedRoots []string
 
+	// extractMu guards both maps. extractions single-flights one archive's unpack;
+	// archiveMus holds each archive's reader/rebuild lock (see archiveMu).
 	extractMu   sync.Mutex
 	extractions map[string]*extraction
+	archiveMus  map[string]*sync.RWMutex
 
 	zips zipReaders
 }

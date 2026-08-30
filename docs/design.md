@@ -149,7 +149,7 @@ that file to show the travel, and the RM card is suppressed from the grid. Pairi
 by `(vendor, pack, canonical file base)` where the canonical base strips the `_RM` token — a
 trailing `_RM` (Quaternius/explosive GLBs) or a `_RM_` infix before a suffix (Synty FBX,
 `..._180L_RM_Masc`) — and pairs a group's in-place animations to its RM sibling, preferring one in the same
-directory, then the same archive, then the same clip over a whole-file RM. The directory
+directory, then the same archive. The directory
 is a preference rather than part of the key because a pack laid out per character holds
 several same-named clips with their own RM files, while another ships every RM in one
 folder; keying on it would mispair the first and stop pairing the second. Because a

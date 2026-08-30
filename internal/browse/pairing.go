@@ -122,12 +122,11 @@ func buildRootMotionPairs(assets []assetindex.Asset) (sibling map[string]string,
 // file the grid should still show.
 //
 // Among same-format candidates the terms are weighted, not ordered: the same
-// directory scores above the same archive, which scores above the same clip, so a
-// same-directory RM in another archive beats a different-directory RM in this one.
-// That is deliberate. A pack laid out per character keeps a clip and its RM together,
-// and the directory is the only thing telling one character's "Walk" from another's;
-// where the layout puts every RM in one folder the term simply never fires and the
-// archive term decides.
+// directory scores above the same archive, so a same-directory RM in another archive
+// beats a different-directory RM in this one. That is deliberate. A pack laid out per
+// character keeps a clip and its RM together, and the directory is the only thing
+// telling one character's "Walk" from another's; where the layout puts every RM in one
+// folder the term simply never fires and the archive term decides.
 //
 // The archive term matters because Pack is a directory name: one pack commonly ships
 // as both a SourceFiles zip and a unitypackage holding the same animations, which lands
@@ -149,9 +148,6 @@ func pickRM(assets []assetindex.Asset, rm []int, nonRM assetindex.Asset) string 
 		}
 		if r.Source.ArchivePath == nonRM.Source.ArchivePath {
 			score += 2
-		}
-		if r.Source.Clip == nonRM.Source.Clip {
-			score++
 		}
 		if score > bestScore {
 			best, bestScore = r.ID, score

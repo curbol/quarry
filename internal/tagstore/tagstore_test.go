@@ -296,19 +296,42 @@ func TestDiscoverStopsAtFilesystemRoot(t *testing.T) {
 
 // A project store sits inside the user's own repo, so a failed save must not strand
 // a temp file there: .gitignore covers the store's name, not the temp pattern.
+//
+// The store is loaded and up to date, so the staleness guards pass and the failure is
+// the one this is about: safewrite.Atomic itself. Reaching it is the whole point —
+// a store that never got that far would satisfy every assertion below by writing
+// nothing at all.
 func TestFailedSaveLeavesNoTempFile(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes into an unwritable directory anyway")
+	}
 	dir := t.TempDir()
-	// A directory where the store should go: the write and encode succeed, the rename
-	// onto it does not.
-	blocked := filepath.Join(dir, FileName)
-	if err := os.MkdirAll(blocked, 0o755); err != nil {
+	p := filepath.Join(dir, FileName)
+	seed := New()
+	seed.Define("hero", "#112233")
+	if err := seed.Save(p); err != nil {
 		t.Fatal(err)
 	}
-	s := New()
+	s, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
 	s.Assign("crc32:aa:1", "hero")
 
-	if err := s.Save(blocked); err == nil {
-		t.Fatal("Save reported success renaming onto a directory")
+	// The directory, not the file: the store's own size and mtime have to stay put or
+	// the stale check fires first and the write is never attempted.
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(dir, 0o755) })
+
+	saveErr := s.Save(p)
+	os.Chmod(dir, 0o755)
+	if saveErr == nil {
+		t.Fatal("Save reported success writing into an unwritable directory")
+	}
+	if errors.Is(saveErr, ErrStale) {
+		t.Fatalf("Save = %v, want a write failure: the staleness guard fired instead of safewrite.Atomic", saveErr)
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -321,6 +344,45 @@ func TestFailedSaveLeavesNoTempFile(t *testing.T) {
 	}
 	if got := s.TagsFor("crc32:aa:1"); len(got) != 1 || got[0] != "hero" {
 		t.Errorf("TagsFor = %v after the failed save, want the edit still in memory for the caller to Reload away", got)
+	}
+	after, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := after.TagsFor("crc32:aa:1"); len(got) != 0 {
+		t.Errorf("on disk TagsFor = %v, want the failed write to have changed nothing", got)
+	}
+}
+
+// A store from New() has read nothing, so rewriting a file that already exists would
+// destroy it whole with no earlier state to have noticed the loss against. That is the
+// same total loss ErrStale guards a loaded store from, and it is refused the same way —
+// including when what is already there is a directory rather than a store.
+func TestSaveFromANeverLoadedStoreRefusesAnExistingPath(t *testing.T) {
+	dir := t.TempDir()
+	existing := filepath.Join(dir, FileName)
+	if err := os.WriteFile(existing, []byte("# someone else's store\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := New()
+	s.Assign("crc32:aa:1", "hero")
+	if err := s.Save(existing); !errors.Is(err, ErrStale) {
+		t.Fatalf("Save = %v, want ErrStale: a store that read nothing rewrote a file it never saw", err)
+	}
+	b, err := os.ReadFile(existing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != "# someone else's store\n" {
+		t.Errorf("the file was rewritten: %q", b)
+	}
+
+	blocked := filepath.Join(dir, "sub", FileName)
+	if err := os.MkdirAll(blocked, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Save(blocked); err == nil {
+		t.Error("Save reported success onto a directory")
 	}
 }
 

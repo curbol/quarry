@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"image"
+	"io"
 
 	_ "image/gif"
 	_ "image/jpeg"
@@ -63,4 +64,31 @@ func isDimExt(ext string) bool {
 		return true
 	}
 	return false
+}
+
+// readHead reads up to dimsHeadBytes from r, enough to recover an image's
+// dimensions without pulling a whole file into memory.
+func readHead(r io.Reader) []byte {
+	head, _ := io.ReadAll(io.LimitReader(r, dimsHeadBytes))
+	return head
+}
+
+// setImageDims fills in an asset's pixel dimensions when its extension is one that
+// can be measured, reading only the head of the bytes open yields. A file that will
+// not open leaves the dimensions at zero: they are a nicety on a card, and a library
+// is full of textures nothing else needs to read.
+//
+// The bytes are reached through open rather than a path because the two callers hold
+// different things — a loose file on disk, and an entry inside an already-open zip —
+// and the decision about which extensions are worth a read belongs in one place.
+func setImageDims(a *Asset, open func() (io.ReadCloser, error)) {
+	if !isDimExt(a.Ext) {
+		return
+	}
+	rc, err := open()
+	if err != nil {
+		return
+	}
+	defer rc.Close()
+	a.Width, a.Height = imageDims(readHead(rc), a.Ext)
 }

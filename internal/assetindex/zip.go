@@ -54,12 +54,7 @@ func zipAssets(archivePath, displayRel, vendor, pack, variant string) ([]Asset, 
 			int64(f.UncompressedSize64),
 			crcFingerprint(f.CRC32, int64(f.UncompressedSize64)),
 		)
-		if isDimExt(a.Ext) {
-			if rc, err := f.Open(); err == nil {
-				a.Width, a.Height = imageDims(readHead(rc), a.Ext)
-				rc.Close()
-			}
-		}
+		setImageDims(&a, f.Open)
 		assets = append(assets, a)
 	}
 	return assets, nil

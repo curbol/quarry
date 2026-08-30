@@ -306,12 +306,7 @@ func looseAsset(e libEntry) (Asset, error) {
 		return Asset{}, err
 	}
 	a := newAsset(Source{Kind: SourceLoose, FilePath: e.path}, e.name, e.rel, e.vendor, e.pack, "", e.size, fp)
-	if isDimExt(a.Ext) {
-		if f, err := os.Open(e.path); err == nil {
-			a.Width, a.Height = imageDims(readHead(f), a.Ext)
-			f.Close()
-		}
-	}
+	setImageDims(&a, func() (io.ReadCloser, error) { return os.Open(e.path) })
 	return a, nil
 }
 
@@ -420,13 +415,6 @@ func uniqueClipNames(names []string) []string {
 		out = append(out, n)
 	}
 	return out
-}
-
-// readHead reads up to dimsHeadBytes from r, enough to recover an image's
-// dimensions without pulling a whole file into memory.
-func readHead(r io.Reader) []byte {
-	head, _ := io.ReadAll(io.LimitReader(r, dimsHeadBytes))
-	return head
 }
 
 // Scan walks the library root and returns every browseable asset: loose files and

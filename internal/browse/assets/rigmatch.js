@@ -124,6 +124,43 @@ export function packRigCandidates(items, clipName, limit = 3) {
     .slice(0, limit);
 }
 
+// BIND_FIT_MARGIN is how much closer the stored bind has to sit before it overrules the
+// nodes. The two answers are an order of magnitude apart across the library — a tenth of
+// the distance where the stored bind is the right one, level where the measure cannot
+// tell — so anything between them decides the same way.
+const BIND_FIT_MARGIN = 0.5;
+
+// storedBindFits reports whether a skin's stored bind pose sits closer to the mesh than
+// the pose its skeleton nodes are in. samples carries, per bone, how far that bone's own
+// vertices lie from each candidate: { stored, rest }, each an array of distances.
+//
+// A vertex the skin gives to one bone is carried rigidly by it, so under the right
+// candidate it sits in that bone's own neighbourhood, and under the wrong one it sits
+// wherever that bone happens to be — trailing behind at that distance in every frame,
+// which is the long fingers on a hand whose bones the two candidates place 20cm apart.
+// The median across bones is what decides, so a densely modelled head cannot outvote a
+// hand.
+//
+// Positions are all it reads, so two candidates that place a bone identically and
+// disagree only about its roll come back level. That is a tie, and a tie leaves the nodes
+// in charge: this only ever overrules them on evidence it can actually see.
+export function storedBindFits(samples) {
+  const stored = [], rest = [];
+  for (const s of samples || []) {
+    if (!s || !s.stored || !s.stored.length || !s.rest || !s.rest.length) continue;
+    stored.push(median(s.stored));
+    rest.push(median(s.rest));
+  }
+  if (!stored.length) return false;
+  return median(stored) < median(rest) * BIND_FIT_MARGIN;
+}
+
+function median(values) {
+  const s = [...values].sort((a, b) => a - b);
+  const h = s.length >> 1;
+  return s.length % 2 ? s[h] : (s[h - 1] + s[h]) / 2;
+}
+
 // stackedCharacter picks which skeleton is the character in a file that stacks several
 // copies of one rig. A vendor ships a pack's whole cast that way, each character skinned
 // to its own copy of the same bone names; only one copy is built, its bones carrying the

@@ -10,7 +10,7 @@ import assert from 'node:assert/strict';
 
 import {
   clipsForAsset, clipsMatching, coversBones, matchRig, nameSeries, packRigCandidates, searchedSkeleton,
-  stackedCharacter,
+  stackedCharacter, storedBindFits,
 } from '../assets/rigmatch.js';
 
 const clips = (...names) => names.map((name) => ({ name }));
@@ -227,3 +227,40 @@ test('a rig that repeats a name within itself still stacks', () => {
   const rig = [...bones(50), 'Thumb_01', 'Thumb_01'];
   assert.equal(stackedCharacter([skel(rig), skel(rig, 49)]), 1);
 });
+
+// Both candidate binds place a bone somewhere, and the mesh says which. A bone whose own
+// vertices sit centimetres away under the stored bind and 20cm away under the nodes is
+// the doublel Unreal mannequin, where rebinding to the nodes is what stretched every
+// finger into a streak.
+const fit = (stored, rest) => ({ stored, rest });
+
+test('the bind the mesh sits closest to wins', () => {
+  assert.equal(storedBindFits([fit([2, 2.5], [22, 23]), fit([3], [20])]), true);
+  assert.equal(storedBindFits([fit([22, 23], [2, 2.5]), fit([20], [3])]), false);
+});
+
+// A rig whose two candidates place every bone identically and disagree only about a
+// bone's roll measures level, and level is not evidence. The nodes keep the rig, which is
+// what the borrowed-rig case needs and what the explosive RPG character relies on.
+test('a tie leaves the nodes in charge', () => {
+  assert.equal(storedBindFits([fit([5.28], [5.29]), fit([6], [6])]), false);
+  // Closer, but not by the margin: still not enough to overrule the nodes.
+  assert.equal(storedBindFits([fit([8], [10])]), false);
+});
+
+// Only bones the skin gives whole vertices to can be measured. A rig that offers none
+// leaves nothing to judge on, and judging on nothing must not overrule the nodes.
+test('nothing to measure is not evidence for the stored bind', () => {
+  assert.equal(storedBindFits([]), false);
+  assert.equal(storedBindFits(null), false);
+  assert.equal(storedBindFits([fit([], []), null, fit([2], [])]), false);
+});
+
+// The median is taken across bones, not across vertices, so a densely modelled head
+// cannot outvote the hands. Here one bone carries 8 samples that favour the nodes and
+// three carry one each that favour the stored bind.
+test('a dense bone does not outvote the sparse ones', () => {
+  const dense = fit(Array(8).fill(30), Array(8).fill(3));
+  assert.equal(storedBindFits([dense, fit([1], [30]), fit([1], [30]), fit([1], [30])]), true);
+});
+

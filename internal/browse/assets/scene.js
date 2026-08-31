@@ -4,7 +4,7 @@
 // (which has no import map); it is the same file the document's import map points
 // "three" at, so a single three instance is shared across both.
 import * as THREE from '/static/vendor/three/three.module.min.js';
-import { clipsForAsset, clipsMatching, coversBones, matchRig, nameSeries, packRigCandidates, searchedSkeleton, stackedCharacter } from '/static/rigmatch.js';
+import { clipsForAsset, clipsMatching, coversBones, matchRig, nameSeries, packRigCandidates, searchedSkeleton, stackedCharacter, storedBindFits } from '/static/rigmatch.js';
 import { GLTFLoader } from '/static/vendor/three/jsm/loaders/GLTFLoader.js';
 import { FBXLoader } from '/static/vendor/three/jsm/loaders/FBXLoader.js';
 
@@ -343,23 +343,67 @@ function bindMatchesRest(rig) {
   return match;
 }
 
-// alignBindToRest makes a borrowed rig's undeformed pose the one its skeleton nodes are in.
-// A rig borrowed for a mesh-less clip is only a coordinate frame for someone else's motion,
-// and that motion is authored as node transforms on the rig's own family — so when the two
-// poses disagree, the nodes are the frame the clip means and the stored bind is the one
-// that cannot be right. Left alone, every such clip poses into a shredded body.
+// boneFitSamples measures, for each bone the skin gives whole vertices to, how far those
+// vertices lie from the two candidate bind positions — the stored one and the pose the
+// nodes are in. Only vertices a single bone owns outright are measured, since a blended
+// one sits between its bones under either candidate and says nothing about which is right.
+// Sampled rather than walked: a body carries hundreds of thousands of vertices and the
+// median this feeds moves no further for reading all of them.
+function boneFitSamples(rig) {
+  const samples = new Map();
+  const v = new THREE.Vector3(), bindWorld = new THREE.Vector3(), restWorld = new THREE.Vector3();
+  const m = new THREE.Matrix4();
+  rig.updateMatrixWorld(true);
+  rig.traverse((mesh) => {
+    if (!mesh.isSkinnedMesh || !mesh.skeleton) return;
+    const { bones, boneInverses } = mesh.skeleton;
+    const pos = mesh.geometry.attributes.position;
+    const skinIndex = mesh.geometry.attributes.skinIndex, skinWeight = mesh.geometry.attributes.skinWeight;
+    if (!pos || !skinIndex || !skinWeight) return;
+    const step = Math.max(1, Math.floor(pos.count / 4000));
+    for (let i = 0; i < pos.count; i += step) {
+      let bone = skinIndex.getComponent(i, 0), weight = skinWeight.getComponent(i, 0);
+      for (let k = 1; k < 4; k++) {
+        if (skinWeight.getComponent(i, k) > weight) { weight = skinWeight.getComponent(i, k); bone = skinIndex.getComponent(i, k); }
+      }
+      if (weight < 0.98 || !bones[bone] || !boneInverses[bone]) continue;
+      v.fromBufferAttribute(pos, i);
+      mesh.localToWorld(v);
+      bindWorld.setFromMatrixPosition(m.copy(boneInverses[bone]).invert());
+      restWorld.setFromMatrixPosition(bones[bone].matrixWorld);
+      const key = bones[bone].name;
+      if (!samples.has(key)) samples.set(key, { stored: [], rest: [] });
+      const s = samples.get(key);
+      s.stored.push(v.distanceTo(bindWorld));
+      s.rest.push(v.distanceTo(restWorld));
+    }
+  });
+  return [...samples.values()];
+}
+
+// alignBindToRest settles which pose a borrowed rig is undeformed in, for the rigs whose
+// skin and skeleton disagree about it. A rig borrowed for a mesh-less clip is only a
+// coordinate frame for someone else's motion, and that motion is authored as node
+// transforms on the rig's own family, so the nodes are usually the frame the clip means —
+// left alone, such a clip poses into a shredded body. But not always: a rig can carry a
+// bind that fits its mesh and nodes that merely rest elsewhere, and rebinding that one to
+// its nodes drags every bone's vertices along at the distance between the two. The mesh
+// itself is the tiebreak, through storedBindFits.
+//
+// The bind matrix moves either way. It carries the mesh into the space the bone inverses
+// are written in, and a loader that leaves it identity while the model root carries a
+// Z-up-to-Y-up rotation has the two describing different poses — which is the shredded
+// body this exists to prevent, arrived at from the other side.
 //
 // Only for a borrowed rig. A file that ships its own mesh and its own clips exported
 // together is authoritative about its own bind even when its nodes rest elsewhere, which is
 // what a "Character@Animation" file is: its nodes hold frame one, not a reference pose.
 function alignBindToRest(rig) {
   if (bindMatchesRest(rig)) return rig; // which left every world matrix current
+  const keepStored = storedBindFits(boneFitSamples(rig));
   rig.traverse((m) => {
     if (!m.isSkinnedMesh || !m.skeleton) return;
-    // The bind matrix carries the mesh into the space the bone inverses are written in, so
-    // moving the inverses without it leaves the two describing different poses — which is
-    // the shredded body this exists to prevent, arrived at from the other side.
-    m.skeleton.calculateInverses();
+    if (!keepStored) m.skeleton.calculateInverses();
     m.bindMatrix.copy(m.matrixWorld);
     m.bindMatrixInverse.copy(m.matrixWorld).invert();
   });

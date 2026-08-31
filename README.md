@@ -149,3 +149,7 @@ linked to a fingerprint set.
 quarry only reads what is already on disk. For Synty store purchases,
 [synty-sync](https://github.com/curbol/synty-sync) mirrors your "Your Library" into a
 local cache; point `root` at that cache, or at a wider tree holding several vendors.
+
+## Support
+
+<a href="https://ko-fi.com/curbol"><img height="42" alt="Buy Me a Coffee at ko-fi.com" src="https://storage.ko-fi.com/cdn/kofi1.png?v=6"></a>

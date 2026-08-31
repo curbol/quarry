@@ -99,7 +99,7 @@ test('repeated bone names count once', () => {
   assert.equal(coversBones([...clip, ...clip], clip), 10);
 });
 
-const entry = (o) => ({ id: o.id, vendor: o.vendor, bones: o.bones, pinned: o.pinned });
+const entry = (o) => ({ id: o.id, name: o.name, vendor: o.vendor, bones: o.bones, pinned: o.pinned });
 
 test('a pinned rig beats a better-covering unpinned one', () => {
   const clip = bones(20);
@@ -189,6 +189,28 @@ test('pack candidates drop the clip series and anything unloadable', () => {
   assert.deepEqual(packRigCandidates(null, 'A_Walk'), []);
 });
 
+// kevdev names a body for the clips that drive it, so the clip's own series is what
+// picks it out — while on the animations beside it that same series is what marks them
+// as clips. Weight alone reaches for the wrong one: HumanF_Model outweighs HumanM_Model,
+// and the pack's male clips would every one of them borrow the female body.
+test('a model named for the clip series leads, the clips sharing it still go', () => {
+  const page = [
+    { name: 'HumanF_MeleeAnimations.blend', ext: 'blend', category: 'animation' },
+    { name: 'HumanF_Model.fbx', ext: 'fbx', category: 'model' },
+    { name: 'HumanM@IdleWounded01.fbx', ext: 'fbx', category: 'animation' },
+    { name: 'HumanF@Idle01.fbx', ext: 'fbx', category: 'animation' },
+    { name: 'HumanM_Model.fbx', ext: 'fbx', category: 'model' },
+  ];
+  assert.deepEqual(
+    packRigCandidates(page, 'HumanM@CombatIdle1H01.fbx').map((it) => it.name),
+    ['HumanM_Model.fbx', 'HumanF_Model.fbx', 'HumanF@Idle01.fbx'],
+  );
+  assert.deepEqual(
+    packRigCandidates(page, 'HumanF@CombatIdle1H01.fbx').map((it) => it.name),
+    ['HumanF_Model.fbx', 'HumanM@IdleWounded01.fbx', 'HumanM_Model.fbx'],
+  );
+});
+
 const skel = (names, placed = 0) => ({ names, placed });
 
 // Synty ships a pack's characters stacked in one file, every one of them on its own
@@ -264,3 +286,30 @@ test('a dense bone does not outvote the sparse ones', () => {
   assert.equal(storedBindFits([dense, fit([1], [30]), fit([1], [30]), fit([1], [30])]), true);
 });
 
+// A pack's body variants are one skeleton wearing different meshes, so every one of them
+// covers every clip equally and coverage has nothing left to say. The name does: the male
+// clip belongs on the male body however the registry happens to be ordered.
+test('a body named for the clip series wins a tie coverage cannot break', () => {
+  const rig = bones(52);
+  const f = entry({ id: 'f', name: 'HumanF_Model.fbx', vendor: 'kevdev', bones: rig });
+  const m = entry({ id: 'm', name: 'HumanM_Model.fbx', vendor: 'kevdev', bones: rig });
+  assert.equal(matchRig([f, m], rig, 'kevdev', 'HumanM@CombatIdle1H01.fbx').id, 'm');
+  assert.equal(matchRig([m, f], rig, 'kevdev', 'HumanM@CombatIdle1H01.fbx').id, 'm');
+  assert.equal(matchRig([m, f], rig, 'kevdev', 'HumanF@Idle01.fbx').id, 'f');
+  // No clip name, or a vendor that names bodies and clips differently: ranked as before.
+  assert.equal(matchRig([f, m], rig, 'kevdev').id, 'f');
+  assert.equal(matchRig([f, m], rig, 'kevdev', 'A_POLY_BOW_Cmp_Idle.fbx').id, 'f');
+});
+
+// The name is a tiebreak, not an override: a pinned body is still the one the user chose,
+// and a body that cannot play the clip is still no candidate.
+test('the clip name yields to pinning and to coverage', () => {
+  const rig = bones(52);
+  const named = entry({ id: 'named', name: 'HumanM_Model.fbx', vendor: 'kevdev', bones: rig });
+  const pinned = entry({ id: 'pinned', name: 'HumanF_Model.fbx', vendor: 'kevdev', bones: rig, pinned: true });
+  assert.equal(matchRig([named, pinned], rig, 'kevdev', 'HumanM@Idle.fbx').id, 'pinned');
+  // Named for the clip but a different skeleton: coverage rejects it before the name counts.
+  const stranger = entry({ id: 'stranger', name: 'HumanM_Model.fbx', vendor: 'kevdev', bones: bones(52, 'z') });
+  const other = entry({ id: 'other', name: 'HumanF_Model.fbx', vendor: 'kevdev', bones: rig });
+  assert.equal(matchRig([stranger, other], rig, 'kevdev', 'HumanM@Idle.fbx').id, 'other');
+});

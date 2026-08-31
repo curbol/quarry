@@ -665,7 +665,7 @@ async function rigCandidates({ q, vendor, limit, types, sort }) {
 // once every known entry had failed and the other gave up there.
 async function resolveRig(bones, asset, tryLoad, cancelled = () => false) {
   const attempt = async () => {
-    for (let m = CharRegistry.match(bones, asset.vendor); m && !cancelled(); m = CharRegistry.match(bones, asset.vendor)) {
+    for (let m = CharRegistry.match(bones, asset.vendor, asset.name); m && !cancelled(); m = CharRegistry.match(bones, asset.vendor, asset.name)) {
       const got = await tryLoad(m);
       if (got) return got;
       CharRegistry.remove(m.id);
@@ -723,12 +723,14 @@ const CharRegistry = {
   // match picks the registered character whose skeleton best covers a clip's bones.
   // A pinned character that covers the clip wins over a higher-coverage unpinned one,
   // so pinning a body for a rig makes it the default for every clip on that rig.
+  // clipName settles the bodies coverage cannot separate — a pack's variants share one
+  // skeleton, so the one named for the clip's own series is the one it belongs on.
   // Auto-match is scoped to the clip's own vendor: cross-vendor skeletons share enough
   // bone names to pass the coverage bar but differ in rest pose, posing a clip into a
   // shredded/T-posed garbage still. A legacy entry with no recorded vendor is a wildcard
   // until it is re-registered (see register), so old caches keep working. The ranking
   // itself is matchRig, in rigmatch.js, where it is checked without a GL context.
-  match(bones, vendor) { return matchRig(this.list(), bones, vendor); },
+  match(bones, vendor, clipName) { return matchRig(this.list(), bones, vendor, clipName); },
   // pin reports whether the flag moved, so a caller can tell a real change from a
   // click that re-asserted what was already true.
   pin(id, on) {
@@ -806,7 +808,7 @@ const CharRegistry = {
         if (seen.has(it.id)) continue;
         seen.add(it.id); loaded++;
         await this.register(it);
-        if (want && this.match(want, vendor)) return true;
+        if (want && this.match(want, vendor, name)) return true;
       }
       return false;
     };

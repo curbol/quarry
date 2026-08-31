@@ -68,23 +68,33 @@ export function coversBones(have, want) {
 // A pinned character that covers the clip wins over a higher-coverage unpinned one, so
 // pinning a body for a rig makes it the default for every clip on that rig.
 //
+// clipName breaks the tie a pack of body variants otherwise loses on coverage: the bodies
+// share one skeleton, so each covers every clip exactly as well as the others, and which
+// one a clip lands on comes down to what was registered first. A body named for the
+// clip's own series is the one the pack means (HumanM_Model for HumanM@CombatIdle1H01),
+// and it ranks above coverage because coverage cannot separate them at all. Vendors that
+// name bodies and clips differently match nothing here and rank as they did.
+//
 // Auto-match is scoped to the clip's own vendor: cross-vendor skeletons share enough
 // bone names to pass the coverage bar but differ in rest pose, posing a clip into
 // shredded garbage still. A legacy entry with no recorded vendor is a wildcard until it
 // is re-registered, so old caches keep working.
-export function matchRig(entries, bones, vendor) {
+export function matchRig(entries, bones, vendor, clipName) {
   if (!bones || !bones.length) return null;
-  let best = null, bestScore = -1, bestPinned = false;
+  const series = clipName ? nameSeries(clipName) : null;
+  let best = null, bestScore = -1, bestPinned = false, bestNamed = false;
   for (const e of entries || []) {
     if (vendor && e.vendor && e.vendor !== vendor) continue;
     if (e.bones.length > new Set(e.bones).size * 1.4) continue; // legacy cache: skip multi-skeleton showcase meshes, whose bones repeat per character (register now rejects them)
     const hit = coversBones(e.bones, bones);
     if (!hit) continue; // rig must fit the clip
     const pinned = !!e.pinned;
+    const named = !!series && nameSeries(e.name) === series;
     // Rank by absolute shared bones: prefer the fullest matching body.
-    if ((pinned && !bestPinned) || (pinned === bestPinned && hit > bestScore)) {
-      best = e; bestScore = hit; bestPinned = pinned;
-    }
+    const better = pinned !== bestPinned ? pinned
+      : named !== bestNamed ? named
+        : hit > bestScore;
+    if (better) { best = e; bestScore = hit; bestPinned = pinned; bestNamed = named; }
   }
   return best;
 }
@@ -117,11 +127,20 @@ export const LOADABLE_RIG_EXTS = ['fbx', 'glb', 'gltf'];
 // animations it ships with, and hundreds of those outrank it. Dropping the series the
 // clip itself belongs to leaves the things a pack animates rather than the animations,
 // and the heaviest of those is the rig.
+//
+// A model carrying that same series is the exception, and goes first rather than out. The
+// series names what a file is *of*, and a pack that ships a body per variant names each
+// one for the clips that drive it — HumanM_Model beside HumanM@CombatIdle1H01 — so on a
+// model the shared series is the strongest evidence in the listing, while on an animation
+// it is what marks the file as one of the clips. Weight cannot stand in for it: the pack
+// ships HumanF_Model heavier than HumanM_Model, and every male clip would borrow the
+// female body.
 export function packRigCandidates(items, clipName, limit = 3) {
   const series = nameSeries(clipName);
-  return (items || [])
-    .filter((it) => nameSeries(it.name) !== series && LOADABLE_RIG_EXTS.includes(it.ext))
-    .slice(0, limit);
+  const loadable = (items || []).filter((it) => LOADABLE_RIG_EXTS.includes(it.ext));
+  const sameSeries = (it) => nameSeries(it.name) === series;
+  const named = loadable.filter((it) => it.category === 'model' && sameSeries(it));
+  return named.concat(loadable.filter((it) => !sameSeries(it))).slice(0, limit);
 }
 
 // BIND_FIT_MARGIN is how much closer the stored bind has to sit before it overrules the

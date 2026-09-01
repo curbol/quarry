@@ -387,50 +387,6 @@ func TestHostGuardRejectsARebindingHost(t *testing.T) {
 		}
 	}
 }
-
-// Facet counts are a promise: click a value and get that many rows. Results are cards,
-// not assets, so a pack shipping one file in both a zip and a unitypackage produces two
-// assets and one card — counting assets advertised roughly double what clicking
-// returned. The earlier fixture happened to make grouping a no-op, which is why this
-// went unseen.
-func TestFacetCountsAreReachableWhenCopiesGroup(t *testing.T) {
-	srv := serverWith(t, func(mk func(...string) string) {
-		// The same file in two archives of one pack: two assets, one card.
-		writeZip(t, mk("synty", "Foo_Pack", "Foo_Pack_SourceFiles_v3.zip"), map[string]string{
-			"SourceFiles/Heart.fbx": "FBXHEART",
-		})
-		writeUnity(t, mk("synty", "Foo_Pack", "Foo_Pack_Unity_2022_3_v1_0_0.unitypackage"), []unityMember{
-			{guid: "aaa", pathname: "Assets/Foo/Heart.fbx", asset: "FBXHEART"},
-		})
-		os.WriteFile(mk("other", "Pack", "Rock.fbx"), []byte("ROCK"), 0o644)
-	})
-
-	var first assetsResp
-	decode(t, doJSON(t, "GET", srv.URL+"/api/assets?limit=1", nil), &first)
-
-	check := func(kind, param string, values []struct {
-		Value string
-		Count int
-	}) {
-		for _, f := range values {
-			if f.Value == "" {
-				continue
-			}
-			var got assetsResp
-			decode(t, doJSON(t, "GET", srv.URL+"/api/assets?limit=500&"+param+"="+url.QueryEscape(f.Value), nil), &got)
-			if got.Total != f.Count {
-				t.Errorf("%s %q advertises %d but filtering returns %d", kind, f.Value, f.Count, got.Total)
-			}
-		}
-	}
-	check("vendor", "vendor", first.Facets.Vendors)
-	check("category", "type", first.Facets.Categories)
-	check("variant", "variant", first.Facets.Variants)
-}
-
-// Groups merge transitively: linking {A,B} then {B,C} yields {A,B,C}. The store's own
-// tests cover the merge; this pins that it survives the HTTP layer, which is the only
-// way a user ever reaches it.
 func TestLinkMergesTransitivelyOverHTTP(t *testing.T) {
 	srv, _ := taggedLibrary(t, func(mk func(...string) string) {
 		writeZip(t, mk("synty", "P", "P_SourceFiles_v3.zip"), map[string]string{
@@ -1085,5 +1041,77 @@ func TestTagCountIsCardsAndNamesWhatIsOffIndex(t *testing.T) {
 	}
 	if p.Tags[0].OffIndex != 1 {
 		t.Errorf("offIndex = %d, want 1: the assignment is kept, and saying so is how it does not read as lost", p.Tags[0].OffIndex)
+	}
+}
+
+// A tag's palette numbers sit in the same slot as the facet counts, so they carry the
+// same promise: what clicking returns. Two things broke it independently. A fingerprint
+// is content alone while a card is name and size, so byte-identical files under two
+// names share one print and land on two cards — and keeping one card key per print
+// counted such a tag once where the filter returns both. And with grouping off a result
+// is a row per asset, which the card count under-reports by however many copies a pack
+// ships, exactly as it did for the facets before they started returning two sets.
+func TestTagCountsAreReachableInBothGroupingModes(t *testing.T) {
+	srv, _ := taggedLibrary(t, func(mk func(...string) string) {
+		// One print, two names: two cards, and two rows either way.
+		writeZip(t, mk("synty", "P", "P_SourceFiles_v3.zip"), map[string]string{
+			"SourceFiles/T_Grid_A.png": "SAMEBYTES",
+			"SourceFiles/T_Grid_B.png": "SAMEBYTES",
+		})
+		// One file in two archives: two prints, two assets, one card.
+		writeZip(t, mk("synty", "Q", "Q_SourceFiles_v3.zip"), map[string]string{
+			"SourceFiles/Heart.fbx": "FBXHEART",
+		})
+		writeUnity(t, mk("synty", "Q", "Q_Unity_2022_3_v1_0_0.unitypackage"), []unityMember{
+			{guid: "aaa", pathname: "Assets/Q/Heart.fbx", asset: "FBXHEART"},
+		})
+	})
+
+	var listed taggedAssetsResp
+	decode(t, doJSON(t, "GET", srv.URL+"/api/assets?limit=50", nil), &listed)
+	var fps []string
+	for _, it := range listed.Items {
+		fps = append(fps, it.Fingerprints...)
+	}
+	resp := doJSON(t, "POST", srv.URL+"/api/assign", map[string]any{
+		"fingerprints": fps, "tag": "hero", "on": true,
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("assign = %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	var p struct {
+		Tags []struct {
+			ID     string
+			Count  int
+			Assets int
+		}
+	}
+	decode(t, doJSON(t, "GET", srv.URL+"/api/tags", nil), &p)
+	if len(p.Tags) != 1 || p.Tags[0].ID != "hero" {
+		t.Fatalf("palette = %+v, want one hero tag", p.Tags)
+	}
+
+	for _, mode := range []struct {
+		name, param string
+		advertised  int
+	}{
+		{"grouped", "", p.Tags[0].Count},
+		{"ungrouped", "&group=0", p.Tags[0].Assets},
+	} {
+		t.Run(mode.name, func(t *testing.T) {
+			var got taggedAssetsResp
+			decode(t, doJSON(t, "GET", srv.URL+"/api/assets?limit=500&tag=hero"+mode.param, nil), &got)
+			if got.Total != mode.advertised {
+				t.Errorf("hero advertises %d but ?tag=hero%s returns %d", mode.advertised, mode.param, got.Total)
+			}
+		})
+	}
+	// The fixture has to exercise both asymmetries, or the two numbers could agree by
+	// accident and the test would pass on a build that reports one of them wrongly.
+	if p.Tags[0].Count == p.Tags[0].Assets {
+		t.Errorf("cards (%d) and rows (%d) are equal; this fixture is meant to separate them",
+			p.Tags[0].Count, p.Tags[0].Assets)
 	}
 }

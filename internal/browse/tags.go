@@ -7,14 +7,18 @@ import (
 	"github.com/curbol/quarry/internal/tagstore"
 )
 
-// tagView is one palette entry for the client: a tag's id, color, how many cards in
-// this library carry it, and how many of its assignments name content the current
-// index does not hold. See paletteLocked for why those are two numbers.
+// tagView is one palette entry for the client: a tag's id, color, how many results
+// carry it under each grouping, and how many of its assignments name content the
+// current index does not hold. See paletteLocked for why those are three numbers.
 type tagView struct {
-	ID       string `json:"id"`
-	Color    string `json:"color"`
-	Count    int    `json:"count"`
-	OffIndex int    `json:"offIndex,omitempty"`
+	ID    string `json:"id"`
+	Color string `json:"color"`
+	// Count is cards and Assets is rows-when-ungrouped, for the same reason
+	// buildFacets returns two sets: "one result" is not one thing, and the client
+	// picks whichever matches the grouping it is asking under.
+	Count    int `json:"count"`
+	Assets   int `json:"assets"`
+	OffIndex int `json:"offIndex,omitempty"`
 }
 
 // paletteView is the tag palette the client renders slivers and filters from, plus
@@ -24,15 +28,21 @@ type paletteView struct {
 	Tags    []tagView `json:"tags"`
 }
 
-// paletteLocked builds the palette the client renders. Count is cards, not
-// fingerprints, because the client renders it in the same slot as the vendor and
-// category facet counts and a user reads it the same way: as how many results
-// clicking it returns. A card's tags are the union over its fingerprints, so two
-// copies of one file both carrying a tag are one result, and the store deliberately
-// keeps assignments for fingerprints outside the current index — a narrowed --root, a
-// disabled pack, another machine — which no filter can reach at all. Those are carried
-// separately in OffIndex rather than folded in, so the number stays reachable without
-// the tags they represent looking lost.
+// paletteLocked builds the palette the client renders. The counts are results, not
+// fingerprints, because the client renders them in the same slot as the vendor and
+// category facet counts and a user reads them the same way: as how many results
+// clicking the tag returns. A card's tags are the union over its fingerprints, so two
+// copies of one file both carrying a tag are one card — but with grouping off they are
+// two rows, so both numbers come back and the client picks, exactly as it does for the
+// facets.
+//
+// A fingerprint can land on several cards (content has no name; a card does), so the
+// card set is unioned over every card each print reaches rather than taking one.
+//
+// The store deliberately keeps assignments for fingerprints outside the current index
+// — a narrowed --root, a disabled pack, another machine — which no filter can reach at
+// all. Those are carried separately in OffIndex rather than folded in, so the numbers
+// stay reachable without the tags they represent looking lost.
 //
 // The caller must hold the read lock.
 func (s *server) paletteLocked() paletteView {
@@ -41,15 +51,19 @@ func (s *server) paletteLocked() paletteView {
 	tv := make([]tagView, len(defs))
 	for i, d := range defs {
 		cards := map[string]bool{}
-		off := 0
+		assets, off := 0, 0
 		for _, fp := range byTag[d.ID] {
-			if key, indexed := s.cardOfFP[fp]; indexed {
-				cards[key] = true
-			} else {
+			keys, indexed := s.cardsOfFP[fp]
+			if !indexed {
 				off++
+				continue
 			}
+			for _, k := range keys {
+				cards[k] = true
+			}
+			assets += s.assetsOfFP[fp]
 		}
-		tv[i] = tagView{ID: d.ID, Color: d.Color, Count: len(cards), OffIndex: off}
+		tv[i] = tagView{ID: d.ID, Color: d.Color, Count: len(cards), Assets: assets, OffIndex: off}
 	}
 	return paletteView{Enabled: s.tagsEnabled, Tags: tv}
 }

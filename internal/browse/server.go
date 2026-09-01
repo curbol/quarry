@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -63,11 +64,18 @@ type server struct {
 	rmSibling    map[string]string
 	rmSuppressed map[string]bool
 
-	// cardOfFP maps a content fingerprint to the group key of the card it lands on, so
-	// a tag's count can be the number of cards ?tag= returns rather than the number of
-	// fingerprints carrying it. Built once beside the facets, from the same static
-	// index, and excluding the same suppressed siblings.
-	cardOfFP map[string]string
+	// cardsOfFP maps a content fingerprint to the group keys of the cards it lands on,
+	// and assetsOfFP to how many rows it is when grouping is off, so a tag's count can
+	// be the number of results ?tag= returns rather than the number of fingerprints
+	// carrying it. Both are built once beside the facets, from the same static index,
+	// and exclude the same suppressed siblings.
+	//
+	// A fingerprint is content alone while a card is name and size, so byte-identical
+	// files under different names share one print and land on different cards: the
+	// relation is one-to-many in both directions, and storing one key per print
+	// undercounted every tag on such a pair.
+	cardsOfFP  map[string][]string
+	assetsOfFP map[string]int
 }
 
 // newServer wires an index, its precomputed facets, and the tag store to the
@@ -96,19 +104,23 @@ func newServer(ix *assetindex.Index, store *tagstore.Store, tagsPath string) (*s
 		}
 	}
 	rmSibling, rmSuppressed := buildRootMotionPairs(ix.Assets)
-	cardOfFP := map[string]string{}
+	cardsOfFP := map[string][]string{}
+	assetsOfFP := map[string]int{}
 	for i := range ix.Assets {
 		fp := ix.Assets[i].Fingerprint
 		if fp == "" || rmSuppressed[ix.Assets[i].ID] {
 			continue
 		}
-		cardOfFP[fp] = groupKey(ix.Assets[i])
+		assetsOfFP[fp]++
+		if k := groupKey(ix.Assets[i]); !slices.Contains(cardsOfFP[fp], k) {
+			cardsOfFP[fp] = append(cardsOfFP[fp], k)
+		}
 	}
 	grouped, ungrouped := buildFacets(ix.Assets, rmSuppressed)
 	return &server{
 		ix: ix, facets: grouped, ungroupedFacets: ungrouped, static: http.FileServerFS(static),
 		tagsEnabled: tagsPath != "", tagsPath: tagsPath, store: store, byFP: byFP,
-		rmSibling: rmSibling, rmSuppressed: rmSuppressed, cardOfFP: cardOfFP,
+		rmSibling: rmSibling, rmSuppressed: rmSuppressed, cardsOfFP: cardsOfFP, assetsOfFP: assetsOfFP,
 	}, nil
 }
 

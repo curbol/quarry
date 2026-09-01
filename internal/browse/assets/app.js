@@ -21,9 +21,18 @@ const els = {
 
 // gen is bumped by reset() so a page still in flight from the previous filter can
 // tell that its results are stale and drop them.
-const state = { gen: 0, offset: 0, total: 0, loading: false, done: false, failed: false, facetsLoaded: false, items: [] };
+// facetsMode is the grouping the dropdown counts were built under, not a bare
+// "loaded" flag: the server counts cards and rows separately, because one result is
+// not one thing, and a count carried over from the other mode advertises a number
+// clicking it cannot return.
+const state = { gen: 0, offset: 0, total: 0, loading: false, done: false, failed: false, facetsMode: null, items: [] };
 
 // ---- data ----
+
+// grouping is the single reading of the group checkbox, so the results, the facet
+// counts and the tag counts cannot disagree about which mode the page is in — the
+// same reason the server has one ungrouped().
+function grouping() { return els.group.checked ? 'cards' : 'assets'; }
 
 function query(extra = {}) {
   const p = new URLSearchParams();
@@ -75,7 +84,8 @@ async function loadPage() {
     const data = await res.json();
     if (!Array.isArray(data.items)) throw new Error('malformed response');
     if (gen !== state.gen) return;
-    if (!state.facetsLoaded && data.facets) { populateFacets(data.facets); state.facetsLoaded = true; }
+    const mode = grouping();
+    if (state.facetsMode !== mode && data.facets) { populateFacets(data.facets); state.facetsMode = mode; }
     state.total = data.total;
     for (const a of data.items) state.items.push(a);
     if (!gridWindow.appended()) {
@@ -379,10 +389,19 @@ function populateFacets(facets) {
 const TAG_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.6 13.4 12 22l-8-8V4h10l6.6 6.6a2 2 0 0 1 0 2.8z"/><circle cx="7.5" cy="7.5" r="1.2"/></svg>';
 const MAX_SLIVERS = 6;
 
-const tagState = { enabled: false, colors: new Map(), counts: new Map() };
+const tagState = { enabled: false, colors: new Map(), counts: new Map(), offIndex: new Map(), tags: [] };
 
 function tagColor(id) { return tagState.colors.get(id) || '#9aa0aa'; }
 function hex6(c) { return /^#[0-9a-fA-F]{6}$/.test(c) ? c : '#9aa0aa'; }
+
+// applyTagCounts re-reads the palette under the current grouping. Called on every
+// palette response and again when the grouping changes, since the same palette means
+// different numbers on either side of it.
+function applyTagCounts() {
+  const cards = grouping() === 'cards';
+  tagState.counts = new Map(tagState.tags.map((t) => [t.id, cards ? t.count : t.assets]));
+  tagState.offIndex = new Map(tagState.tags.map((t) => [t.id, t.offIndex || 0]));
+}
 
 // applyPalette syncs the local palette from any tag API response, so a newly
 // created or recolored tag is known before its slivers/chips render.
@@ -396,7 +415,10 @@ function applyPalette(p) {
   const repaint = colors.size !== tagState.colors.size
     || [...colors].some(([id, c]) => tagState.colors.get(id) !== c);
   tagState.colors = colors;
-  tagState.counts = new Map((p.tags || []).map((t) => [t.id, t.count]));
+  // Both numbers come back for the reason the facets return two sets; which one the
+  // chip shows has to follow the grouping the query will run under.
+  tagState.tags = p.tags || [];
+  applyTagCounts();
   document.body.classList.toggle('tags-on', tagState.enabled);
   tagFilter.root.hidden = !tagState.enabled;
   tagFilter.setOptions();
@@ -756,6 +778,11 @@ const tagFilter = {
     const count = document.createElement('span');
     count.className = 'ms-opt-count';
     count.textContent = tagState.counts.get(id) || 0;
+    // The store keeps assignments for content this library does not hold — a narrowed
+    // --root, a disabled pack, another machine — and no filter can reach them. Saying
+    // so here is what keeps a tag that is all off-index from reading as an empty one.
+    const off = tagState.offIndex.get(id) || 0;
+    if (off) count.title = off + ' more on content outside this library';
     row.append(cb, dot, text, count);
     return row;
   },
@@ -1357,7 +1384,11 @@ function escapeHTML(s) {
 
 let debounce;
 els.q.addEventListener('input', () => { clearTimeout(debounce); debounce = setTimeout(reset, 220); });
-for (const s of [els.sort, els.group]) s.addEventListener('change', reset);
+els.sort.addEventListener('change', reset);
+// Grouping changes what a result is, so every number beside a filter has to be asked
+// for again: the facets come back with the next page, the tag counts are already in
+// hand under both modes.
+els.group.addEventListener('change', () => { applyTagCounts(); tagFilter.setOptions(); reset(); });
 
 new IntersectionObserver((entries) => {
   if (entries.some((e) => e.isIntersecting)) fetchPage();

@@ -16,6 +16,15 @@ import "strings"
 // Each token is bounded by "_", a space before "[", or the end, so substrings like
 // "arm"/"Storm"/"Warm" are left alone. Suffixed spellings like "RootMotionVertical" are
 // deliberately not matched: their in-place counterpart is ambiguous.
+//
+// Teaching it a convention means bumping assetindex.indexVersion, because the two
+// consumers do not read it at the same time. The split gate's answer is frozen into
+// the cache — a loose file whose stat print has not moved keeps the assets it produced
+// — while browse pairs live at startup over whatever the cache handed back. Left
+// unbumped, a file the old gate split into clips is read by the new pairing as an RM
+// variant of its own base: each in-place clip claims one stale clip asset as its
+// sibling and hides exactly that one, leaving the rest visible, one card silently
+// missing, and a toggle pointed at a clip the RM file need not contain.
 func RootMotionVariant(base string) (string, bool) {
 	if i := strings.Index(base, "[RM]"); i >= 0 {
 		return strings.TrimRight(base[:i], " ") + base[i+len("[RM]"):], true

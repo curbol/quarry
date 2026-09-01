@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/curbol/quarry/internal/safewrite"
@@ -19,7 +20,7 @@ import (
 // also keys the unpacked-archive tree, so a change to what extraction writes belongs
 // here too: an archive whose bytes never changed keeps its fingerprint, and only the
 // version tells the old extraction apart from what the current code would produce.
-const indexVersion = 20
+const indexVersion = 21
 
 // SkippedFile records a library file the scan could not read. A damaged archive
 // costs its own contents, not the rest of the library, so the failure is carried
@@ -66,11 +67,13 @@ type Index struct {
 	rootsOnce     sync.Once
 	resolvedRoots []string
 
-	// extractMu guards both maps. extractions single-flights one archive's unpack;
-	// archiveMus holds each archive's reader/rebuild lock (see archiveMu).
+	// extractMu guards all three maps. extractions single-flights one archive's unpack;
+	// archiveMus holds each archive's reader/rebuild lock (see archiveMu); rebuilt
+	// records the extractions a torn member has already been repaired for.
 	extractMu   sync.Mutex
 	extractions map[string]*extraction
 	archiveMus  map[string]*sync.RWMutex
+	rebuilt     map[string]bool
 
 	zips zipReaders
 }
@@ -101,6 +104,18 @@ type Options struct {
 	// also what authorises serving those files, since they sit outside the root that
 	// otherwise bounds what the content API will open.
 	FollowSymlinks bool
+}
+
+// absCacheDir makes the cache dir absolute the way Root already is. Everything derived
+// from it — stateDir, the extraction tree, the prune — is a path this package writes
+// through, and containment is checked against a resolved copy, so a relative one would
+// have the check and the writes disagreeing about which directory they mean the moment
+// anything changed the working directory. Empty stays empty: that is "no cache dir".
+func absCacheDir(cacheDir string) (string, error) {
+	if cacheDir == "" {
+		return "", nil
+	}
+	return filepath.Abs(cacheDir)
 }
 
 // checkCacheDir refuses a cache dir inside the scan root. The tree quarry promises
@@ -144,6 +159,9 @@ func checkCacheDirLinks(cacheDir string, linkRoots []string) error {
 func Build(opt Options) (*Index, error) {
 	absRoot, err := filepath.Abs(opt.Root)
 	if err != nil {
+		return nil, err
+	}
+	if opt.CacheDir, err = absCacheDir(opt.CacheDir); err != nil {
 		return nil, err
 	}
 	if err := checkCacheDir(absRoot, opt.CacheDir); err != nil {
@@ -216,6 +234,20 @@ func (ix *Index) refresh() error {
 			assets = append(assets, prevAt(i))
 		}
 	}
+	// describes reports whether cached entries still describe the file at the path the
+	// walk reached them by. The stat print keys on the resolved path, while RelPath,
+	// Vendor, Pack and Variant are all derived from the path the walk took to get
+	// there — the same file only under --follow-symlinks, where renaming a link moves
+	// every display field without moving the print. Reused blind, a renamed drive keeps
+	// the old name in the grid, in the vendor facet and in `path:` search until the
+	// file's own size or mtime happens to move.
+	describes := func(idx []int, rel string) bool {
+		if len(idx) == 0 {
+			return true
+		}
+		got := prevAt(idx[0]).RelPath
+		return got == rel || strings.HasPrefix(got, rel+"::")
+	}
 	for _, e := range entries {
 		fp, err := fingerprint(e.path)
 		if err != nil {
@@ -223,7 +255,7 @@ func (ix *Index) refresh() error {
 			continue
 		}
 		if e.kind == SourceLoose {
-			if ix.LoosePrint[e.path] == fp {
+			if ix.LoosePrint[e.path] == fp && describes(oldByLoose[e.path], e.rel) {
 				newLoose[e.path] = fp
 				reuse(oldByLoose[e.path])
 				continue
@@ -244,7 +276,7 @@ func (ix *Index) refresh() error {
 		// Keyed on the print alone, not on having cached assets: an archive whose every
 		// entry was dropped by dedup leaves no assets behind, and demanding some would
 		// re-decompress it on every single run.
-		if ix.ArchivePrint[e.path] == fp {
+		if ix.ArchivePrint[e.path] == fp && describes(oldByArchive[e.path], e.rel) {
 			reuse(oldByArchive[e.path])
 			continue
 		}
@@ -356,6 +388,9 @@ func LoadOrBuild(opt Options, reindex bool, warn func(string)) (*Index, error) {
 		return nil, err
 	}
 	opt.Root = absRoot
+	if opt.CacheDir, err = absCacheDir(opt.CacheDir); err != nil {
+		return nil, err
+	}
 	if err := checkCacheDir(absRoot, opt.CacheDir); err != nil {
 		return nil, err
 	}

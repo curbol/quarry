@@ -15,18 +15,36 @@ import (
 // versionSuffix matches a trailing Synty version token like "_v3" or "_v1_1_3".
 var versionSuffix = regexp.MustCompile(`_v[0-9][0-9_]*$`)
 
+// bareVersion matches a name whose whole variant slot is a version token.
+var bareVersion = regexp.MustCompile(`^v[0-9][0-9_]*$`)
+
 // deriveVariant extracts the engine/format token from a Synty archive filename,
 // whose base name is prefixed by its pack dir and suffixed by a version token:
 // "<packDir>_<variant>_v<ver>.<ext>" → "<variant>". Returns "" when the
 // convention doesn't hold (e.g. kevdev "Human Basic Motions.zip"), leaving the
 // asset in the unknown-variant facet bucket.
+//
+// Two near-misses have to land in that bucket rather than in a wrong one, because a
+// variant is a facet the user filters by and a value nothing else shares is a bucket
+// of one. A file directly under a vendor dir has no pack dir to be prefixed by, so
+// every prefix check would pass on the bare "_". And a pack shipping "<packDir>_v3"
+// carries a version where the variant goes: versionSuffix needs a leading separator,
+// so nothing is stripped and the version number itself becomes the variant — one
+// bucket per release of the same pack.
 func deriveVariant(packDir, filename string) string {
+	if packDir == "" {
+		return ""
+	}
 	base := strings.TrimSuffix(filename, filepath.Ext(filename))
 	prefix := packDir + "_"
 	if !strings.HasPrefix(base, prefix) {
 		return ""
 	}
-	return versionSuffix.ReplaceAllString(base[len(prefix):], "")
+	v := versionSuffix.ReplaceAllString(base[len(prefix):], "")
+	if bareVersion.MatchString(v) {
+		return ""
+	}
+	return v
 }
 
 // isSidecar reports extensions that are engine bookkeeping, not browseable assets
@@ -501,8 +519,18 @@ func dedupKey(vendor, pack, subpath string, size int64) string {
 	return vendor + "\x00" + pack + "\x00" + normSubpath(subpath) + "\x00" + strconv.FormatInt(size, 10)
 }
 
+// looseDedupKey is the key a loose file offers to the archive entries that might be
+// copies of it. A split GLB's clips each carry "<file>::<clip>" as their RelPath and
+// nothing carries the file's own, so without the trim the file the clips came from is
+// invisible here and the archive's copy of it survives as a duplicate whole-file card
+// beside them. Size is already the whole file's on every clip, which is what the
+// archive entry's uncompressed size matches.
 func looseDedupKey(a Asset) string {
-	return dedupKey(a.Vendor, a.Pack, packSubpath(a.RelPath, a.Vendor, a.Pack), a.Size)
+	rel := a.RelPath
+	if a.Source.Clip != "" {
+		rel = strings.TrimSuffix(rel, "::"+a.Source.Clip)
+	}
+	return dedupKey(a.Vendor, a.Pack, packSubpath(rel, a.Vendor, a.Pack), a.Size)
 }
 
 // packSubpath strips the vendor/pack prefix from a loose file's library-relative

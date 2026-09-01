@@ -106,30 +106,26 @@ func applySidekick(archivePath string, assets []Asset) ([]Asset, *SkippedFile) {
 		// print: the print describes the file, not whether the second pass worked.
 		return assets, &SkippedFile{Reason: "sidekick characters could not be assembled: " + err.Error()}
 	}
-	// Every .sk in the package, assembled or not. An unassembled character still has
-	// to claim its own name below, or the assembled character whose name prefixes it
-	// would take the byproducts that are the unassembled one's only representation.
-	// Built by walking the assets rather than the guid set, so the order the claims are
-	// compared in is the scan's, not a map's.
-	var chars []sidekickChar
-	charAt := make(map[string]int, len(skGuids))
+	// Every .sk in the package, assembled or not. Built by walking the assets rather
+	// than the guid set, so the order the claims are compared in is the scan's, not a
+	// map's.
+	chars := make([]sidekickChar, 0, len(skGuids))
 	for i := range assets {
 		a := &assets[i]
 		if a.Source.Kind != SourceUnityPackage || a.Ext != "sk" {
 			continue
 		}
 		p := a.Source.Pathname
-		charAt[a.Source.Guid] = len(chars)
 		chars = append(chars, sidekickChar{
 			tree: path.Dir(p) + "/",
 			base: strings.TrimSuffix(path.Base(p), path.Ext(p)),
 		})
-	}
-	for i := range assets {
-		a := &assets[i]
-		if a.Source.Kind != SourceUnityPackage || a.Ext != "sk" {
-			continue
-		}
+		// The claim is appended before the upgrade is attempted, and stands whether or
+		// not it succeeds: an unassembled character still has to hold its own name, or
+		// the assembled character whose name prefixes it takes the byproducts that are
+		// the unassembled one's only representation. sidekickByproduct runs after this
+		// loop, over the finished slice, so nothing here reads another character's claim.
+		claim := len(chars) - 1
 		data, ok := skBytes[a.Source.Guid]
 		if !ok {
 			continue
@@ -156,7 +152,7 @@ func applySidekick(archivePath string, assets []Asset) ([]Asset, *SkippedFile) {
 		// that still show the whole character — the same outcome readUnityAssetBytes
 		// refuses a truncated read to avoid.
 		if len(partIDs) == len(partNames) {
-			chars[charAt[a.Source.Guid]].assembled = true
+			chars[claim].assembled = true
 		}
 	}
 	kept := assets[:0]

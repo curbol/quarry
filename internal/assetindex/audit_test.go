@@ -1728,3 +1728,317 @@ func TestARewrittenArchiveIsNotServedFromTheCachedDirectory(t *testing.T) {
 		t.Errorf("read = %q, %v; want fs.ErrNotExist for an entry the archive no longer carries", got, err)
 	}
 }
+
+// A unitypackage replaced in place is the ordinary way a pack is updated, and the size
+// the running index carries for its members is then the old one. Read as a torn tree,
+// every request for a changed member discarded the whole extraction and decompressed
+// the package again — per request, forever, taking the tree its healthy siblings were
+// being served from with it — and still answered 500. The zip path has always handled
+// the same update correctly; this pins the unitypackage one to the same outcome.
+func TestReshippedUnityPackageIsAMissNotAnEndlessRebuild(t *testing.T) {
+	root, mk := libRoot(t)
+	archive := mk("v", "Pack", "Pack_A_v1.unitypackage")
+	const guid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	writeUnityPackage(t, archive, []unityGUID{{guid: guid, pathname: "Assets/Heart.fbx", asset: "ORIGINAL"}})
+	ix, err := Build(Options{Root: root, CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ix.Assets) != 1 {
+		t.Fatalf("indexed %d assets, want 1", len(ix.Assets))
+	}
+	a := ix.Assets[0]
+	read := func() error {
+		rc, _, err := ix.Open(a)
+		if err != nil {
+			return err
+		}
+		defer rc.Close()
+		_, err = io.ReadAll(rc)
+		return err
+	}
+	if err := read(); err != nil {
+		t.Fatalf("first read: %v", err)
+	}
+
+	// Re-shipped in place: same path, same guid, a longer payload.
+	time.Sleep(10 * time.Millisecond) // the stat print is size+mtime; move the mtime
+	writeUnityPackage(t, archive, []unityGUID{{guid: guid, pathname: "Assets/Heart.fbx", asset: "REPLACED-AND-LONGER"}})
+
+	err = read()
+	if !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("read after the reship = %v; want fs.ErrNotExist so browse answers 404 like the zip path", err)
+	}
+
+	// And the extraction is left alone, rather than discarded and rebuilt per request.
+	fp, err := fingerprint(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sentinel := filepath.Join(ix.unpackedDir(), fp, "SENTINEL")
+	if err := os.WriteFile(sentinel, []byte("x"), 0o644); err != nil {
+		t.Fatalf("no extraction to mark: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		if err := read(); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("read %d = %v; want a stable fs.ErrNotExist", i, err)
+		}
+	}
+	if _, err := os.Stat(sentinel); err != nil {
+		t.Errorf("the extraction was rebuilt for a mismatch the archive itself explains: %v", err)
+	}
+}
+
+// A genuinely torn tree is still repaired — but once. The repair costs a full
+// decompress, so a mismatch that survives it is not the tree's fault and repeating it
+// would spend that cost on every request for the rest of the run.
+func TestATornExtractionIsRebuiltOnceNotPerRequest(t *testing.T) {
+	root, mk := libRoot(t)
+	archive := mk("v", "Pack", "Pack_A_v1.unitypackage")
+	const guid = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	writeUnityPackage(t, archive, []unityGUID{{guid: guid, pathname: "Assets/Heart.fbx", asset: "ORIGINALBYTES"}})
+	ix, err := Build(Options{Root: root, CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := ix.Assets[0]
+	read := func() (string, error) {
+		rc, _, err := ix.Open(a)
+		if err != nil {
+			return "", err
+		}
+		defer rc.Close()
+		b, err := io.ReadAll(rc)
+		return string(b), err
+	}
+	if got, err := read(); err != nil || got != "ORIGINALBYTES" {
+		t.Fatalf("first read = %q, %v", got, err)
+	}
+
+	fp, err := fingerprint(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	member := filepath.Join(ix.unpackedDir(), fp, guid, "asset")
+	// Torn the way a crash between the rename and the data blocks leaves it: the archive
+	// is untouched, so the fingerprint still matches and only the member is short.
+	if err := os.WriteFile(member, []byte("SHORT"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := read(); err != nil || got != "ORIGINALBYTES" {
+		t.Fatalf("a torn member must be rebuilt from the archive: got %q, %v", got, err)
+	}
+
+	// Tear it again. The rebuild is spent, so this reports rather than re-extracting.
+	if err := os.WriteFile(member, []byte("SHORT"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := read(); err == nil {
+		t.Errorf("read = %q; want an error rather than a second full re-extraction", got)
+	}
+}
+
+// A preview.png has no indexed size to check against, so the one member the size check
+// cannot reach was also the one the rebuild could never reach: a blank one sits behind
+// a stat of a directory named for a print that does not move, outliving --reindex.
+// Emptiness is the evidence for it instead — no PNG is zero bytes.
+func TestATornPreviewIsRebuilt(t *testing.T) {
+	root, mk := libRoot(t)
+	archive := mk("v", "Pack", "Pack_A_v1.unitypackage")
+	const guid = "cccccccccccccccccccccccccccccccc"
+	writeUnityPackage(t, archive, []unityGUID{{guid: guid, pathname: "Assets/Rock.fbx", asset: "FBXBYTES", preview: true}})
+	ix, err := Build(Options{Root: root, CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := ix.Assets[0]
+	readThumb := func() (string, error) {
+		rc, _, err := ix.OpenThumbnail(a)
+		if err != nil {
+			return "", err
+		}
+		defer rc.Close()
+		b, err := io.ReadAll(rc)
+		return string(b), err
+	}
+	if got, err := readThumb(); err != nil || got != "PNGPREVIEW" {
+		t.Fatalf("first thumbnail read = %q, %v", got, err)
+	}
+	fp, err := fingerprint(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	preview := filepath.Join(ix.unpackedDir(), fp, guid, "preview.png")
+	if err := os.WriteFile(preview, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := readThumb(); err != nil || got != "PNGPREVIEW" {
+		t.Errorf("a zero-length preview must be rebuilt: got %q, %v", got, err)
+	}
+}
+
+// The retry inside uniqueClipNames is what stops a generated label from landing on a
+// real one. The duplicate case alone never reaches it — the first candidate is always
+// free — so this uses a file that already numbers its own duplicates, which a pipeline
+// that exported them once has produced.
+func TestAGeneratedClipLabelCannotTakeARealOne(t *testing.T) {
+	got := uniqueClipNames([]string{"Walk", "Walk (2)", "Walk"})
+	want := []string{"Walk", "Walk (2)", "Walk (3)"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("uniqueClipNames = %v, want %v: the third clip took the second's label, and with it its id and fingerprint", got, want)
+	}
+	// The same collision arriving from the other side.
+	got = uniqueClipNames([]string{"", "clip 1", ""})
+	for i := range got {
+		for j := range got {
+			if i != j && got[i] == got[j] {
+				t.Fatalf("uniqueClipNames = %v: %q is not unique", got, got[i])
+			}
+		}
+	}
+}
+
+// A loose file unreadable on the first build must be skipped, not indexed with an empty
+// fingerprint: an asset with no fingerprint is untaggable and unlinkable, and this one
+// would not open either. Every other use of unreadable() here asserts cache reuse, so
+// nothing covered the cold path.
+func TestAnUnreadableLooseFileIsSkippedNotIndexedBlank(t *testing.T) {
+	root, mk := libRoot(t)
+	p := mk("v", "Pack", "Locked.fbx")
+	if err := os.WriteFile(p, []byte("FBXBYTES"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(p, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(p, 0o644) })
+	if os.Geteuid() == 0 {
+		t.Skip("root reads a 0000 file regardless")
+	}
+	ix, err := Build(Options{Root: root, CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("one unreadable file must not fail the build: %v", err)
+	}
+	if len(ix.Assets) != 0 {
+		t.Errorf("indexed %d assets, want 0: a file whose fingerprint could not be read is a skip, not a blank card", len(ix.Assets))
+	}
+	if len(ix.Skipped) != 1 || !strings.Contains(ix.Skipped[0].RelPath, "Locked.fbx") {
+		t.Errorf("skipped = %v, want one entry naming Locked.fbx", ix.Skipped)
+	}
+}
+
+// A cache that cannot be written is not fatal — the index in hand is usable — but it is
+// not swallowed either: silently failing here re-pays a whole library scan every run.
+// Both halves are load-bearing and neither was pinned, because no test in this package
+// passed a warn that recorded anything.
+func TestAnUnwritableCacheWarnsAndKeepsServing(t *testing.T) {
+	root, mk := libRoot(t)
+	if err := os.WriteFile(mk("v", "Pack", "Rock.fbx"), []byte("ROCK"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cacheDir := t.TempDir()
+	// A directory where the index JSON goes: the write fails for every user, including
+	// root, without needing a permission bit.
+	if err := os.MkdirAll(cacheFile(cacheDir, mustAbs(t, root)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var warnings []string
+	ix, err := LoadOrBuild(Options{Root: root, CacheDir: cacheDir}, false, func(m string) { warnings = append(warnings, m) })
+	if err != nil {
+		t.Fatalf("an unwritable cache must not fail the run: %v", err)
+	}
+	if len(ix.Assets) != 1 {
+		t.Errorf("indexed %d assets, want 1", len(ix.Assets))
+	}
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "cache") {
+		t.Errorf("warnings = %v, want one naming the cache", warnings)
+	}
+}
+
+func mustAbs(t *testing.T, p string) string {
+	t.Helper()
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return abs
+}
+
+// Under --follow-symlinks the stat print keys on the resolved path while every display
+// field comes from the path the walk took to reach it. Renaming the link moves the
+// second and not the first, so a blind reuse kept the old drive's name in the grid, in
+// the vendor facet and in `path:` search until the file's own size or mtime moved.
+func TestRenamingAFollowedLinkRederivesItsDisplayFields(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	pack := filepath.Join(outside, "Synty", "POLYGON_Nature")
+	if err := os.MkdirAll(pack, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pack, "Tree.fbx"), []byte("FBXBYTES"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "drive2")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatal(err)
+	}
+	opt := Options{Root: root, CacheDir: t.TempDir(), FollowSymlinks: true}
+	first, err := LoadOrBuild(opt, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first.Assets) != 1 || first.Assets[0].Vendor != "drive2" {
+		t.Fatalf("first build = %+v, want one asset under vendor drive2", first.Assets)
+	}
+	if err := os.Rename(link, filepath.Join(root, "synty-drive")); err != nil {
+		t.Fatal(err)
+	}
+	again, err := LoadOrBuild(opt, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(again.Assets) != 1 {
+		t.Fatalf("second build indexed %d assets, want 1", len(again.Assets))
+	}
+	a := again.Assets[0]
+	if a.Vendor != "synty-drive" || !strings.HasPrefix(a.RelPath, "synty-drive/") {
+		t.Errorf("after the rename: vendor %q, relpath %q; want the path the walk now takes", a.Vendor, a.RelPath)
+	}
+}
+
+// dedup exists so a pack shipping one file both loose and inside an archive shows one
+// card. Splitting a multi-clip GLB into per-clip assets left nothing carrying the
+// file's own path, so the archive's copy matched no loose key and survived beside the
+// clips as a duplicate whole-file card.
+func TestASplitGLBStillSuppressesItsArchiveTwin(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		anims []string
+	}{
+		{"single clip", []string{"Walk"}},
+		{"multi clip", []string{"Walk", "Run"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root, mk := libRoot(t)
+			loose := mk("v", "Pack", "Anim.glb")
+			writeGLB(t, loose, tc.anims...)
+			b, err := os.ReadFile(loose)
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeZip(t, mk("v", "Pack", "Pack_Unity_v1.zip"), map[string]string{"Anim.glb": string(b)})
+			ix, err := Build(Options{Root: root, CacheDir: t.TempDir()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, a := range ix.Assets {
+				if a.Source.Kind == SourceZip {
+					t.Errorf("the archive copy of %s survived as a separate card (%s)", loose, a.RelPath)
+				}
+			}
+			if len(ix.Suppressed) != 1 {
+				t.Errorf("suppressed %d entries, want the archive's one copy", len(ix.Suppressed))
+			}
+		})
+	}
+}

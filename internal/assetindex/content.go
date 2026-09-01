@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -66,19 +67,77 @@ func (ix *Index) openUnpacked(a Asset, member string, want int64) (io.ReadCloser
 	// Only a member that opened and disagreed is evidence of a torn tree. A missing one
 	// is an ordinary miss — a guid this package does not hold — and re-extracting
 	// hundreds of MB to confirm that would be its own bug.
-	if err != nil || want < 0 || n == want {
+	if err != nil || !tornMember(n, want) {
 		return rc, n, err
 	}
 	rc.Close()
+	fp, err := fingerprint(a.Source.ArchivePath)
+	if err != nil {
+		return nil, 0, err
+	}
+	// Two things produce a disagreement here and only one of them is repairable. An
+	// archive replaced in place since the scan — the ordinary way a pack is updated —
+	// extracts correctly under its new print while the size this asset carries is the
+	// old one, so a rebuild reproduces the disagreement every time. Left to the repair
+	// path that is a full re-extraction per request, forever. Report it as the miss it
+	// is instead, the way openZipEntry reports an entry the archive stopped carrying,
+	// and leave the tree alone. An archive with no recorded print took a degraded
+	// enumeration, which says nothing either way, so it keeps the repair.
+	if recorded, known := ix.ArchivePrint[a.Source.ArchivePath]; known && recorded != fp {
+		return nil, 0, fmt.Errorf("%s changed since it was indexed: %w", filepath.Base(a.Source.ArchivePath), fs.ErrNotExist)
+	}
+	// Repaired once per extraction. The repair costs a full decompress, and a second
+	// disagreement after one means the cause was never the tree, so retrying would
+	// spend that cost on every request for the rest of the run — and each discard
+	// deletes the tree this archive's healthy members are being served from.
+	if !ix.claimRebuild(fp) {
+		return nil, 0, tornError(a, member, n, want)
+	}
 	if err := ix.discardExtraction(a.Source.ArchivePath); err != nil {
 		return nil, 0, err
 	}
 	rc, n, err = ix.openUnpackedMember(a, member)
-	if err == nil && n != want {
+	if err == nil && tornMember(n, want) {
 		rc.Close()
-		return nil, 0, fmt.Errorf("extracted %s is %d bytes, want %d", a.RelPath, n, want)
+		return nil, 0, tornError(a, member, n, want)
 	}
 	return rc, n, err
+}
+
+// tornMember reports whether an extracted member's size is evidence that its tree was
+// published before the bytes reached the disk. want is the size the scan recorded; for
+// a member the index does not size, emptiness is the evidence instead, since no member
+// a unitypackage ships is empty and a preview.png is at minimum its 8-byte signature.
+// Without that, the one member with nothing to compare against is also the one the
+// rebuild can never reach: the fast path is a stat of a directory named for a print
+// that does not move, so a blank preview would outlive even --reindex.
+func tornMember(n, want int64) bool {
+	if want < 0 {
+		return n == 0
+	}
+	return n != want
+}
+
+func tornError(a Asset, member string, n, want int64) error {
+	if want < 0 {
+		return fmt.Errorf("extracted %s %s is empty", a.RelPath, member)
+	}
+	return fmt.Errorf("extracted %s is %d bytes, want %d", a.RelPath, n, want)
+}
+
+// claimRebuild reports whether this caller should rebuild the extraction named by fp,
+// claiming it so no later one repeats the work. See openUnpacked for why it is once.
+func (ix *Index) claimRebuild(fp string) bool {
+	ix.extractMu.Lock()
+	defer ix.extractMu.Unlock()
+	if ix.rebuilt[fp] {
+		return false
+	}
+	if ix.rebuilt == nil {
+		ix.rebuilt = map[string]bool{}
+	}
+	ix.rebuilt[fp] = true
+	return true
 }
 
 // openUnpackedMember opens one extracted member, holding the archive's read lock from
@@ -234,6 +293,11 @@ func isLegacyIndex(path string) bool {
 // extraction under way is assembled in stagingDir instead — outside that tree, where
 // only one left behind long enough to be nobody's is cleared. A second quarry sharing
 // this cache dir sweeps every time it starts, so the two have to be able to overlap.
+//
+// The keep-set is read off this index, so it may only be called on one a full Build or
+// LoadOrBuild just produced for this root. Over an index anything narrowed — filtered,
+// truncated, half-populated — it deletes the extractions of everything that was
+// removed, and those are live for whoever is still serving them.
 func (ix *Index) PruneUnpacked() error {
 	if ix.cacheDir == "" {
 		return nil

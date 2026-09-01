@@ -303,3 +303,84 @@ func TestFailedSidekickAssemblyIsReportedAndNotCached(t *testing.T) {
 		t.Error("nothing was reported; the failure would be invisible to the user")
 	}
 }
+
+// scanPackagePaths is scanPackage keyed on the .unitypackage pathname rather than the
+// asset name, because the depth tie-break below turns on two characters of the same
+// name in different directories, which a name-keyed set cannot tell apart.
+func scanPackagePaths(t *testing.T, entries []unityGUID) map[string]bool {
+	t.Helper()
+	root, mk := libRoot(t)
+	writeUnityPackage(t, mk("synty", "SIDEKICK", "SIDEKICK_Unity_2021_3_v1_0_0.unitypackage"), entries)
+	assets, err := Scan(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kept := map[string]bool{}
+	for _, a := range assets {
+		kept[a.Source.Pathname] = true
+	}
+	return kept
+}
+
+// Two characters of the same base name, one nested under the other's directory. Name
+// length cannot separate them, so the deeper tree wins the claim — and it has to, or the
+// outer character (which assembled) takes the inner one's prefab and drops it, deleting
+// the only row that shows a character its own .sk could not assemble.
+func TestTheDeeperSidekickClaimsItsOwnByproducts(t *testing.T) {
+	head := unityGUID{guid: "hd1", pathname: "Assets/S/Resources/Meshes/SK_HEAD.fbx", asset: "HEADFBX"}
+	torso := unityGUID{guid: "tr1", pathname: "Assets/S/Resources/Meshes/SK_TORSO.fbx", asset: "TORSOFBX"}
+	outer := unityGUID{guid: "ou1", pathname: "Assets/S/Hero.sk", asset: "Name: Hero\nParts:\n  - Name: SK_HEAD\n  - Name: SK_TORSO\n"}
+	// The inner character names a part the package does not hold, so it never assembles.
+	inner := unityGUID{guid: "in1", pathname: "Assets/S/Sub/Hero.sk", asset: "Name: Hero\nParts:\n  - Name: SK_HEAD\n  - Name: SK_MISSING\n"}
+	innerPrefab := unityGUID{guid: "ip1", pathname: "Assets/S/Sub/Hero.prefab", asset: "PREFAB"}
+	outerPrefab := unityGUID{guid: "op1", pathname: "Assets/S/Hero.prefab", asset: "PREFAB"}
+
+	kept := scanPackagePaths(t, []unityGUID{head, torso, outer, inner, innerPrefab, outerPrefab})
+
+	if kept["Assets/S/Hero.prefab"] {
+		t.Error("the outer character assembled, so its own prefab is superseded")
+	}
+	if !kept["Assets/S/Sub/Hero.prefab"] {
+		t.Error("the inner character did not assemble, so its prefab is the only row that shows it and must survive")
+	}
+}
+
+// readUnityAssetBytes reads one byte past the limit and discards what exceeds it,
+// rather than truncating. A truncated .sk parses into a short part list, every name of
+// which resolves — so the character reports itself fully assembled while missing the
+// limbs the cut tail named, and the prefab that would have shown it whole is dropped.
+func TestAnOversizeSidekickDefinitionIsRefusedNotTruncated(t *testing.T) {
+	head := unityGUID{guid: "hd1", pathname: "Assets/S/Resources/Meshes/SK_HEAD.fbx", asset: "HEADFBX"}
+	torso := unityGUID{guid: "tr1", pathname: "Assets/S/Resources/Meshes/SK_TORSO.fbx", asset: "TORSOFBX"}
+	// A valid definition, then padding past the limit. Truncated at the limit this
+	// would parse as a complete two-part character.
+	body := "Name: Hero\nParts:\n  - Name: SK_HEAD\n  - Name: SK_TORSO\n" +
+		"Notes: " + strings.Repeat("x", maxSidekickBytes) + "\n"
+	sk := unityGUID{guid: "sk1", pathname: "Assets/S/Hero.sk", asset: body}
+	prefab := unityGUID{guid: "pf1", pathname: "Assets/S/Hero.prefab", asset: "PREFAB"}
+
+	root, mk := libRoot(t)
+	writeUnityPackage(t, mk("synty", "SIDEKICK", "SIDEKICK_Unity_2021_3_v1_0_0.unitypackage"),
+		[]unityGUID{head, torso, sk, prefab})
+	assets, err := Scan(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var character *Asset
+	kept := map[string]bool{}
+	for i := range assets {
+		kept[assets[i].Source.Pathname] = true
+		if assets[i].Ext == "sk" {
+			character = &assets[i]
+		}
+	}
+	if character == nil {
+		t.Fatal("the .sk row itself must survive")
+	}
+	if len(character.Source.Parts) != 0 {
+		t.Errorf("the .sk was read past its limit and assembled %d parts", len(character.Source.Parts))
+	}
+	if !kept["Assets/S/Hero.prefab"] {
+		t.Error("nothing assembled, so the prefab is the only row showing this character and must survive")
+	}
+}

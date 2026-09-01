@@ -16,6 +16,14 @@ func TestDeriveVariant(t *testing.T) {
 		{"GENERIC_Particle_FX", "GENERIC_Particle_FX_Godot_4_5_1_v1_0_0.zip", "Godot_4_5_1"},
 		{"INTERFACE_Dark_Fantasy_HUD", "INTERFACE_Dark_Fantasy_HUD_SourceSprites_v3.zip", "SourceSprites"},
 		{"Human_Basic_Motions", "Human Basic Motions.zip", ""}, // convention doesn't hold
+		// Near-misses that have to reach the unknown bucket rather than a wrong one. A
+		// variant is a facet the user filters by, so a value nothing else shares is a
+		// bucket of one: a pack shipping two releases would get one per version number.
+		{"Foo", "Foo_v3.zip", ""},                      // version where the variant goes
+		{"Foo", "Foo_v1_0_0.unitypackage", ""},         // same, multi-part version
+		{"", "_Extras_v1.zip", ""},                     // no pack dir to be prefixed by
+		{"Foo", "Foo_.zip", ""},                        // prefix and nothing after it
+		{"Foo", "Foo_Unity_2022_v2.zip", "Unity_2022"}, // still the ordinary case
 	}
 	for _, c := range cases {
 		if got := deriveVariant(c.pack, c.file); got != c.want {

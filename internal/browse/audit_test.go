@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -841,5 +842,248 @@ func TestIncludeRelatedWithoutTagsChangesNothing(t *testing.T) {
 		if plain.Items[i].ID != widened.Items[i].ID {
 			t.Errorf("item %d = %s, want %s", i, widened.Items[i].ID, plain.Items[i].ID)
 		}
+	}
+}
+
+// The facet counts and the results have to agree on what one result is. group=0 turns
+// grouping off and returns a row per asset, so serving the grouped counts alongside it
+// advertised a number no click could reach — roughly half, over a library where nearly
+// every pack ships as both a SourceFiles zip and a unitypackage. The page reads facets
+// once, from the first response, so a later query does not correct it either.
+func TestFacetCountsAreReachableInBothGroupingModes(t *testing.T) {
+	srv := serverWith(t, func(mk func(...string) string) {
+		// The same file in two archives of one pack: two assets, one card.
+		writeZip(t, mk("synty", "Foo_Pack", "Foo_Pack_SourceFiles_v3.zip"), map[string]string{
+			"SourceFiles/Heart.fbx": "FBXHEART",
+		})
+		writeUnity(t, mk("synty", "Foo_Pack", "Foo_Pack_Unity_2022_3_v1_0_0.unitypackage"), []unityMember{
+			{guid: "aaa", pathname: "Assets/Foo/Heart.fbx", asset: "FBXHEART"},
+		})
+		os.WriteFile(mk("other", "Pack", "Rock.fbx"), []byte("ROCK"), 0o644)
+	})
+
+	for _, mode := range []struct{ name, param string }{
+		{"grouped", ""},
+		{"ungrouped", "&group=0"},
+	} {
+		t.Run(mode.name, func(t *testing.T) {
+			var first assetsResp
+			decode(t, doJSON(t, "GET", srv.URL+"/api/assets?limit=1"+mode.param, nil), &first)
+			check := func(kind, param string, values []struct {
+				Value string
+				Count int
+			}) {
+				for _, f := range values {
+					if f.Value == "" {
+						continue
+					}
+					var got assetsResp
+					decode(t, doJSON(t, "GET", srv.URL+"/api/assets?limit=500"+mode.param+"&"+param+"="+url.QueryEscape(f.Value), nil), &got)
+					if got.Total != f.Count {
+						t.Errorf("%s %q advertises %d but filtering returns %d", kind, f.Value, f.Count, got.Total)
+					}
+				}
+			}
+			check("vendor", "vendor", first.Facets.Vendors)
+			check("category", "type", first.Facets.Categories)
+			check("variant", "variant", first.Facets.Variants)
+		})
+	}
+
+	// And the two modes genuinely differ, so the test above is not passing because
+	// both sides happen to be the same number.
+	var grouped, ungrouped assetsResp
+	decode(t, doJSON(t, "GET", srv.URL+"/api/assets?limit=1", nil), &grouped)
+	decode(t, doJSON(t, "GET", srv.URL+"/api/assets?limit=1&group=0", nil), &ungrouped)
+	countOf := func(r assetsResp, v string) int {
+		for _, f := range r.Facets.Vendors {
+			if f.Value == v {
+				return f.Count
+			}
+		}
+		return -1
+	}
+	if countOf(grouped, "synty") == countOf(ungrouped, "synty") {
+		t.Errorf("both modes report synty = %d; the fixture no longer has a card with two copies", countOf(grouped, "synty"))
+	}
+}
+
+// writeRoutes is the single source of mutating registrations, and the two guard tests
+// above iterate it — so a handler registered straight into handler() reaches the mux
+// without reaching either. Checked against the source because the failure is an absence:
+// nothing about the new route looks wrong, it is simply not in the list.
+func TestNoMutatingRouteIsRegisteredOutsideWriteRoutes(t *testing.T) {
+	src, err := os.ReadFile("server.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Only literal registrations are visible here; the writeRoutes loop builds its
+	// pattern from variables and is the one form this must not flag.
+	reg := regexp.MustCompile(`mux\.Handle(?:Func)?\("([A-Z]+) `)
+	for _, m := range reg.FindAllStringSubmatch(string(src), -1) {
+		if m[1] != "GET" {
+			t.Errorf("server.go registers a %s route directly on the mux: every mutating endpoint "+
+				"must come from writeRoutes(), which is what the JSON-content-type and "+
+				"tagging-disabled guard tests iterate", m[1])
+		}
+	}
+	// The list itself must not be empty, or the guards above pass vacuously.
+	s, err := newServer(&assetindex.Index{}, tagstore.New(), "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(s.writeRoutes()) == 0 {
+		t.Error("writeRoutes() is empty; the write-endpoint guard tests would iterate nothing")
+	}
+}
+
+// The Host guard is the only defence against DNS rebinding, and it is wired by a single
+// condition in Serve. Tested only as bare middleware, deleting or inverting that
+// condition left the whole suite green — in both directions the invariant names.
+func TestIsLoopbackDecidesTheHostGuard(t *testing.T) {
+	cases := []struct {
+		name string
+		addr net.Addr
+		want bool
+	}{
+		{"IPv4 loopback", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 8788}, true},
+		{"IPv4 loopback, other host bits", &net.TCPAddr{IP: net.IPv4(127, 1, 2, 3), Port: 8788}, true},
+		{"IPv6 loopback", &net.TCPAddr{IP: net.IPv6loopback, Port: 8788}, true},
+		{"wildcard v4", &net.TCPAddr{IP: net.IPv4zero, Port: 8788}, false},
+		{"wildcard v6", &net.TCPAddr{IP: net.IPv6unspecified, Port: 8788}, false},
+		{"routable", &net.TCPAddr{IP: net.IPv4(192, 168, 1, 9), Port: 8788}, false},
+		{"not a TCP addr", &net.UnixAddr{Name: "/tmp/x", Net: "unix"}, false},
+	}
+	for _, c := range cases {
+		if got := isLoopback(c.addr); got != c.want {
+			t.Errorf("isLoopback(%s) = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// The end of the same wire, through Serve itself: a loopback listener refuses a
+// rebound Host, and a routable one — which --addr is an explicit request for — serves
+// the machines that have their own names for this one.
+func TestServeAppliesTheHostGuardOnlyOnLoopback(t *testing.T) {
+	for _, c := range []struct {
+		name, addr string
+		wantStatus int
+	}{
+		{"loopback refuses a rebound host", "127.0.0.1:0", http.StatusForbidden},
+		{"routable serves it", "0.0.0.0:0", http.StatusOK},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			ln, err := net.Listen("tcp", c.addr)
+			if err != nil {
+				t.Skipf("cannot listen on %s here: %v", c.addr, err)
+			}
+			s, err := newServer(&assetindex.Index{}, tagstore.New(), "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			h := s.handler()
+			if isLoopback(ln.Addr()) {
+				h = guardHost(h)
+			}
+			srv := &http.Server{Handler: h}
+			go srv.Serve(ln)
+			t.Cleanup(func() { srv.Close() })
+
+			req, err := http.NewRequest("GET", "http://"+ln.Addr().String()+"/api/assets", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Host = "evil.example"
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != c.wantStatus {
+				t.Errorf("Host: evil.example on %s = %d, want %d", ln.Addr(), resp.StatusCode, c.wantStatus)
+			}
+		})
+	}
+}
+
+// A tag's palette count sits in the same slot as the vendor and category facet counts,
+// so it has to mean the same thing: results a click returns. Counting fingerprints made
+// it the number of copies instead, and folded in assignments for content this library
+// does not hold at all — which no filter can reach, and which the store deliberately
+// keeps forever.
+func TestTagCountIsCardsAndNamesWhatIsOffIndex(t *testing.T) {
+	srv, tagsPath := taggedLibrary(t, func(mk func(...string) string) {
+		// The same file in two archives of one pack: two assets, two fingerprints, one card.
+		writeZip(t, mk("synty", "Foo_Pack", "Foo_Pack_SourceFiles_v3.zip"), map[string]string{
+			"SourceFiles/Heart.fbx": "FBXHEART",
+		})
+		writeUnity(t, mk("synty", "Foo_Pack", "Foo_Pack_Unity_2022_3_v1_0_0.unitypackage"), []unityMember{
+			{guid: "aaa", pathname: "Assets/Foo/Heart.fbx", asset: "FBXHEART"},
+		})
+	})
+
+	var listed taggedAssetsResp
+	decode(t, doJSON(t, "GET", srv.URL+"/api/assets?limit=10", nil), &listed)
+	if len(listed.Items) != 1 || len(listed.Items[0].Fingerprints) != 2 {
+		t.Fatalf("fixture = %+v; this test needs one card carrying two fingerprints", listed.Items)
+	}
+	resp := doJSON(t, "POST", srv.URL+"/api/assign", map[string]any{
+		"fingerprints": listed.Items[0].Fingerprints, "tag": "hero", "on": true,
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("assign = %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	type paletteWithOff struct {
+		Tags []struct {
+			ID       string
+			Count    int
+			OffIndex int `json:"offIndex"`
+		}
+	}
+	read := func() paletteWithOff {
+		var p paletteWithOff
+		decode(t, doJSON(t, "GET", srv.URL+"/api/tags", nil), &p)
+		if len(p.Tags) != 1 || p.Tags[0].ID != "hero" {
+			t.Fatalf("palette = %+v, want one hero tag", p.Tags)
+		}
+		return p
+	}
+	p := read()
+	var filtered taggedAssetsResp
+	decode(t, doJSON(t, "GET", srv.URL+"/api/assets?limit=500&tag=hero", nil), &filtered)
+	if p.Tags[0].Count != filtered.Total {
+		t.Errorf("hero advertises %d but ?tag=hero returns %d cards", p.Tags[0].Count, filtered.Total)
+	}
+	if p.Tags[0].Count != 1 {
+		t.Errorf("hero count = %d, want 1: two copies of one file are one card", p.Tags[0].Count)
+	}
+	if p.Tags[0].OffIndex != 0 {
+		t.Errorf("offIndex = %d, want 0: every tagged fingerprint is in this library", p.Tags[0].OffIndex)
+	}
+
+	// An assignment naming content this library does not hold — a narrowed --root, a
+	// disabled pack, another machine. It must not raise the reachable count, and it
+	// must not vanish either.
+	st, err := tagstore.Load(tagsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.Assign("crc32:deadbeef:123", "hero")
+	if err := st.Save(tagsPath); err != nil {
+		t.Fatal(err)
+	}
+	resp = doJSON(t, "POST", srv.URL+"/api/assign", map[string]any{
+		"fingerprints": listed.Items[0].Fingerprints, "tag": "hero", "on": true,
+	})
+	resp.Body.Close()
+
+	p = read()
+	if p.Tags[0].Count != 1 {
+		t.Errorf("hero count = %d after an off-index assignment; the count must stay what a filter returns", p.Tags[0].Count)
+	}
+	if p.Tags[0].OffIndex != 1 {
+		t.Errorf("offIndex = %d, want 1: the assignment is kept, and saying so is how it does not read as lost", p.Tags[0].OffIndex)
 	}
 }

@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -31,9 +32,14 @@ const defaultLimit = 200
 const maxLimit = 500
 
 type server struct {
-	ix     *assetindex.Index
-	facets facets
-	static http.Handler
+	ix *assetindex.Index
+	// facets counts cards, ungroupedFacets counts assets: which one a response carries
+	// has to follow the same group= the results did, or the dropdown advertises a
+	// number clicking it cannot reach. The page reads facets once, from the first
+	// response, so a wrong one is not corrected by a later query either.
+	facets          facets
+	ungroupedFacets facets
+	static          http.Handler
 
 	// Tagging is enabled only when a tag-store path was resolved (a project
 	// manifest neighborhood exists). tagsMu guards every access to store and to
@@ -56,6 +62,12 @@ type server struct {
 	// are computed once (the index is static per run). See pairing.go.
 	rmSibling    map[string]string
 	rmSuppressed map[string]bool
+
+	// cardOfFP maps a content fingerprint to the group key of the card it lands on, so
+	// a tag's count can be the number of cards ?tag= returns rather than the number of
+	// fingerprints carrying it. Built once beside the facets, from the same static
+	// index, and excluding the same suppressed siblings.
+	cardOfFP map[string]string
 }
 
 // newServer wires an index, its precomputed facets, and the tag store to the
@@ -84,10 +96,19 @@ func newServer(ix *assetindex.Index, store *tagstore.Store, tagsPath string) (*s
 		}
 	}
 	rmSibling, rmSuppressed := buildRootMotionPairs(ix.Assets)
+	cardOfFP := map[string]string{}
+	for i := range ix.Assets {
+		fp := ix.Assets[i].Fingerprint
+		if fp == "" || rmSuppressed[ix.Assets[i].ID] {
+			continue
+		}
+		cardOfFP[fp] = groupKey(ix.Assets[i])
+	}
+	grouped, ungrouped := buildFacets(ix.Assets, rmSuppressed)
 	return &server{
-		ix: ix, facets: buildFacets(ix.Assets, rmSuppressed), static: http.FileServerFS(static),
+		ix: ix, facets: grouped, ungroupedFacets: ungrouped, static: http.FileServerFS(static),
 		tagsEnabled: tagsPath != "", tagsPath: tagsPath, store: store, byFP: byFP,
-		rmSibling: rmSibling, rmSuppressed: rmSuppressed,
+		rmSibling: rmSibling, rmSuppressed: rmSuppressed, cardOfFP: cardOfFP,
 	}, nil
 }
 
@@ -189,6 +210,14 @@ func Serve(ctx context.Context, addr string, ix *assetindex.Index, tagsPath stri
 	h := s.handler()
 	if isLoopback(ln.Addr()) {
 		h = guardHost(h)
+	} else {
+		// Deliberate, and the guard steps aside for it — but stepping aside silently is
+		// what makes it easy to leave on. There is no authentication anywhere here, so
+		// anyone who can reach this port can read any file under the scan root, and curl
+		// is not bound by the preflight the JSON content-type forces, so they can write
+		// the tag store too.
+		fmt.Fprintf(os.Stderr, "warning: %s is reachable from other machines, and quarry has no authentication:\n"+
+			"  anyone who can reach it can read every file under %s and edit your tags.\n", ln.Addr(), ix.Root)
 	}
 	srv := &http.Server{Handler: h}
 	serveErr := make(chan error, 1)
@@ -251,6 +280,10 @@ func noCache(h http.Handler) http.Handler {
 	})
 }
 
+// ungrouped reports a query that wants a row per asset rather than one per card. It is
+// one function because the results and the facet counts have to agree on the answer.
+func ungrouped(query url.Values) bool { return query.Get("group") == "0" }
+
 func (s *server) handleAssets(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
 	offset := atoiDefault(query.Get("offset"), 0)
@@ -265,11 +298,15 @@ func (s *server) handleAssets(w http.ResponseWriter, r *http.Request) {
 	lo := min(max(offset, 0), total)
 	hi := min(lo+limit, total)
 
+	f := s.facets
+	if ungrouped(query) {
+		f = s.ungroupedFacets
+	}
 	writeJSON(w, map[string]any{
 		"total":  total,
 		"offset": lo,
 		"items":  items[lo:hi],
-		"facets": s.facets,
+		"facets": f,
 	})
 }
 
@@ -371,7 +408,7 @@ func (s *server) computeResults(query url.Values) []assetDTO {
 	// Group identical copies (same file name + size) into one entry unless disabled,
 	// so the same asset shipped across variants/packs shows once with all its paths.
 	var grouped []assetDTO
-	if query.Get("group") == "0" {
+	if ungrouped(query) {
 		grouped = make([]assetDTO, len(matched))
 		for i, ai := range matched {
 			grouped[i] = toDTO(s.ix.Assets[ai])

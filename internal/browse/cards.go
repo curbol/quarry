@@ -14,9 +14,10 @@ import (
 // assetDTOs and the facet counts beside them out — with no HTTP anywhere in it, so
 // grouping and counting can be read and reasoned about apart from request handling.
 //
-// groupKey is the single notion of "one card", used both per query and once at
-// startup for the facets. Counting cards one way and filtering them another is what
-// made a facet advertise a count no filter could reach.
+// groupKey is the single notion of "one card", used both per query and at startup for
+// the facets. Counting cards one way and filtering them another is what made a facet
+// advertise a count no filter could reach — which is also why buildFacets returns a
+// second set of counts for group=0, where a result is one asset rather than one card.
 
 // assetDTO is the client-facing view of an asset: the representative's display
 // fields plus every identical copy (same file across variants/packs) so the UI can
@@ -77,6 +78,11 @@ func toDTO(a assetindex.Asset) assetDTO {
 		Thumb: string(a.Thumb), Source: a.Source,
 		Count: 1, Copies: []copyDTO{copyOf(a)},
 	}
+	// Never nil, for the reason unionTagsLocked keeps "tags" never nil: an asset whose
+	// content could not be read has no fingerprint, and leaving the field null here
+	// made it null on the group=0 path and [] on the grouped one — a difference in the
+	// public response shape that says nothing about the card.
+	d.Fingerprints = []string{}
 	if a.Fingerprint != "" {
 		d.Fingerprints = []string{a.Fingerprint}
 	}
@@ -127,16 +133,27 @@ type facetValue struct {
 // Grouped over positions rather than through groupItems: this runs over the whole
 // library, and materializing every card as a DTO — with its copies slice and its
 // fingerprint set — to throw them all away is a large transient spike at startup.
-func buildFacets(assets []assetindex.Asset, hidden map[string]bool) facets {
+//
+// Both counts come back, because "one result" is not one thing: group=0 turns grouping
+// off and returns a row per asset, so the grouped count under-reports it by however
+// many copies a pack ships — which for a Synty library, where nearly every pack ships
+// as both a SourceFiles zip and a unitypackage, is close to half. Counted in the one
+// pass that already visits every asset, so the second set is free.
+func buildFacets(assets []assetindex.Asset, hidden map[string]bool) (grouped, ungrouped facets) {
 	byKey := map[string][]int32{}
+	categories, vendors, variants := map[string]int{}, map[string]int{}, map[string]int{}
+	uCategories, uVendors, uVariants := map[string]int{}, map[string]int{}, map[string]int{}
 	for i := range assets {
 		if hidden[assets[i].ID] {
 			continue
 		}
 		k := groupKey(assets[i])
 		byKey[k] = append(byKey[k], int32(i))
+		// Ungrouped is a row per asset, so every value counts every time it appears.
+		uCategories[string(assets[i].Category)]++
+		uVendors[assets[i].Vendor]++
+		uVariants[assets[i].Variant]++
 	}
-	categories, vendors, variants := map[string]int{}, map[string]int{}, map[string]int{}
 	bump := func(m map[string]int, seen map[string]bool, v string) {
 		if !seen[v] {
 			seen[v] = true
@@ -156,6 +173,10 @@ func buildFacets(assets []assetindex.Asset, hidden map[string]bool) facets {
 		Categories: sortedFacet(categories),
 		Vendors:    sortedFacet(vendors),
 		Variants:   sortedFacet(variants),
+	}, facets{
+		Categories: sortedFacet(uCategories),
+		Vendors:    sortedFacet(uVendors),
+		Variants:   sortedFacet(uVariants),
 	}
 }
 

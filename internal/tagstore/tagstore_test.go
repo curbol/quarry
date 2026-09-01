@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -947,5 +948,183 @@ func TestUnlinkSurvivesARoundTrip(t *testing.T) {
 	}
 	if strings.Contains(string(b), "[[group]]") {
 		t.Errorf("a dissolved group still wrote a row:\n%s", b)
+	}
+}
+
+// Only the file this store read may be rewritten. A save onto a file this store has
+// never seen cannot tell what it is destroying — the same total loss ErrStale exists to
+// prevent, minus even the chance to notice — so an export is allowed onto a path that
+// does not exist and refused onto one that does.
+func TestSaveRefusesAFileThisStoreNeverRead(t *testing.T) {
+	dir := t.TempDir()
+	real := filepath.Join(dir, FileName)
+	if err := os.WriteFile(real, []byte("[[tag]]\n  id = \"hero\"\n  color = \"#e11d48\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Load(real)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Exporting to a fresh path is not a rewrite, and stays allowed.
+	backup := filepath.Join(dir, "backup.toml")
+	if err := s.Save(backup); err != nil {
+		t.Fatalf("export to a path that does not exist: %v", err)
+	}
+
+	// Somebody else's file, which this store has never read.
+	other := filepath.Join(dir, "someone-elses.toml")
+	if err := os.WriteFile(other, []byte("[[tag]]\n  id = \"villain\"\n  color = \"#00ff00\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Save(other); !errors.Is(err, ErrStale) {
+		t.Errorf("Save onto an unread existing file = %v, want ErrStale", err)
+	}
+	b, err := os.ReadFile(other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "villain") {
+		t.Errorf("the refused save still overwrote the file: %q", b)
+	}
+
+	// Re-exporting over the backup this store just wrote is the same rule: it is not
+	// the file this store read, so it is not the file this store may rewrite.
+	if err := s.Save(backup); !errors.Is(err, ErrStale) {
+		t.Errorf("second export over the same backup = %v, want ErrStale", err)
+	}
+
+	// And the home never moved: the real store is still the guarded one.
+	if err := s.Save(real); err != nil {
+		t.Errorf("saving the file this store loaded = %v, want success", err)
+	}
+}
+
+// A failed save must not leave memory ahead of the file. The store is the caller's to
+// recover, and Reload is what it recovers with — so a Reload that itself fails has to
+// leave the store exactly as it was, which is the one state a caller can detect.
+func TestAFailedSaveLeavesTheStoreRecoverable(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, FileName)
+	s := New()
+	s.Define("hero", "#112233")
+	s.Assign("crc32:aaaa:1", "hero")
+	if err := s.Save(p); err != nil {
+		t.Fatal(err)
+	}
+
+	// Edited underneath, the way a checkout or a second quarry would.
+	if err := os.WriteFile(p, []byte("[[tag]]\n  id = \"villain\"\n  color = \"#00ff00\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s.Assign("crc32:bbbb:2", "hero")
+	if err := s.Save(p); !errors.Is(err, ErrStale) {
+		t.Fatalf("Save over an outside edit = %v, want ErrStale", err)
+	}
+	// The outside edit survived, untouched.
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "villain") {
+		t.Fatalf("the refused save destroyed the outside edit: %q", b)
+	}
+
+	// Recovery: memory takes what the file holds, dropping the edit that never landed.
+	if err := s.Reload(p); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.TagsFor("crc32:bbbb:2")) != 0 {
+		t.Error("an assignment the file never received survived the reload")
+	}
+	if !s.Has("villain") {
+		t.Error("the reload did not pick up the outside edit")
+	}
+	// And the recovered store can save again, against the file it now matches.
+	s.Assign("crc32:cccc:3", "villain")
+	if err := s.Save(p); err != nil {
+		t.Errorf("save after a successful reload = %v, want success", err)
+	}
+}
+
+// A Reload that fails leaves the store exactly as it was, so a caller can tell that
+// memory and disk have diverged rather than silently serving a half-cleared store.
+func TestAFailedReloadChangesNothing(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, FileName)
+	s := New()
+	s.Define("hero", "#112233")
+	s.Assign("crc32:aaaa:1", "hero")
+	if err := s.Save(p); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte("this is not toml ["), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Reload(p); err == nil {
+		t.Fatal("Reload over an unparseable file must fail")
+	}
+	if !s.Has("hero") || len(s.TagsFor("crc32:aaaa:1")) != 1 {
+		t.Error("a failed reload emptied the store instead of leaving it alone")
+	}
+}
+
+// Overlapping [[group]] rows merge, which is the deliberate asymmetry with a duplicate
+// [[tag]] id: a save rewrites the file whole, so a last-row-wins tag id would destroy
+// the other definition, while overlapping groups lose nothing by becoming one. Only the
+// Link path covered the merge, so extending the duplicate-id refusal to groups — the
+// natural-looking symmetry — would have turned a hand-edited store into a load error.
+func TestOverlappingGroupRowsMergeOnLoad(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, FileName)
+	if err := os.WriteFile(p, []byte(`
+[[group]]
+  fingerprints = ["A", "B"]
+[[group]]
+  fingerprints = ["B", "C"]
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Load(p)
+	if err != nil {
+		t.Fatalf("overlapping groups must merge, not error: %v", err)
+	}
+	groups := s.Groups()
+	if len(groups) != 1 {
+		t.Fatalf("groups = %v, want the single merged {A,B,C}", groups)
+	}
+	if !reflect.DeepEqual(groups[0], []string{"A", "B", "C"}) {
+		t.Errorf("group = %v, want [A B C]", groups[0])
+	}
+	if !reflect.DeepEqual(s.Related("A"), []string{"B", "C"}) {
+		t.Errorf("Related(A) = %v, want [B C]", s.Related("A"))
+	}
+}
+
+// FingerprintsByTag is what the palette folds onto cards, so it has to name every
+// assignment exactly once and see tags with none.
+func TestFingerprintsByTag(t *testing.T) {
+	s := New()
+	s.Define("hero", "#112233")
+	s.Define("unused", "#445566")
+	s.Assign("fp1", "hero")
+	s.Assign("fp2", "hero")
+	s.Assign("fp2", "villain")
+	got := s.FingerprintsByTag()
+	sort.Strings(got["hero"])
+	if !reflect.DeepEqual(got["hero"], []string{"fp1", "fp2"}) {
+		t.Errorf("hero = %v, want [fp1 fp2]", got["hero"])
+	}
+	if !reflect.DeepEqual(got["villain"], []string{"fp2"}) {
+		t.Errorf("villain = %v, want [fp2]", got["villain"])
+	}
+	if len(got["unused"]) != 0 {
+		t.Errorf("unused = %v, want nothing", got["unused"])
+	}
+	// The same totals Counts reports, from the same assignments.
+	for id, fps := range got {
+		if len(fps) != s.Counts()[id] {
+			t.Errorf("%s: %d fingerprints but Counts says %d", id, len(fps), s.Counts()[id])
+		}
 	}
 }

@@ -95,6 +95,9 @@ type fileTOML struct {
 //
 // A Store is not safe for concurrent use: callers sharing one across goroutines
 // must synchronize externally, around reads as well as writes.
+//
+// New or Load builds one. The zero value is not usable — its maps are nil, so the
+// first Assign panics rather than reporting anything.
 type Store struct {
 	colors map[string]string          // tag id -> color
 	assign map[string]map[string]bool // fingerprint -> set of tag ids
@@ -346,6 +349,21 @@ func (s *Store) Groups() [][]string {
 	return out
 }
 
+// FingerprintsByTag returns the fingerprints carrying each tag. Counts answers "how
+// many assignments"; a caller that has to fold those onto something else — the cards
+// they land on, or the subset the current index actually holds — needs the
+// fingerprints themselves, and building that per tag from the outside would be a pass
+// over every assignment per tag rather than one pass in total.
+func (s *Store) FingerprintsByTag() map[string][]string {
+	m := make(map[string][]string, len(s.colors))
+	for fp, set := range s.assign {
+		for id := range set {
+			m[id] = append(m[id], fp)
+		}
+	}
+	return m
+}
+
 // Counts returns the number of fingerprints each tag is applied to.
 func (s *Store) Counts() map[string]int {
 	m := map[string]int{}
@@ -462,6 +480,11 @@ func Load(path string) (*Store, error) {
 // a pointer swap is a step a caller can forget while still holding the write lock.
 // On error the store is left exactly as it was; the caller then knows memory and
 // disk have diverged and can refuse further writes.
+//
+// path is load-bearing beyond what is read: it becomes the file Save will guard, so
+// reloading from somewhere else re-homes the store there and leaves the file it was
+// actually editing unguarded. Recovery passes the path it saved to, which is the
+// same one, and nothing else should call this.
 func (s *Store) Reload(path string) error {
 	fresh, err := Load(path)
 	if err != nil {
@@ -484,24 +507,29 @@ const storeHeader = "# quarry tag store. Rewritten whole on every edit, so comme
 // the user-wide one — is destroyed with no trace. Stat-then-rename leaves a window
 // too small to matter here and too expensive to close: this is one user's file, and
 // the failure being guarded against is measured in minutes, not microseconds.
-// The first save of a store that has never read a file adopts that file, and a store
-// that has one keeps it: a save elsewhere is an export and leaves the guard where it
-// was. Either way a successful save re-stamps the guarded file, which is what the
-// check reads next time — so this mutates the store, and a caller sharing a Store
-// across goroutines must hold the lock it holds for an edit, not the one it holds for
-// a read.
+// The rule is that only the file this store read may be rewritten. A save anywhere
+// else is an export, so it is allowed onto a path that does not exist and refused onto
+// one that does — a store that never read that file cannot tell what it would be
+// destroying, which is the same thing the staleness check is for. The first save of a
+// store that has never read a file adopts that file, and a store that has one keeps
+// it: an export leaves the guard where it was. Either way a successful save re-stamps
+// the guarded file, which is what the check reads next time — so this mutates the
+// store, and a caller sharing a Store across goroutines must hold the lock it holds
+// for an edit, not the one it holds for a read.
 func (s *Store) Save(path string) error {
 	switch {
 	case s.loadedFrom == path:
 		if s.stamp != stampOf(path) {
 			return fmt.Errorf("%s: %w", path, ErrStale)
 		}
-	case s.loadedFrom == "":
-		// A store from New() has read nothing. Rewriting an existing file whole from it
-		// is the same total loss ErrStale exists to prevent, minus even the chance to
-		// notice: there is no earlier state to compare against because there was never a
-		// read. Only Load leaves loadedFrom empty-handed, and Load records the path even
-		// for a file that is not there yet, so this is exactly the never-loaded case.
+	default:
+		// Only the file this store read may be rewritten. Everything else — a store from
+		// New() that has read nothing, and a store saving somewhere other than where it
+		// loaded from — is writing a file it has never seen, which is the same total loss
+		// ErrStale exists to prevent, minus even the chance to notice: there is no earlier
+		// state to compare against because there was never a read. An export to a path
+		// that does not exist yet is the one shape that is not a rewrite, so that is the
+		// one this allows.
 		if _, err := os.Stat(path); err == nil {
 			return fmt.Errorf("%s: %w", path, ErrStale)
 		}

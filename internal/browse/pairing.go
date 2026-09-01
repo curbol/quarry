@@ -67,7 +67,8 @@ func assetFileBase(s assetindex.Source) string {
 // grouped by (vendor, pack, canonical file base); a group with both variants pairs
 // only when its visible side includes an animation, so an unrelated "_RM" file never
 // hijacks a card. Which RM an in-place asset gets is pickRM's decision: same directory
-// first, then same archive, then same clip.
+// first, then same archive. Which clip inside that file plays is not settled here —
+// an RM file is never split, so it arrives whole and the frontend matches the clip.
 func buildRootMotionPairs(assets []assetindex.Asset) (sibling map[string]string, suppressed map[string]bool) {
 	type group struct{ nonRM, rm []int }
 	groups := map[string]*group{}

@@ -99,6 +99,19 @@ export function matchRig(entries, bones, vendor, clipName) {
   return best;
 }
 
+// hasNamedBody reports whether the registry already holds the body a clip is named after,
+// so a caller can tell the case matchRig can settle on its own from the one where the
+// entry it would rank first is missing and has to be looked up.
+//
+// A registry that predates the naming rule holds whichever body was registered first, and
+// that body fits — one skeleton, several meshes — so nothing would ever go looking for the
+// named one again. This is the cheap question asked before paying for that search.
+export function hasNamedBody(entries, vendor, clipName) {
+  const series = nameSeries(clipName);
+  if (!series) return true; // nothing to look for, so nothing is missing
+  return (entries || []).some((e) => (!vendor || !e.vendor || e.vendor === vendor) && nameSeries(e.name) === series);
+}
+
 // searchedSkeleton reports whether one of the bone sets already searched for is the same
 // skeleton as this clip's, so searching again would load the same models to the same end.
 // A pack can ship two skeletons that share no bone name — a Unity-named body and clips

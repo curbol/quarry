@@ -10,7 +10,7 @@ import assert from 'node:assert/strict';
 
 import {
   clipsForAsset, clipsMatching, coversBones, matchRig, nameSeries, packRigCandidates, searchedSkeleton,
-  stackedCharacter, storedBindFits,
+  stackedCharacter, storedBindFits, hasNamedBody,
 } from '../assets/rigmatch.js';
 
 const clips = (...names) => names.map((name) => ({ name }));
@@ -312,4 +312,33 @@ test('the clip name yields to pinning and to coverage', () => {
   const stranger = entry({ id: 'stranger', name: 'HumanM_Model.fbx', vendor: 'kevdev', bones: bones(52, 'z') });
   const other = entry({ id: 'other', name: 'HumanF_Model.fbx', vendor: 'kevdev', bones: rig });
   assert.equal(matchRig([stranger, other], rig, 'kevdev', 'HumanM@Idle.fbx').id, 'other');
+});
+
+// A registry written before the naming rule holds whichever body was registered first,
+// and that body fits, so nothing would ever look for the named one again. hasNamedBody is
+// the question asked before paying for that lookup.
+test('the named body is missing until the registry holds one', () => {
+  const f = entry({ id: 'f', name: 'HumanF_Model.fbx', vendor: 'kevdev', bones: bones(52) });
+  const m = entry({ id: 'm', name: 'HumanM_Model.fbx', vendor: 'kevdev', bones: bones(52) });
+  assert.equal(hasNamedBody([f], 'kevdev', 'HumanM@CombatIdle1H01.fbx'), false);
+  assert.equal(hasNamedBody([f, m], 'kevdev', 'HumanM@CombatIdle1H01.fbx'), true);
+  assert.equal(hasNamedBody([f], 'kevdev', 'HumanF@Idle01.fbx'), true);
+  assert.equal(hasNamedBody([], 'kevdev', 'HumanM@Idle.fbx'), false);
+});
+
+// Scoped to the clip's vendor the same way matching is, since a body from another vendor
+// is never what match() would return however it is named. A vendorless legacy entry stays
+// the wildcard it is everywhere else.
+test('a named body from another vendor does not count as holding it', () => {
+  const other = entry({ id: 'o', name: 'HumanM_Model.fbx', vendor: 'synty', bones: bones(52) });
+  const legacy = entry({ id: 'l', name: 'HumanM_Model.fbx', bones: bones(52) });
+  assert.equal(hasNamedBody([other], 'kevdev', 'HumanM@Idle.fbx'), false);
+  assert.equal(hasNamedBody([legacy], 'kevdev', 'HumanM@Idle.fbx'), true);
+});
+
+// No series to look for means nothing is missing, so no search is paid for.
+test('a clip with no name asks for nothing', () => {
+  assert.equal(hasNamedBody([], 'kevdev', ''), true);
+  assert.equal(hasNamedBody([], 'kevdev', null), true);
+  assert.equal(hasNamedBody(null, 'kevdev', 'HumanM@Idle.fbx'), false);
 });

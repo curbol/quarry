@@ -4,7 +4,7 @@
 // (which has no import map); it is the same file the document's import map points
 // "three" at, so a single three instance is shared across both.
 import * as THREE from '/static/vendor/three/three.module.min.js';
-import { clipsForAsset, clipsMatching, coversBones, matchRig, nameSeries, packRigCandidates, searchedSkeleton, stackedCharacter, storedBindFits } from '/static/rigmatch.js';
+import { clipsForAsset, clipsMatching, coversBones, hasNamedBody, matchRig, nameSeries, packRigCandidates, searchedSkeleton, stackedCharacter, storedBindFits } from '/static/rigmatch.js';
 import { GLTFLoader } from '/static/vendor/three/jsm/loaders/GLTFLoader.js';
 import { FBXLoader } from '/static/vendor/three/jsm/loaders/FBXLoader.js';
 
@@ -674,6 +674,13 @@ async function resolveRig(bones, asset, tryLoad, cancelled = () => false) {
   };
   await CharRegistry.seed();
   if (cancelled()) return null;
+  // A registry holding any body that fits settles the clip here, and the pack search that
+  // would turn up the body it is named after only runs when nothing fits at all — so a
+  // registry written before this session preferred the named one would go on answering
+  // with the other body for as long as it survives. Fetching the named body first is one
+  // search and at most one load, once per vendor and series, and leaves the ranking to it.
+  if (!CharRegistry.hasNamed(asset)) await CharRegistry.registerNamed(asset);
+  if (cancelled()) return null;
   const known = await attempt();
   if (known || cancelled()) return known;
   await CharRegistry.discoverForVendor(asset, bones);
@@ -757,6 +764,33 @@ const CharRegistry = {
     dispose(root);
     if (entry) this.add(entry);
     return !!entry;
+  },
+  // hasNamed reports whether the body this clip is named after is already registered, so
+  // registerNamed is only paid for when it is not. The ranking in match() does the rest.
+  hasNamed(asset) { return hasNamedBody(this.list(), asset && asset.vendor, asset && asset.name); },
+  // registerNamed looks up the one body a clip's own name points at — HumanM_Model for
+  // HumanM@CombatIdle1H01 — and registers it so match() has it to rank. A name search
+  // rather than discoverForVendor's sweep: this is asking for a specific file, not
+  // establishing what a pack ships, and the sweep costs up to fourteen model loads where
+  // this costs one query and at most one.
+  //
+  // The search is by series alone, so it also returns files that merely begin with those
+  // letters; only an exact series match is the body meant. Preferring the clip's own pack
+  // among them keeps a character to the pack it was indexed under, since a vendor ships
+  // the same body in every pack. Once per vendor and series, whether or not it found
+  // anything: a vendor that names its bodies nothing like its clips must not re-ask for
+  // every clip in the library.
+  namedTried: new Set(),
+  async registerNamed(asset) {
+    const series = nameSeries(asset && asset.name);
+    if (!series) return;
+    const scope = (asset.vendor || '') + ' ' + series;
+    if (this.namedTried.has(scope)) return;
+    this.namedTried.add(scope);
+    const items = await rigCandidates({ q: series, vendor: asset.vendor, limit: 8, types: ['model'] });
+    const named = items.filter((it) => nameSeries(it.name) === series);
+    const pick = named.find((it) => it.pack === asset.pack) || named[0];
+    if (pick) await this.register(pick);
   },
   // Lazily discover a few character bodies by name so auto-match works before the
   // user has opened a matching character. Runs once per session; bounded; add()

@@ -256,7 +256,14 @@ function withTimeout(promise, onExpire) {
 
 self.onmessage = (e) => {
   if (e.data.type === 'seed') {
-    if (e.data.list && e.data.list.length) CharRegistry.save(e.data.list);
+    // Merged, not saved over. The worker's registry is its own in-memory store (there
+    // is no localStorage here), and discoverForVendor fills it with bodies the main
+    // thread has never seen. Replacing it wholesale dropped those — permanently, since
+    // the memos that record a scope as already searched live on CharRegistry rather
+    // than in the store and so survive the wipe, short-circuiting every re-search.
+    // add() unshifts, so the incoming list is applied backwards to keep its order.
+    const list = e.data.list || [];
+    for (let i = list.length - 1; i >= 0; i--) CharRegistry.add(list[i]);
     return;
   }
   if (e.data.type === 'cancel') {

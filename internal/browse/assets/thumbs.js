@@ -77,14 +77,16 @@ const THUMB_CACHE_MAX = 400;
 const NO_RENDER_MAX = 5000;
 
 // lazyWork defers per-card work (a thumbnail render, a font download) until the card
-// is near the viewport, and forgets every card the grid drops. An IntersectionObserver
-// holds its targets and a card that never scrolled into view is never unobserved, so
-// each reset — a keystroke, a filter toggle — would otherwise strand another batch of
-// detached cards and the assets they reference for the life of the page.
+// is near the viewport. An IntersectionObserver holds its targets and a card that
+// never scrolled into view is never unobserved, so every caller dropping a node must
+// forget() it or that node, and the asset it references, outlives the DOM.
+//
+// It watches more than the grid — the lightbox's related strip defers the same work —
+// so there is no wholesale teardown here. Releasing a batch means forgetting its
+// nodes; anything coarser takes the other caller's nodes with it.
 export const lazyWork = {
   observer: null,
-  reset() {
-    if (this.observer) this.observer.disconnect();
+  init() {
     this.observer = new IntersectionObserver((entries) => {
       for (const e of entries) {
         if (!e.isIntersecting) continue;
@@ -101,7 +103,7 @@ export const lazyWork = {
     el._onVisible = null;
   },
 };
-lazyWork.reset();
+lazyWork.init();
 
 // ModelThumbnails is a thin client over the thumbnail worker: it observes cards, posts
 // each asset's descriptor, and swaps in the PNG blob the worker renders off the main
@@ -168,7 +170,6 @@ class ModelThumbnails {
   // grinding through cards nobody is looking at before it reaches the visible ones;
   // without the re-request, a cancelled card would keep its icon forever.
   watch() {
-    if (this.vis) this.vis.disconnect();
     this.vis = new IntersectionObserver((entries) => {
       for (const e of entries) {
         if (e.isIntersecting) this.request(e.target);
@@ -193,19 +194,6 @@ class ModelThumbnails {
     }
     this.pending.clear();
     this.vis.disconnect();
-  }
-  // release drops the renders queued for cards the grid is about to replace, and lets
-  // go of the cards themselves: an IntersectionObserver holds its targets, so keeping
-  // them observed would strand a batch of detached nodes on every filter change.
-  release() {
-    if (this.dead) return;
-    for (const id of this.pending.keys()) this.worker.postMessage({ type: 'cancel', id });
-    this.pending.clear();
-    // watch() builds a fresh observer, so nothing here is observed any more and these
-    // nodes are about to be dropped: holding them would be the leak this method exists
-    // to avoid, one detached batch per filter change.
-    this.settled.clear();
-    this.watch();
   }
   // forget lets go of one card the grid is dropping: the render queued for it is
   // cancelled (unless another card on screen still wants the same asset) and the

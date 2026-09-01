@@ -129,8 +129,14 @@ function reset() {
   // Let go of the outgoing cards before dropping them: what is observing them, what is
   // still being rendered for them, and what would repaint them on a tag edit all
   // outlive the DOM otherwise.
-  lazyWork.reset();
-  modelThumbs.release();
+  //
+  // Card by card rather than by rebuilding the two observers wholesale. They are not
+  // the grid's alone — the lightbox's related strip registers its thumbnails through
+  // the same thumbContent — and a reset can arrive with one open, since editing a tag
+  // under an active tag filter re-runs the query. Tearing the observers down then left
+  // the strip's holders in the DOM watched by nobody and in no pending set, spinning
+  // for a render nothing would ask for again.
+  for (const el of els.grid.querySelectorAll('.card')) forgetCard(el);
   tagWatchers.clear();
   gridWindow.reset();
   els.grid.replaceChildren();

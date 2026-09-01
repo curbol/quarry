@@ -796,7 +796,7 @@ const CharRegistry = {
   async registerNamed(asset) {
     const series = nameSeries(asset && asset.name);
     if (!series) return;
-    const scope = (asset.vendor || '') + ' ' + series;
+    const scope = (asset.vendor || '') + '\x00' + series;
     if (this.namedTried.has(scope)) return;
     this.namedTried.add(scope);
     const items = await rigCandidates({ q: series, vendor: asset.vendor, limit: 8, types: ['model'] });

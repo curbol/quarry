@@ -68,12 +68,6 @@ already pins is not a new finding. Between them they pin most of what is listed 
 Core invariants below, so they are also the fastest way to learn which rules already
 have teeth and which are prose only.
 
-One trap when sweeping the frontend: `scene.js` contains a literal NUL byte (a map-key
-separator, around line 799), so GNU grep classifies it as binary and reports "binary
-file matches" with no lines, and a piped `grep -n` over it looks like a clean miss.
-Pass `-a` / `--binary-files=text` for any grep meant to cover the frontend, or the
-largest module on the page silently answers "not found" to every pattern.
-
 ## Step 3: Dispatch review sub-agents
 
 Use `feature-dev:code-reviewer` sub-agents to review the scoped files. Split by area so

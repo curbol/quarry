@@ -5,6 +5,7 @@
 // "three" at, so a single three instance is shared across both.
 import * as THREE from '/static/vendor/three/three.module.min.js';
 import { clipsForAsset, clipsMatching, coversBones, hasNamedBody, matchRig, nameSeries, packRigCandidates, searchedSkeleton, stackedCharacter, storedBindFits } from '/static/rigmatch.js';
+import { trimmedDuration } from '/static/cliptrim.js';
 import { GLTFLoader } from '/static/vendor/three/jsm/loaders/GLTFLoader.js';
 import { FBXLoader } from '/static/vendor/three/jsm/loaders/FBXLoader.js';
 
@@ -30,6 +31,16 @@ loadingManager.setURLModifier((url) => {
   if (url.startsWith('blob:')) URL.revokeObjectURL(url);
   return BLANK_PIXEL;
 });
+// Whether the blanking manager governs glTF too. In the worker it must: a scroll
+// touches thousands of models and every texture behind one would stay resident for the
+// life of the page. In the lightbox it must not — the user is looking at one model and
+// its maps are what it looks like, and this module is shared, so left module-wide the
+// comment above describes the worker while the code also silently strips every glTF
+// texture in the preview. FBX is unaffected either way: loadModel replaces its
+// materials with CLAY, so its textures are never drawn wherever it is loaded.
+const inWorker = typeof WorkerGlobalScope !== 'undefined';
+const gltfManager = inWorker ? loadingManager : new THREE.LoadingManager();
+
 const CLAY = new THREE.MeshStandardMaterial({ color: 0xc7ccd6, roughness: 0.72, metalness: 0.0 });
 
 // normalizeClip rebases a clip to its first real keyframe. Synty source FBX keep each
@@ -53,38 +64,19 @@ function normalizeClip(clip) {
   return trimStaticTail(clip);
 }
 
-// trimStaticTail shortens a clip that ends by holding a pose — some libraries pad every
-// animation to a fixed slot length (e.g. Quaternius Turn90 finishes at ~1.1s then holds
-// the final pose to 2.0s). It finds the last keyframe any track actually changes and, when
-// the dead tail exceeds ~0.3s, sets the clip duration there so playback and looping stop
-// on the real end. Records the original on userData.trimmedFrom so the UI can show it.
+// trimStaticTail shortens a clip that ends by holding a pose, so playback and looping
+// stop on the real end. Where that is lives in cliptrim.js, which takes plain keyframe
+// arrays and is covered by the Node tests; this is the mutation, and the record of the
+// original on userData.trimmedFrom that the UI reads to say the clip was cut.
 function trimStaticTail(clip) {
-  let lastMotion = 0;
-  for (const tr of clip.tracks) {
-    const vs = tr.getValueSize();
-    const v = tr.values, times = tr.times, n = times.length;
-    if (n < 2) continue;
-    // Per-keyframe change, and the track's peak change. A frame counts as motion only if
-    // it exceeds 5% of the track's own peak, so imperceptible end-of-clip jitter on one
-    // bone doesn't keep the whole clip from trimming.
-    let peak = 0;
-    const chg = new Array(n).fill(0);
-    for (let i = 1; i < n; i++) {
-      let d = 0;
-      for (let k = 0; k < vs; k++) d += Math.abs(v[i * vs + k] - v[(i - 1) * vs + k]);
-      chg[i] = d;
-      if (d > peak) peak = d;
-    }
-    if (peak < 1e-3) continue; // this track never really moves
-    const thresh = peak * 0.05;
-    for (let i = n - 1; i > 0; i--) {
-      if (chg[i] > thresh) { if (times[i] > lastMotion) lastMotion = times[i]; break; }
-    }
-  }
-  if (lastMotion > 0 && clip.duration - lastMotion > 0.3) {
+  const cut = trimmedDuration(
+    clip.tracks.map((tr) => ({ times: tr.times, values: tr.values, valueSize: tr.getValueSize() })),
+    clip.duration,
+  );
+  if (cut > 0) {
     clip.userData = clip.userData || {};
     clip.userData.trimmedFrom = clip.duration;
-    clip.duration = lastMotion;
+    clip.duration = cut;
   }
   return clip;
 }
@@ -93,7 +85,7 @@ function trimStaticTail(clip) {
 // root.animations (GLTFLoader keeps clips on gltf.animations, not the scene).
 async function loadModel(url, ext) {
   if (ext === 'glb' || ext === 'gltf') {
-    const gltf = await new GLTFLoader(loadingManager).loadAsync(url);
+    const gltf = await new GLTFLoader(gltfManager).loadAsync(url);
     const root = gltf.scene;
     root.animations = (gltf.animations || []).map(normalizeClip);
     return root;
@@ -493,17 +485,37 @@ function syntyNeutral() {
       const r = await fetch('/api/assets?limit=8&group=0&q=' + encodeURIComponent('A_TPose_Neut'));
       const items = (await r.json()).items || [];
       const it = items.find((x) => x.name === 'A_TPose_Neut.fbx') || items[0];
-      if (!it) return null;
+      // Memoized either way, including the failure — one fetch decides retargeting for
+      // the life of the page. So the one place it can go wrong says so: without the
+      // neutral, retargetedFor hands back raw local rotations on a foreign rig, which is
+      // the shredded pose this whole path exists to prevent, in the lightbox and in every
+      // grid thumbnail, with nothing anywhere reporting it.
+      if (!it) {
+        console.warn('synty retargeting is off: no A_TPose_Neut.fbx in this library; clips from Synty packs will pose on their raw rotations');
+        return null;
+      }
       const o = await loadModel(contentURL(it.id), it.ext);
       const clip = (o.animations || [])[0];
       if (clip) { const m = new THREE.AnimationMixer(o); m.clipAction(clip).play(); m.setTime((clip.duration || 0) * 0.5); }
       const map = new Map();
       o.traverse((n) => { if (n.isBone) map.set(n.name, n.quaternion.clone()); });
       dispose(o);
+      if (!map.size) console.warn('synty retargeting is off: A_TPose_Neut.fbx carries no bones');
       return map.size ? map : null;
-    } catch { return null; }
+    } catch (e) { console.warn('synty retargeting is off: the neutral pose could not be loaded', e); return null; }
   })();
   return syntyNeutralPromise;
+}
+
+// rebuiltClip is a clip with new tracks and everything else about the original kept.
+// A bare AnimationClip constructor drops userData, and trimStaticTail records how much
+// held pose it cut there — so a clip that was trimmed and then retargeted or stripped
+// arrives at the viewer claiming it was not, and the marker that says so never appears
+// for exactly the clips it was written for.
+function rebuiltClip(clip, tracks) {
+  const out = new THREE.AnimationClip(clip.name, clip.duration, tracks);
+  out.userData = clip.userData;
+  return out;
 }
 
 // retargetClip rebuilds clip's rotation tracks onto rig's rest pose through the neutral.
@@ -537,7 +549,7 @@ function retargetClip(clip, neutral, rig) {
     tracks.push(new THREE.QuaternionKeyframeTrack(tr.name, tr.times, vv));
     rotated++;
   }
-  return rotated ? new THREE.AnimationClip(clip.name, clip.duration, tracks) : clip;
+  return rotated ? rebuiltClip(clip, tracks) : clip;
 }
 
 // isSynty tests the vendor facet, which is the first path segment of the user's own
@@ -574,7 +586,7 @@ function stripRootMotion(clip, rootName, upAxis) {
     changed = true;
     return new THREE.VectorKeyframeTrack(tr.name, tr.times, v);
   });
-  return changed ? new THREE.AnimationClip(clip.name, clip.duration, tracks) : clip;
+  return changed ? rebuiltClip(clip, tracks) : clip;
 }
 
 // dispose releases what an object owns. CLAY is deliberately exempt: it is one

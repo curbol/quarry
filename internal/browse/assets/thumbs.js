@@ -118,6 +118,10 @@ class ModelThumbnails {
     // cache: a settled answer is worth remembering, but not for every asset in a
     // 150k-item library at once.
     this.noRender = new Set();
+    // Holders showing the category icon because nothing was drawn for them. They are
+    // no longer observed — that is the point of settling — so clearing noRender alone
+    // would never reach them again. See reseed.
+    this.settled = new Set();
     this.seq = 0;
     this.watch();
     this.dead = false;
@@ -141,7 +145,22 @@ class ModelThumbnails {
   reseed() {
     if (this.dead) return;
     this.noRender.clear();
+    // Forgetting the answer is not enough to ask the question again. Both places that
+    // settle "nothing to draw" stop observing the holder, so the cards this exists for
+    // — the ones on screen when the user picked the body — would keep their category
+    // icon with nothing left watching to notice. Re-observing an already-visible node
+    // queues a fresh initial observation, so those re-request immediately.
+    for (const holder of this.settled) {
+      if (holder.isConnected) this.vis.observe(holder);
+    }
+    this.settled.clear();
     this.worker.postMessage({ type: 'seed', list: CharRegistry.list() });
+  }
+  // settle stops watching a holder there is nothing to draw for, remembering it so
+  // reseed can put it back when the answer might have changed.
+  settle(holder) {
+    this.settled.add(holder);
+    this.vis.unobserve(holder);
   }
   // Unlike the one-shot lazyWork observer, this one keeps watching: a card that
   // scrolls away before its turn in the worker's serial queue has its render cancelled,
@@ -182,6 +201,10 @@ class ModelThumbnails {
     if (this.dead) return;
     for (const id of this.pending.keys()) this.worker.postMessage({ type: 'cancel', id });
     this.pending.clear();
+    // watch() builds a fresh observer, so nothing here is observed any more and these
+    // nodes are about to be dropped: holding them would be the leak this method exists
+    // to avoid, one detached batch per filter change.
+    this.settled.clear();
     this.watch();
   }
   // forget lets go of one card the grid is dropping: the render queued for it is
@@ -189,6 +212,7 @@ class ModelThumbnails {
   // observer releases the node, which it would otherwise hold indefinitely.
   forget(holder) {
     this.cancel(holder);
+    this.settled.delete(holder);
     if (this.vis) this.vis.unobserve(holder);
   }
   cancel(holder) {
@@ -213,7 +237,7 @@ class ModelThumbnails {
     // in this vendor fits.
     if (this.noRender.has(asset.id)) {
       holder.classList.remove('loading');
-      this.vis.unobserve(holder);
+      this.settle(holder);
       return;
     }
     const cached = this.cache.get(asset.id);
@@ -285,7 +309,7 @@ class ModelThumbnails {
         holder.classList.remove('loading'); // no render (failed / mesh-less with no rig)
         // Settled: there is nothing to draw for this asset, so stop watching rather than
         // re-asking the worker every time the card scrolls back into view.
-        this.vis.unobserve(holder);
+        this.settle(holder);
       }
     }
   }

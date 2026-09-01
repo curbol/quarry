@@ -10,10 +10,10 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import {
-  contentURL, thumbURL, loadModel, loadSidekick, normalizeClip, clipBones, clipsForAsset,
-  loadRMClips, isSynty, coversBones, resolveRig, posedBox, frameBox, isRenderable, captureRootRest,
-  uprightRig, prepareClipRig, poseAt, retargetedFor, stripRootMotion, dispose, CharRegistry,
-  rigEntry, rigCandidates, rootBoneName, oneCharacter, alignBindToRest, hideAlternates, CLAY, _posedV,
+  contentURL, thumbURL, loadModel, loadSidekick, clipBones, clipsForAsset,
+  loadRMClips, isSynty, coversBones, resolveRig, frameBox, isRenderable, captureRootRest,
+  prepareClipRig, retargetedFor, stripRootMotion, dispose, CharRegistry,
+  rigEntry, rigCandidates, rootBoneName, oneCharacter, alignBindToRest, hideAlternates, _posedV,
 } from '/static/scene.js';
 import { iconEl } from '/static/icons.js';
 import { modelThumbs } from '/static/thumbs.js';
@@ -48,7 +48,22 @@ function acquireRenderer() {
 
 export function startViewer(container, asset, panels) {
   const w = container.clientWidth || 600, h = container.clientHeight || 500;
-  const renderer = acquireRenderer();
+  // A WebGLRenderer throws when it cannot get a context, and the two ways that happens
+  // are ordinary: the GPU process is still coming back from the reset that lost the
+  // shared one, or the browser blocklists WebGL entirely. Unguarded the throw escapes
+  // openLightbox before it ever unhides the lightbox, so clicking a 3D card does
+  // nothing at all — no preview, no message — for the rest of the session.
+  let renderer;
+  try {
+    renderer = acquireRenderer();
+  } catch (e) {
+    console.error('3D preview unavailable', e);
+    const box = document.createElement('div');
+    box.className = 'lb-placeholder';
+    box.textContent = '3D preview unavailable (no WebGL context). Reload the page to try again.';
+    container.appendChild(box);
+    return { stop() {} };
+  }
   renderer.setSize(w, h);
   renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
   container.appendChild(renderer.domElement);
@@ -110,7 +125,7 @@ export function startViewer(container, asset, panels) {
   const clock = new THREE.Clock();
   let raf = 0, obj = null, stopped = false;
   let mixer = null, action = null, clips = [], soloClips = null, soloRootRest = null, clipDur = 0, playing = true, ctrls = null, curTrimmedFrom = 0;
-  let rawClips = [], playRootName = null, playUpAxis = null, motionOn = false, curClip = 0;
+  let rawClips = [], playUpAxis = null, motionOn = false, curClip = 0;
   let playInPlace = [], playMotion = []; // the two clip sets the root-motion toggle swaps between
 
   // View controls overlaid on the canvas: three view modes (isometric default / flat
@@ -136,7 +151,7 @@ export function startViewer(container, asset, panels) {
   viewBtns.iso = mkBtn('', ISO_ICON, 'Isometric view', () => setViewMode('iso'));
   viewBtns.flat = mkBtn('', FLAT_ICON, 'Flat (eye-level) view', () => setViewMode('flat'));
   viewBtns.free = mkBtn('', FREE_ICON, 'Free rotation', () => setViewMode('free'));
-  const moveBtn = mkBtn('lb-move', MOVE_ICON, '', () => {
+  const moveBtn = mkBtn('lb-move', MOVE_ICON, 'Playing in place — click to show root motion', () => {
     motionOn = !motionOn;
     moveBtn.classList.toggle('on', motionOn);
     moveBtn.title = motionOn ? 'Showing root motion — click to play in place' : 'Playing in place — click to show root motion';
@@ -207,6 +222,23 @@ export function startViewer(container, asset, panels) {
     if (ctrls) ctrls.setClip(curClip);
   };
 
+  // offerRootMotion swaps in the travel sibling once it has arrived behind the first
+  // frame. Until then the toggle offers the algorithmically stripped clips — the same
+  // fallback an animation with no sibling gets — so nothing is ever dead, and with the
+  // real sibling in hand the in-place side becomes the native clips, which need no
+  // stripping. Only a change the viewer is currently showing restarts playback: the
+  // point of loading this in the background is not to interrupt what the user is
+  // already watching.
+  const offerRootMotion = (rmCs) => {
+    playInPlace = rawClips;
+    playMotion = rmCs;
+    moveBtn.hidden = false;
+    clips = motionOn ? playMotion : playInPlace;
+    if (!motionOn) return;
+    if (ctrls) ctrls.setClips(clips);
+    playClip(curClip);
+  };
+
   const buildPlayback = (mixerRoot, cs, charInfo, rootRest, rmCs) => {
     const rootName = rootBoneName(mixerRoot);
     mixerRoot.traverse((o) => { if (o.isMesh) o.castShadow = true; });
@@ -215,7 +247,7 @@ export function startViewer(container, asset, panels) {
     // lockstep. It records the up axis (for in-place stripping); then the clip plays inside
     // the fixed frame. scale, centering and the ground stay fixed no matter what the clip does.
     const refBox = prepareClipRig(mixerRoot, rootRest);
-    rawClips = cs; playRootName = rootName; playUpAxis = mixerRoot.userData.upAxis;
+    rawClips = cs; playUpAxis = mixerRoot.userData.upAxis;
     const rmClips = rmCs || [];
     // With a paired RM sibling, in-place is the native (non-RM) clips and the travel view is
     // the RM clips — both play on this same skeleton. Without one, fall back to stripping a
@@ -242,11 +274,25 @@ export function startViewer(container, asset, panels) {
   // Load a chosen character and play the pending clip-only clips on it. Resolves
   // true on success, false if the character couldn't load — so callers can fall
   // back to another rig or the picker instead of leaving an empty viewer.
+  // Why the last useCharacter said no. It cannot say so in its return value: resolveRig
+  // also uses it as a plain "did this candidate work" predicate over a list of them.
+  let charFailure = '';
   const useCharacter = (item) => {
     const mine = ++charSeq;
     const superseded = () => stopped || mine !== charSeq;
     return loadModel(contentURL(item.id), item.ext).then(async (char) => {
       if (superseded()) { dispose(char); return true; }
+      // The search that offers these accepts animations as well as models, because a
+      // body shipped inside an animation pack is classified as one — but that also puts
+      // a pack's hundreds of mesh-less clips in the list. Posing onto one gives an empty
+      // box with a working scrub bar, and returning true would report it as a success,
+      // so the user gets no error and no chance to pick again. The thumbnail worker
+      // makes the same check before it caches a rig.
+      if (!isRenderable(char)) {
+        dispose(char);
+        charFailure = 'That file has no mesh to play on — it is an animation, not a body. Pick another.';
+        return false;
+      }
       alignBindToRest(oneCharacter(char));
       const entry = rigEntry(item, char);
       if (entry && CharRegistry.add(entry)) modelThumbs.reseed();
@@ -262,7 +308,11 @@ export function startViewer(container, asset, panels) {
       mixer = null; action = null;
       buildPlayback(char, clips, { id: item.id, name: item.name }, isSynty(asset.vendor) ? null : soloRootRest, rmCs);
       return true;
-    }).catch(() => false);
+    }).catch((e) => {
+      console.error('character load failed', item && item.id, item && item.name, e);
+      charFailure = 'That model could not be loaded. Try another.';
+      return false;
+    });
   };
 
   // ---- character sidebar panel ----
@@ -270,9 +320,10 @@ export function startViewer(container, asset, panels) {
   const SAVE_SVG = '<svg viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3h12v18l-6-4-6 4z"/></svg>';
 
   const useAndFallback = async (item, forBones) => {
+    charFailure = '';
     const ok = await useCharacter(item);
     if (stopped) return;
-    if (!ok) showCharacterChooser(forBones, 'That model could not be loaded. Try another.');
+    if (!ok) showCharacterChooser(forBones, charFailure || 'That model could not be loaded. Try another.');
   };
 
   // characterSearch is a single autocomplete combobox: a text input whose dropdown of
@@ -440,9 +491,16 @@ export function startViewer(container, asset, panels) {
       // buildPlayback corrects orientation and frames from the reference box; do the same
       // for a static (clip-less) renderable so a Z-up model still stands upright and framed.
       if (cs.length) {
-        const rmCs = await loadRMClips(asset); // travel sibling, if this animation ships one
-        if (stopped) return;
-        buildPlayback(root, cs, null, null, rmCs);
+        // Built from the in-place clips first, then the travel sibling is fetched behind
+        // it. Awaited here instead, a second whole model download and parse sits between
+        // scene.add and the orientation-and-framing buildPlayback does — so the rAF loop
+        // spends it rendering an un-uprighted model through a camera still at the origin,
+        // for bytes the default toggle position does not need.
+        buildPlayback(root, cs, null, null, null);
+        loadRMClips(asset).then((rmCs) => {
+          if (stopped || !rmCs || !rmCs.length) return;
+          offerRootMotion(rmCs);
+        });
       } else frameBox(prepareClipRig(root, null), camera, controls);
       return;
     }

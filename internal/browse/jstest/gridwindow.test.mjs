@@ -83,6 +83,38 @@ test('the live range stays bounded however far the list runs', () => {
   }
 });
 
+// visibleRange decides what "the user is looking at" means, and the scroll harness
+// above computes its holes counter from it. Tested only through that, a version that
+// under-reported the viewport would report zero holes for the wrong reason and every
+// assertion here would still pass while the real grid showed blank rows.
+test('visibleRange covers every row the viewport touches, end-exclusive', () => {
+  const at = (scrollTop, total = BIG) =>
+    visibleRange({ scrollTop, viewportH: VIEWPORT_H, rowH: ROW_H, cols: COLS, total });
+
+  // Flush at the top: 900px of viewport over 216px rows spans 0..900, touching rows
+  // 0..4 (row 4 starts at 864). Five rows, end-exclusive.
+  assert.deepEqual(at(0), { start: 0, end: 5 * COLS });
+
+  // Scrolled 200px, still inside row 0: the viewport now spans 200..1100 and reaches
+  // into row 5 (1080..1296). The partly visible row at each end has to be inside the
+  // range, or its cards are the hole.
+  assert.deepEqual(at(200), { start: 0, end: 6 * COLS });
+
+  // Scrolled past whole rows: 2268 is halfway through row 10, and 2268..3168 ends
+  // inside row 14.
+  assert.deepEqual(at(2268), { start: 10 * COLS, end: 15 * COLS });
+
+  // Both ends clamp to total rather than running past the end of the list.
+  assert.deepEqual(at(0, 3), { start: 0, end: 3 });
+  assert.deepEqual(at(ROW_H * 100, 30), { start: 30, end: 30 });
+
+  // A viewport shorter than one row still covers the row it is inside.
+  assert.deepEqual(
+    visibleRange({ scrollTop: 0, viewportH: 10, rowH: ROW_H, cols: COLS, total: BIG }),
+    { start: 0, end: COLS },
+  );
+});
+
 test('spacers account for exactly the rows that are not live', () => {
   const total = 10000;
   const live = wantedRange({ scrollTop: 300 * ROW_H, rowH: ROW_H, cols: COLS, total, size: LIVE });
@@ -90,6 +122,18 @@ test('spacers account for exactly the rows that are not live', () => {
   const liveRows = Math.ceil((live.end - live.start) / COLS);
   assert.equal(rows.before + liveRows + rows.after, Math.ceil(total / COLS),
     'the spacers and the live rows must add up to the whole list, or the scrollbar lies');
+
+  // A partial last row is where the ceil matters: 10003 items is 1667 rows of six with
+  // one row holding a single card, and a floor here would leave the scrollbar a row short.
+  const ragged = 10003;
+  const tail = spacerRows({ start: 600, end: 900, total: ragged, cols: COLS });
+  assert.equal(tail.before + Math.ceil((900 - 600) / COLS) + tail.after, Math.ceil(ragged / COLS));
+
+  // Nothing live, and a live range covering everything, are both exact.
+  assert.deepEqual(spacerRows({ start: 0, end: 0, total: ragged, cols: COLS }),
+    { before: 0, after: Math.ceil(ragged / COLS) });
+  assert.deepEqual(spacerRows({ start: 0, end: ragged, total: ragged, cols: COLS }),
+    { before: 0, after: 0 });
 });
 
 test('needsRebuild is driven by margin, not by movement', () => {

@@ -48,8 +48,21 @@ function sentinelNear() {
   return els.sentinel.getBoundingClientRect().top <= vh + 600;
 }
 
+// fetchPage loads the next page. While one is in flight it hands back that same
+// promise rather than a resolved one, so a caller that awaits it — navLightbox
+// stepping past the last loaded item — waits for the page instead of racing it and
+// finding the list unchanged. Without that, a second arrow press at the tail resolved
+// instantly, found nothing new, and was silently dropped.
+let inflight = null;
 async function fetchPage() {
-  if (state.loading || state.done) return;
+  if (state.done) return;
+  if (state.loading) return inflight;
+  const run = loadPage();
+  inflight = run.finally(() => { if (inflight === run) inflight = null; });
+  return inflight;
+}
+
+async function loadPage() {
   state.loading = true;
   // reset() clears the grid and releases the loading latch, so a page already in
   // flight would otherwise resume and append its now-stale items to the fresh grid
@@ -490,6 +503,12 @@ async function apiAssign(fingerprints, tag, on) {
   // Broadcast here rather than at each call site, so no caller can forget to and leave
   // a card on screen contradicting what was just written.
   applyTagChange(fingerprints, tag, on);
+  // Under a tag filter the edit changes which cards match, not just how they look, and
+  // the grid pages by offset into a set the server recomputes per request. Folding the
+  // edit in place leaves the client's offset pointing one past where it was: the card
+  // that shifted into that slot is never requested, and it is missing from the grid for
+  // the rest of the session. Re-running the query is what keeps the offsets honest.
+  if (tagFilter.selected.size) reset();
   return data.tags || [];
 }
 
@@ -1244,8 +1263,13 @@ async function renderLbRelated(a, gen) {
   let items;
   try {
     const qs = a.fingerprints.map((fp) => 'fingerprint=' + encodeURIComponent(fp)).join('&');
-    items = ((await (await fetch('/api/related?' + qs)).json()).items) || [];
-  } catch { return; }
+    // res.ok checked rather than trusting the body: an error response is JSON too, so
+    // .items is simply undefined and `|| []` turns a failure into "this asset has no
+    // companions" — the strip is absent either way, and nothing anywhere says which.
+    const res = await fetch('/api/related?' + qs);
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    items = (await res.json()).items || [];
+  } catch (e) { console.error('loading linked companions failed', e); return; }
   if (!items.length || lb.root.hidden || gen !== lbGen) return;
 
   const head = document.createElement('div');

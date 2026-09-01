@@ -87,6 +87,15 @@ test('coverage needs the clip to drive the rig and the rig to cover the clip', (
   // Just outside the rig side: 11 of 20 is 55%.
   assert.equal(coversBones([...bones(11), ...bones(9, 'y')], clip), 0);
 
+  // The clip side, pinned as tightly as the rig side above. Without a pair straddling
+  // it the threshold could move from 0.3 to 0.6 with every test here still passing,
+  // and the only symptom would be a clip posed onto a rig missing half its bones.
+  //
+  // 9 shared of a 15-bone rig is 60% of the rig and 45% of the 20-bone clip: in.
+  assert.equal(coversBones([...bones(9), ...bones(6, 'y')], clip), 9);
+  // 8 shared of a 13-bone rig is 61.5% of the rig and 40% of the clip: out.
+  assert.equal(coversBones([...bones(8), ...bones(5, 'y')], clip), 0);
+
   assert.equal(coversBones([], clip), 0);
   assert.equal(coversBones(clip, []), 0);
   assert.equal(coversBones(null, undefined), 0);

@@ -177,9 +177,12 @@ async function rigFor(clip, asset) {
   return resolveRig(clipBones(clip), asset, async (m) => {
     const cached = rigs.get(m.id);
     if (cached) return cached;
+    // A candidate that will not load is not a failure of this thumbnail — rig
+    // discovery tries up to fourteen of them — but a whole vendor failing to load is,
+    // and silently it looks identical to a vendor with no rig at all.
     const rig = await loadModel(contentURL(m.id), m.ext)
       .then((r) => (isRenderable(r) ? alignBindToRest(oneCharacter(r)) : (dispose(r), null)))
-      .catch(() => null);
+      .catch((e) => { console.warn('rig candidate failed to load', m.id, m.name, e); return null; });
     if (rig) {
       rigs.set(m.id, rig);
       evictRigs();
@@ -232,6 +235,14 @@ const jobs = new JobTracker();
 // for the rest of the session. Giving up draws the category icon instead.
 const JOB_TIMEOUT_MS = 30_000;
 
+// reportFailure names a thumbnail that will not appear. Without it the three cases a
+// user sees as one — this clip has no rig, this file is corrupt, the server answered
+// 500 — are all a category icon and an empty console, and the page then remembers the
+// answer, so a transport failure looks exactly like a settled one.
+function reportFailure(asset, e) {
+  console.error('thumbnail failed', asset && asset.id, asset && asset.name, e);
+}
+
 function withTimeout(promise, onExpire) {
   let timer;
   const deadline = new Promise((_, reject) => {
@@ -276,7 +287,7 @@ self.onmessage = (e) => {
     const ac = new AbortController();
     withTimeout(downscale(asset, ac.signal), () => ac.abort())
       .then((blob) => settle(blob))
-      .catch(() => settle(null));
+      .catch((e) => { reportFailure(asset, e); settle(null); });
     return;
   }
   queue = queue.then(async () => {
@@ -287,11 +298,20 @@ self.onmessage = (e) => {
       // would wedge this single queue and leave every card behind it spinning.
       const ok = await withTimeout((async () => {
         await ensureRenderer();
+        // Re-checked after every await, because a deadline only stops this job from
+        // being waited on — the work itself keeps running, and everything below it
+        // touches the one canvas, camera and rig cache the queue exists to give each
+        // job alone. An abandoned job that reaches snap() renders into the canvas the
+        // next one is about to encode, and its model is then cached under that card's
+        // id for the rest of the page.
+        if (!current()) return null;
         if (!(await build(asset))) return null;
+        if (!current()) return null;
         return canvas.convertToBlob({ type: 'image/png' });
       })());
       settle(ok || null);
-    } catch {
+    } catch (e) {
+      reportFailure(asset, e);
       settle(null);
     }
   });

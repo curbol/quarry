@@ -160,7 +160,7 @@ each package's doc comment restates its own share.
   embeds a machine-absolute path and a version-bearing archive name, so it is neither
   portable nor stable. *Violation:* any tag or link path that keys on `ID`; any change
   to how a fingerprint is derived, to an indexed field, or to what extraction writes
-  without bumping `assetindex.indexVersion` (`cache.go`, currently 21). *Check:* grep
+  without bumping `assetindex.indexVersion` (`cache.go`, currently 22). *Check:* grep
   `Fingerprint` and `\.ID` through `internal/tagstore/`, `browse/tags.go`,
   `browse/links.go`; confirm `indexVersion` is compared on cache load.
 - **The library is read-only.** The tag store is the only thing quarry may write inside

@@ -873,15 +873,28 @@ func TestNoMutatingRouteIsRegisteredOutsideWriteRoutes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// An allow-list rather than a search for non-GET literals. A pattern registered
+	// with no method prefix matches every method in Go's mux, and every read-only route
+	// here is spelled that way, so a mutating handler added in the same style was
+	// invisible to a regex keyed on "METHOD ".
+	readOnly := map[string]bool{
+		"/": true, "/static/": true, "/api/assets": true, "/api/content": true, "/api/thumb": true,
+	}
 	// Only literal registrations are visible here; the writeRoutes loop builds its
 	// pattern from variables and is the one form this must not flag.
-	reg := regexp.MustCompile(`mux\.Handle(?:Func)?\("([A-Z]+) `)
-	for _, m := range reg.FindAllStringSubmatch(string(src), -1) {
-		if m[1] != "GET" {
-			t.Errorf("server.go registers a %s route directly on the mux: every mutating endpoint "+
-				"must come from writeRoutes(), which is what the JSON-content-type and "+
-				"tagging-disabled guard tests iterate", m[1])
+	reg := regexp.MustCompile(`mux\.Handle(?:Func)?\("([^"]+)"`)
+	found := reg.FindAllStringSubmatch(string(src), -1)
+	if len(found) == 0 {
+		t.Fatal("no literal mux registrations matched; this guard has stopped reading server.go")
+	}
+	for _, m := range found {
+		pattern := m[1]
+		if strings.HasPrefix(pattern, "GET ") || readOnly[pattern] {
+			continue
 		}
+		t.Errorf("server.go registers %q directly on the mux. Every mutating endpoint must come "+
+			"from writeRoutes(), which is what the JSON-content-type and tagging-disabled guard "+
+			"tests iterate; a new read-only one belongs in this test's allow-list, deliberately", pattern)
 	}
 	// The list itself must not be empty, or the guards above pass vacuously.
 	s, err := newServer(&assetindex.Index{}, tagstore.New(), "x")
@@ -1113,5 +1126,41 @@ func TestTagCountsAreReachableInBothGroupingModes(t *testing.T) {
 	if p.Tags[0].Count == p.Tags[0].Assets {
 		t.Errorf("cards (%d) and rows (%d) are equal; this fixture is meant to separate them",
 			p.Tags[0].Count, p.Tags[0].Assets)
+	}
+}
+
+// An asset whose content could not be read has no fingerprint — a zip writer that
+// leaves the CRC field unset over non-empty bytes is enough — and both the grouped and
+// the ungrouped path build its card from a different function. Returning nil from
+// either made "fingerprints" and "tags" null on one path and [] on the other, a
+// difference in the public response shape that says nothing about the card and reaches
+// the page as a call on a null. No fixture here produces a blank fingerprint, because
+// archive/zip always writes a real CRC, so this asserts the shape directly.
+func TestCardsSerializeEmptySetsAsArraysOnBothPaths(t *testing.T) {
+	blank := assetindex.Asset{Name: "X.fbx", Size: 3}
+	if blank.Fingerprint != "" {
+		t.Fatal("this test needs an asset with no fingerprint")
+	}
+	empty := &server{store: tagstore.New()}
+	for _, c := range []struct {
+		name string
+		dto  assetDTO
+	}{
+		{"ungrouped", toDTO(blank)},
+		{"grouped", groupItems([]assetindex.Asset{blank}, []int32{0})[0]},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			d := c.dto
+			d.Tags = empty.unionTagsLocked(d.Fingerprints)
+			b, err := json.Marshal(d)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, want := range []string{`"fingerprints":[]`, `"tags":[]`} {
+				if !bytes.Contains(b, []byte(want)) {
+					t.Errorf("missing %s in %s", want, b)
+				}
+			}
+		})
 	}
 }

@@ -2042,3 +2042,45 @@ func TestASplitGLBStillSuppressesItsArchiveTwin(t *testing.T) {
 		})
 	}
 }
+
+// absCacheDir looks redundant next to checkCacheDir, which resolves both sides itself
+// and so refuses a relative cache dir inside the root either way. It is not: without it
+// ix.cacheDir stays relative, and stateDir, the extraction tree, the staging dir, the
+// cache file and the prune root are all derived from it — so containment is checked
+// against one path while every write goes to another, and the whole lot moves with the
+// working directory. Nothing else in the suite passes a relative cache dir.
+func TestStatePathsAreAbsoluteFromARelativeCacheDir(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a.fbx"), []byte("FBX"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Relative to the working directory, which the test binary owns; the point is the
+	// shape of the value, not where it lands.
+	rel := filepath.Join(t.TempDir(), "cache")
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rel, err = filepath.Rel(wd, rel)
+	if err != nil {
+		t.Skipf("cannot express %s relative to %s", rel, wd)
+	}
+	if filepath.IsAbs(rel) {
+		t.Fatalf("%s is not relative; this test needs a relative cache dir", rel)
+	}
+	ix, err := Build(Options{Root: root, CacheDir: rel})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []struct{ name, path string }{
+		{"stateDir", ix.stateDir()},
+		{"unpackedDir", ix.unpackedDir()},
+		{"stagingDir", ix.stagingDir()},
+		{"cachePath", ix.cachePath()},
+	} {
+		if !filepath.IsAbs(p.path) {
+			t.Errorf("%s = %q is relative: the index and every extraction would move with the "+
+				"working directory, and containment was checked against a different path", p.name, p.path)
+		}
+	}
+}

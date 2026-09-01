@@ -770,9 +770,11 @@ func TestInstallScriptComposesPublishedLabels(t *testing.T) {
 	// linux-apple), so this asserts that each one it *can* produce is either published
 	// or an impossible pairing, and that at least the real ones are covered.
 	real := map[string]bool{"mac-intel": true, "mac-apple": true, "linux-intel": true, "linux-arm64": true}
+	composable := map[string]bool{}
 	for _, o := range oses {
 		for _, a := range arches {
 			label := o[1] + "-" + a[1]
+			composable[label] = true
 			if !real[label] {
 				continue
 			}
@@ -782,8 +784,32 @@ func TestInstallScriptComposesPublishedLabels(t *testing.T) {
 		}
 	}
 	for label := range real {
+		// Both directions, or the script is only ever narrowing the set this checks and
+		// is never itself checked: renaming an arch here alone made every label it
+		// composes unreal, so the loop above skipped them all and this one still passed
+		// against releaseSuffix — while the next first install on that platform failed.
+		if !composable[label] {
+			t.Errorf("install.sh can no longer compose %s from its uname mapping, so a platform "+
+				"the release publishes has no installer path", label)
+		}
 		if !published[label+".zip"] {
 			t.Errorf("%s.zip is a platform install.sh supports but the release does not publish", label)
+		}
+	}
+	// The asset *name* is a contract too. release.yml composes it, install.sh composes
+	// it again, and platformAsset matches on "-"+suffix; changing the separator in one
+	// place breaks install and update with nothing failing until a release ships.
+	wf, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", "release.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []struct{ file, pattern, in string }{
+		{"release.yml", `quarry-\$\{VERSION\}-\$\{label\}\.zip`, string(wf)},
+		{"install.sh", `\$\{BINARY_NAME\}-\$\{VERSION\}-\$\{PLATFORM\}\.zip`, src},
+	} {
+		if !regexp.MustCompile(want.pattern).MatchString(want.in) {
+			t.Errorf("%s no longer composes the asset name as <name>-<version>-<label>.zip; "+
+				"platformAsset matches on \"-\"+suffix and would stop finding it", want.file)
 		}
 	}
 }

@@ -231,6 +231,34 @@ func TestPairingKeepsEachArchiveToItsOwnRootMotionSibling(t *testing.T) {
 	}
 }
 
+// The two archives above are separated by their internal layout, so the directory term
+// alone decides them and deleting the archive term leaves that test green. This is the
+// shape only the archive term can settle: one pack shipped as two archives rooted at
+// the same internal path, which is how Synty ships a Unity and an Unreal zip of one
+// pack. Both candidates score on the directory, so without the archive term the tie
+// falls to scan order, both cards take the first archive's RM, the second RM is never
+// suppressed and shows as a stray card, and its card's toggle fetches the wrong file.
+func TestPairingSeparatesTwoArchivesSharingOneInternalLayout(t *testing.T) {
+	const a, b = "/lib/synty/P/P_Unity_v1.zip", "/lib/synty/P/P_Unreal_v1.zip"
+	sibling, suppressed := buildRootMotionPairs([]assetindex.Asset{
+		zipAnim("a-walk", "synty", "P", a, "SourceFiles/Anim/Walk.fbx"),
+		zipAnim("a-walk-rm", "synty", "P", a, "SourceFiles/Anim/Walk_RM.fbx"),
+		zipAnim("b-walk", "synty", "P", b, "SourceFiles/Anim/Walk.fbx"),
+		zipAnim("b-walk-rm", "synty", "P", b, "SourceFiles/Anim/Walk_RM.fbx"),
+	})
+	if got := sibling["a-walk"]; got != "a-walk-rm" {
+		t.Errorf("a-walk -> %q, want its own archive's RM", got)
+	}
+	if got := sibling["b-walk"]; got != "b-walk-rm" {
+		t.Errorf("b-walk -> %q, want its own archive's RM", got)
+	}
+	for _, id := range []string{"a-walk-rm", "b-walk-rm"} {
+		if !suppressed[id] {
+			t.Errorf("%s is not suppressed, so it renders as its own card beside the pair it belongs to", id)
+		}
+	}
+}
+
 // A group holds whatever shares a base name in one pack, which need not be one kind:
 // "_RM" is also the conventional suffix for a roughness-metallic map. Testing the group
 // as a whole let one animation's presence hide a texture nothing will ever play.

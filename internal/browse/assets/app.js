@@ -326,6 +326,28 @@ function wireDropdown(owner, root) {
   dropdowns.push(owner);
 }
 
+// msOption is one checkbox row in a dropdown: the facet lists and the tag filter draw
+// the same thing, down to the class names the stylesheet keys on, and differ only in a
+// colour dot and where the count comes from. Built here so the two cannot drift apart.
+function msOption({ checked, label, count, countTitle = '', before = null, onToggle }) {
+  const row = document.createElement('label');
+  row.className = 'ms-opt';
+  const cb = document.createElement('input');
+  cb.type = 'checkbox';
+  cb.checked = checked;
+  cb.addEventListener('change', () => onToggle(cb.checked));
+  const text = document.createElement('span');
+  text.className = 'ms-opt-label';
+  text.textContent = label;
+  const n = document.createElement('span');
+  n.className = 'ms-opt-count';
+  n.textContent = count;
+  if (countTitle) n.title = countTitle;
+  row.append(cb, ...(before ? [before] : []), text, n);
+  return row;
+}
+
+
 class MultiSelect {
   constructor(root, allLabel, isVariant, onChange) {
     this.allLabel = allLabel;
@@ -347,24 +369,16 @@ class MultiSelect {
   setOptions(values) {
     this.pop.replaceChildren();
     for (const f of values) {
-      const row = document.createElement('label');
-      row.className = 'ms-opt';
-      const cb = document.createElement('input');
-      cb.type = 'checkbox';
-      cb.checked = this.selected.has(f.value);
-      cb.addEventListener('change', () => {
-        if (cb.checked) this.selected.add(f.value); else this.selected.delete(f.value);
-        this.renderButton();
-        this.onChange();
-      });
-      const text = document.createElement('span');
-      text.className = 'ms-opt-label';
-      text.textContent = this.display(f.value);
-      const count = document.createElement('span');
-      count.className = 'ms-opt-count';
-      count.textContent = f.count;
-      row.append(cb, text, count);
-      this.pop.appendChild(row);
+      this.pop.appendChild(msOption({
+        checked: this.selected.has(f.value),
+        label: this.display(f.value),
+        count: f.count,
+        onToggle: (on) => {
+          if (on) this.selected.add(f.value); else this.selected.delete(f.value);
+          this.renderButton();
+          this.onChange();
+        },
+      }));
     }
     this.renderButton();
   }
@@ -773,33 +787,26 @@ const tagFilter = {
     for (const id of ids) this.pop.appendChild(this.manage ? this.manageRow(id) : this.filterRow(id));
   },
   filterRow(id) {
-    const row = document.createElement('label');
-    row.className = 'ms-opt';
-    const cb = document.createElement('input');
-    cb.type = 'checkbox';
-    cb.checked = this.selected.has(id);
-    cb.addEventListener('change', () => {
-      if (cb.checked) this.selected.add(id); else this.selected.delete(id);
-      this.renderButton();
-      reset();
-    });
     const dot = document.createElement('span');
     dot.className = 'tag-dot';
     dot.dataset.tag = id;
     dot.style.background = tagColor(id);
-    const text = document.createElement('span');
-    text.className = 'ms-opt-label';
-    text.textContent = id;
-    const count = document.createElement('span');
-    count.className = 'ms-opt-count';
-    count.textContent = tagState.counts.get(id) || 0;
     // The store keeps assignments for content this library does not hold — a narrowed
     // --root, a disabled pack, another machine — and no filter can reach them. Saying
     // so here is what keeps a tag that is all off-index from reading as an empty one.
     const off = tagState.offIndex.get(id) || 0;
-    if (off) count.title = off + ' more on content outside this library';
-    row.append(cb, dot, text, count);
-    return row;
+    return msOption({
+      checked: this.selected.has(id),
+      label: id,
+      count: tagState.counts.get(id) || 0,
+      countTitle: off ? off + ' more on content outside this library' : '',
+      before: dot,
+      onToggle: (on) => {
+        if (on) this.selected.add(id); else this.selected.delete(id);
+        this.renderButton();
+        reset();
+      },
+    });
   },
   manageRow(id) {
     const row = document.createElement('div');
@@ -1131,7 +1138,17 @@ function openLightbox(a) {
   const fields = [['Vendor', vendors.join(', ') || '—'], ['Category', a.category], ['Format', a.ext || '—'], ['Size', humanSize(a.size)]];
   if (hasDims) fields.push(['Dimensions', `${a.width} × ${a.height}`]);
   else if (bitmap) fields.push(['Dimensions', '…']);
-  lb.fields.innerHTML = fields.map(([k, v]) => `<dt>${escapeHTML(k)}</dt><dd data-field="${escapeHTML(k)}">${escapeHTML(v)}</dd>`).join('');
+  // Built as nodes like every other renderer here. The values are library-derived —
+  // a vendor is a directory name — and this was the one place in the page where any of
+  // that reached markup, so an escaper had to be right rather than merely present.
+  lb.fields.replaceChildren(...fields.flatMap(([k, v]) => {
+    const dt = document.createElement('dt');
+    dt.textContent = k;
+    const dd = document.createElement('dd');
+    dd.dataset.field = k;
+    dd.textContent = v;
+    return [dt, dd];
+  }));
   // The index carries dimensions for images it could measure; probe the bytes only
   // as a fallback (a copy dropped from the index, or a format the scanner skipped).
   if (!hasDims && bitmap) {
@@ -1393,10 +1410,6 @@ function humanSize(n) {
   let i = 0, v = n;
   while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
   return (i === 0 ? v : v.toFixed(1)) + ' ' + u[i];
-}
-
-function escapeHTML(s) {
-  return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 }
 
 let debounce;

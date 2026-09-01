@@ -355,36 +355,56 @@ func TestFailedSaveLeavesNoTempFile(t *testing.T) {
 	}
 }
 
-// A store from New() has read nothing, so rewriting a file that already exists would
-// destroy it whole with no earlier state to have noticed the loss against. That is the
-// same total loss ErrStale guards a loaded store from, and it is refused the same way —
-// including when what is already there is a directory rather than a store.
+// A store from New() has read nothing, so it has no earlier state to compare a file
+// against and no business rewriting one whole. The whole rule in one place: refuse an
+// existing file, adopt one that is not there yet, and report a path that cannot be
+// written rather than reporting success.
 func TestSaveFromANeverLoadedStoreRefusesAnExistingPath(t *testing.T) {
 	dir := t.TempDir()
-	existing := filepath.Join(dir, FileName)
-	if err := os.WriteFile(existing, []byte("# someone else's store\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	s := New()
-	s.Assign("crc32:aa:1", "hero")
-	if err := s.Save(existing); !errors.Is(err, ErrStale) {
-		t.Fatalf("Save = %v, want ErrStale: a store that read nothing rewrote a file it never saw", err)
-	}
-	b, err := os.ReadFile(existing)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(b) != "# someone else's store\n" {
-		t.Errorf("the file was rewritten: %q", b)
-	}
 
-	blocked := filepath.Join(dir, "sub", FileName)
-	if err := os.MkdirAll(blocked, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.Save(blocked); err == nil {
-		t.Error("Save reported success onto a directory")
-	}
+	t.Run("an existing file is refused and left alone", func(t *testing.T) {
+		existing := filepath.Join(dir, FileName)
+		original := "# someone else's store\n"
+		if err := os.WriteFile(existing, []byte(original), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		s := New()
+		s.Assign("crc32:aa:1", "hero")
+		if err := s.Save(existing); !errors.Is(err, ErrStale) {
+			t.Fatalf("Save = %v, want ErrStale: a store that read nothing rewrote a file it never saw", err)
+		}
+		b, err := os.ReadFile(existing)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(b) != original {
+			t.Errorf("the file was rewritten: %q", b)
+		}
+	})
+
+	// Saving to a path that is not there yet is the ordinary first save, and the store
+	// adopts it: this is how a user-wide store comes into existence.
+	t.Run("a path that does not exist is adopted", func(t *testing.T) {
+		fresh := filepath.Join(dir, "new.toml")
+		s := New()
+		s.Assign("crc32:1:1", "hero")
+		if err := s.Save(fresh); err != nil {
+			t.Fatalf("first save to a path that does not exist: %v", err)
+		}
+		if err := s.Save(fresh); err != nil {
+			t.Fatalf("second save to the file it just wrote: %v", err)
+		}
+	})
+
+	t.Run("a directory in the way is an error, not a success", func(t *testing.T) {
+		blocked := filepath.Join(dir, "sub", FileName)
+		if err := os.MkdirAll(blocked, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := New().Save(blocked); err == nil {
+			t.Error("Save reported success onto a directory")
+		}
+	})
 }
 
 // Reload is the recovery every failed write goes through, so its own failure has to
@@ -400,22 +420,29 @@ func TestFailedReloadLeavesTheStoreUntouched(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// A key this version does not know is one of the things Load refuses outright.
-	if err := os.WriteFile(p, []byte("unknown_key = true\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.Reload(p); err == nil {
-		t.Fatal("Reload accepted a file Load refuses")
-	}
-
-	if _, ok := s.color("hero"); !ok {
-		t.Error("the palette lost a tag to a reload that failed")
-	}
-	if got := s.TagsFor("crc32:aa:1"); len(got) != 1 || got[0] != "hero" {
-		t.Errorf("TagsFor = %v, want the assignment untouched by a reload that failed", got)
-	}
-	if got := s.Related("crc32:aa:1"); len(got) != 1 || got[0] != "crc32:bb:2" {
-		t.Errorf("Related = %v, want the link untouched by a reload that failed", got)
+	// Both ways Load can refuse a file, since Reload is Load applied in place and each
+	// one has to leave the store whole.
+	for _, bad := range []struct{ name, body string }{
+		{"a key this version does not know", "unknown_key = true\n"},
+		{"a file that is not TOML at all", "this is not toml ["},
+	} {
+		t.Run(bad.name, func(t *testing.T) {
+			if err := os.WriteFile(p, []byte(bad.body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Reload(p); err == nil {
+				t.Fatal("Reload accepted a file Load refuses")
+			}
+			if _, ok := s.color("hero"); !ok {
+				t.Error("the palette lost a tag to a reload that failed")
+			}
+			if got := s.TagsFor("crc32:aa:1"); len(got) != 1 || got[0] != "hero" {
+				t.Errorf("TagsFor = %v, want the assignment untouched by a reload that failed", got)
+			}
+			if got := s.Related("crc32:aa:1"); len(got) != 1 || got[0] != "crc32:bb:2" {
+				t.Errorf("Related = %v, want the link untouched by a reload that failed", got)
+			}
+		})
 	}
 }
 
@@ -646,27 +673,6 @@ func TestSaveRefusesToClobberAnEditMadeSinceLoad(t *testing.T) {
 		t.Errorf("Save after Reload: %v, want it to succeed now that the store matches disk", err)
 	}
 }
-
-// Saving to a path this store was not loaded from is a fresh write, not a rewrite of
-// something that could have changed underneath — exporting a store must not be
-// mistaken for clobbering one.
-func TestSaveToADifferentPathIsNotStale(t *testing.T) {
-	dir := t.TempDir()
-	p := filepath.Join(dir, FileName)
-	s := New()
-	s.Define("hero", "#112233")
-	if err := s.Save(p); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.Save(filepath.Join(dir, "copy-"+FileName)); err != nil {
-		t.Errorf("Save to a second path: %v", err)
-	}
-}
-
-// Rename must say when there is nothing to rename, whatever the new name is.
-// Reporting success let a caller that follows a rename with a color edit define the
-// new id from nothing, answering "renamed" while inventing a tag no asset carries —
-// and short-circuiting the identity case first hid the miss for `Rename(x, x)`.
 func TestRenameReportsAMissingTag(t *testing.T) {
 	for _, tc := range []struct {
 		name, old, neu string
@@ -882,43 +888,6 @@ func TestSaveElsewhereDoesNotMoveTheGuardedFile(t *testing.T) {
 	}
 }
 
-// A store from New() has read nothing, so it has no earlier state to compare a file
-// against and no business rewriting one whole. Saving to a path that is not there yet
-// is the ordinary first save and has to keep working.
-func TestNewStoreWillNotOverwriteAnExistingFile(t *testing.T) {
-	dir := t.TempDir()
-	occupied := filepath.Join(dir, FileName)
-	original := "[[tag]]\n  id = \"hero\"\n  color = \"#e11d48\"\n"
-	if err := os.WriteFile(occupied, []byte(original), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := New().Save(occupied); !errors.Is(err, ErrStale) {
-		t.Fatalf("New().Save over an existing store = %v, want ErrStale", err)
-	}
-	b, err := os.ReadFile(occupied)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(b) != original {
-		t.Errorf("the existing store was rewritten: %s", b)
-	}
-
-	fresh := filepath.Join(dir, "new.toml")
-	s := New()
-	s.Assign("crc32:1:1", "hero")
-	if err := s.Save(fresh); err != nil {
-		t.Fatalf("first save to a path that does not exist: %v", err)
-	}
-	// Having adopted it, the same store keeps writing there.
-	if err := s.Save(fresh); err != nil {
-		t.Fatalf("second save to the file it just wrote: %v", err)
-	}
-}
-
-// Groups() is the only funnel between the shared-set representation and the file, so
-// the persistence half of unlinking lives there: a shrunk group has to come back
-// shrunk, and a dissolved one has to leave no row at all — a one-member [[group]]
-// would load as a fingerprint linked to nothing.
 func TestUnlinkSurvivesARoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), FileName)
 	s := New()
@@ -999,81 +968,6 @@ func TestSaveRefusesAFileThisStoreNeverRead(t *testing.T) {
 		t.Errorf("saving the file this store loaded = %v, want success", err)
 	}
 }
-
-// A failed save must not leave memory ahead of the file. The store is the caller's to
-// recover, and Reload is what it recovers with — so a Reload that itself fails has to
-// leave the store exactly as it was, which is the one state a caller can detect.
-func TestAFailedSaveLeavesTheStoreRecoverable(t *testing.T) {
-	dir := t.TempDir()
-	p := filepath.Join(dir, FileName)
-	s := New()
-	s.Define("hero", "#112233")
-	s.Assign("crc32:aaaa:1", "hero")
-	if err := s.Save(p); err != nil {
-		t.Fatal(err)
-	}
-
-	// Edited underneath, the way a checkout or a second quarry would.
-	if err := os.WriteFile(p, []byte("[[tag]]\n  id = \"villain\"\n  color = \"#00ff00\"\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	s.Assign("crc32:bbbb:2", "hero")
-	if err := s.Save(p); !errors.Is(err, ErrStale) {
-		t.Fatalf("Save over an outside edit = %v, want ErrStale", err)
-	}
-	// The outside edit survived, untouched.
-	b, err := os.ReadFile(p)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(b), "villain") {
-		t.Fatalf("the refused save destroyed the outside edit: %q", b)
-	}
-
-	// Recovery: memory takes what the file holds, dropping the edit that never landed.
-	if err := s.Reload(p); err != nil {
-		t.Fatal(err)
-	}
-	if len(s.TagsFor("crc32:bbbb:2")) != 0 {
-		t.Error("an assignment the file never received survived the reload")
-	}
-	if !s.has("villain") {
-		t.Error("the reload did not pick up the outside edit")
-	}
-	// And the recovered store can save again, against the file it now matches.
-	s.Assign("crc32:cccc:3", "villain")
-	if err := s.Save(p); err != nil {
-		t.Errorf("save after a successful reload = %v, want success", err)
-	}
-}
-
-// A Reload that fails leaves the store exactly as it was, so a caller can tell that
-// memory and disk have diverged rather than silently serving a half-cleared store.
-func TestAFailedReloadChangesNothing(t *testing.T) {
-	dir := t.TempDir()
-	p := filepath.Join(dir, FileName)
-	s := New()
-	s.Define("hero", "#112233")
-	s.Assign("crc32:aaaa:1", "hero")
-	if err := s.Save(p); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(p, []byte("this is not toml ["), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.Reload(p); err == nil {
-		t.Fatal("Reload over an unparseable file must fail")
-	}
-	if !s.has("hero") || len(s.TagsFor("crc32:aaaa:1")) != 1 {
-		t.Error("a failed reload emptied the store instead of leaving it alone")
-	}
-}
-
-// Overlapping [[group]] rows merge, which is the deliberate asymmetry with a duplicate
-// [[tag]] id: a save rewrites the file whole, so a last-row-wins tag id would destroy
-// the other definition, while overlapping groups lose nothing by becoming one. Only the
-// Link path covered the merge, so extending the duplicate-id refusal to groups — the
-// natural-looking symmetry — would have turned a hand-edited store into a load error.
 func TestOverlappingGroupRowsMergeOnLoad(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, FileName)

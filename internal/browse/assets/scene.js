@@ -412,11 +412,6 @@ function alignBindToRest(rig) {
   return rig;
 }
 
-// cloneRig deep-clones a skinned character (three's Object3D.clone shares the skeleton, so
-// posing one clone would move them all). Same algorithm as three's SkeletonUtils.clone: clone
-// the hierarchy, then rebind each SkinnedMesh to a cloned skeleton whose bones point at the
-// cloned nodes. Lets the thumbnails reuse one loaded body but pose each clip on a fresh
-// skeleton, matching the lightbox's fresh-load pipeline.
 // hideAlternates hides the versions a file stacks in one place, keeping the first of
 // each. A prop ships as a variant sheet — Synty's bow rig carries eight complete bows
 // at one origin — and borrowing that to play a clip draws all eight at once.
@@ -452,6 +447,11 @@ function centreDrift(a, b) {
   return a.getCenter(new THREE.Vector3()).distanceTo(b.getCenter(new THREE.Vector3())) / Math.max(span, 1e-3);
 }
 
+// cloneRig deep-clones a skinned character (three's Object3D.clone shares the skeleton, so
+// posing one clone would move them all). Same algorithm as three's SkeletonUtils.clone: clone
+// the hierarchy, then rebind each SkinnedMesh to a cloned skeleton whose bones point at the
+// cloned nodes. Lets the thumbnails reuse one loaded body but pose each clip on a fresh
+// skeleton, matching the lightbox's fresh-load pipeline.
 function cloneRig(source) {
   const srcLookup = new Map(), cloneLookup = new Map();
   const clone = source.clone();

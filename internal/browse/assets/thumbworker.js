@@ -256,12 +256,20 @@ const jobs = new JobTracker();
 // for the rest of the session. Giving up draws the category icon instead.
 const JOB_TIMEOUT_MS = 30_000;
 
-// reportFailure names a thumbnail that will not appear. Without it the three cases a
-// user sees as one — this clip has no rig, this file is corrupt, the server answered
-// 500 — are all a category icon and an empty console, and the page then remembers the
-// answer, so a transport failure looks exactly like a settled one.
+// reportFailure names a thumbnail that will not appear because something went wrong —
+// a corrupt file, a 500, a job past its deadline. Without it those are a category icon
+// and an empty console, and the page then remembers the answer, so a transport failure
+// looks exactly like a settled one.
 function reportFailure(asset, e) {
   console.error('thumbnail failed', asset && asset.id, asset && asset.name, e);
+}
+
+// reportNoRender names the other way a card keeps its icon: nothing to draw. It is not
+// a failure — a mesh-less clip with no matching body in the library is a settled answer
+// — but it is by far the most common of the two, and silently it is indistinguishable
+// from the ones above. info rather than error, because it is not a fault to fix.
+function reportNoRender(asset) {
+  console.info('nothing to draw for', asset && asset.id, asset && asset.name);
 }
 
 function withTimeout(promise, onExpire) {
@@ -333,7 +341,10 @@ self.onmessage = (e) => {
         // unguarded: an abandoned job reaching snap() renders into the canvas the next
         // one is about to encode, and its model is then cached under that card's id.
         if (!current()) return null;
-        if (!(await build(asset, current))) return null;
+        if (!(await build(asset, current))) {
+          if (current()) reportNoRender(asset);
+          return null;
+        }
         if (!current()) return null;
         return canvas.convertToBlob({ type: 'image/png' });
       })());

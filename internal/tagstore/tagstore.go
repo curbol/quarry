@@ -70,14 +70,14 @@ type TagDef struct {
 	Color string `toml:"color"`
 }
 
-// Assignment is the set of tag ids applied to one content fingerprint.
-type Assignment struct {
+// assignment is the set of tag ids applied to one content fingerprint.
+type assignment struct {
 	Fingerprint string   `toml:"fingerprint"`
 	Tags        []string `toml:"tags"`
 }
 
-// Group is one link group: a set of content fingerprints that travel together.
-type Group struct {
+// group is one link group: a set of content fingerprints that travel together.
+type group struct {
 	Fingerprints []string `toml:"fingerprints"`
 }
 
@@ -85,8 +85,8 @@ type Group struct {
 // then [[group]].
 type fileTOML struct {
 	Tags        []TagDef     `toml:"tag"`
-	Assignments []Assignment `toml:"assignment"`
-	Groups      []Group      `toml:"group"`
+	Assignments []assignment `toml:"assignment"`
+	Groups      []group      `toml:"group"`
 }
 
 // Store is an in-memory tag store. The palette (colors), assignments, and link
@@ -185,10 +185,10 @@ func (s *Store) ensure(id string) {
 }
 
 // Has reports whether a tag is defined.
-func (s *Store) Has(id string) bool { _, ok := s.colors[id]; return ok }
+func (s *Store) has(id string) bool { _, ok := s.colors[id]; return ok }
 
 // Color returns a tag's color and whether it is defined.
-func (s *Store) Color(id string) (string, bool) { c, ok := s.colors[id]; return c, ok }
+func (s *Store) color(id string) (string, bool) { c, ok := s.colors[id]; return c, ok }
 
 // Assign applies a tag to a fingerprint, defining the tag (default color) if new.
 func (s *Store) Assign(fp, id string) {
@@ -543,10 +543,10 @@ func (s *Store) Save(path string) error {
 	}
 	sort.Strings(fps)
 	for _, fp := range fps {
-		f.Assignments = append(f.Assignments, Assignment{Fingerprint: fp, Tags: sortedKeys(s.assign[fp])})
+		f.Assignments = append(f.Assignments, assignment{Fingerprint: fp, Tags: sortedKeys(s.assign[fp])})
 	}
 	for _, g := range s.Groups() {
-		f.Groups = append(f.Groups, Group{Fingerprints: g})
+		f.Groups = append(f.Groups, group{Fingerprints: g})
 	}
 
 	if err := safewrite.Atomic(path, ".quarry-tags-*", func(w io.Writer) error {

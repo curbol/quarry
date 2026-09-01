@@ -37,7 +37,7 @@ func TestDefineAssignRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c, _ := got.Color("hero"); c != "#e11d48" {
+	if c, _ := got.color("hero"); c != "#e11d48" {
 		t.Errorf("hero color = %q, want normalized #e11d48", c)
 	}
 	if !reflect.DeepEqual(got.TagsFor("crc32:abc:10"), []string{"hero", "wip"}) {
@@ -75,13 +75,13 @@ func TestRenameRewritesAssignments(t *testing.T) {
 	if err := s.Rename("wip", "in-progress"); err != nil {
 		t.Fatal(err)
 	}
-	if s.Has("wip") {
+	if s.has("wip") {
 		t.Error("old id still present after rename")
 	}
 	if !reflect.DeepEqual(s.TagsFor("fp1"), []string{"in-progress"}) || !reflect.DeepEqual(s.TagsFor("fp2"), []string{"in-progress"}) {
 		t.Errorf("rename did not rewrite assignments: fp1=%v fp2=%v", s.TagsFor("fp1"), s.TagsFor("fp2"))
 	}
-	if c, _ := s.Color("in-progress"); c != "#123456" {
+	if c, _ := s.color("in-progress"); c != "#123456" {
 		t.Errorf("renamed tag lost its color: %q", c)
 	}
 }
@@ -97,7 +97,7 @@ func TestRenameOntoExistingMerges(t *testing.T) {
 	if err := s.Rename("a", "b"); err != nil {
 		t.Fatal(err)
 	}
-	if s.Has("a") {
+	if s.has("a") {
 		t.Error("merged-away id still present")
 	}
 	// fp1 collapses a+b to a single b; fp2's a becomes b.
@@ -107,7 +107,7 @@ func TestRenameOntoExistingMerges(t *testing.T) {
 	if !reflect.DeepEqual(s.TagsFor("fp2"), []string{"b"}) {
 		t.Errorf("fp2 after merge = %v, want [b]", s.TagsFor("fp2"))
 	}
-	if c, _ := s.Color("b"); c != "#bbbbbb" {
+	if c, _ := s.color("b"); c != "#bbbbbb" {
 		t.Errorf("merge should keep target color, got %q", c)
 	}
 	if s.Counts()["b"] != 2 {
@@ -121,7 +121,7 @@ func TestDeletePurgesAssignments(t *testing.T) {
 	s.Assign("fp1", "stay")
 	s.Assign("fp2", "gone")
 	s.Delete("gone")
-	if s.Has("gone") {
+	if s.has("gone") {
 		t.Error("deleted tag still in palette")
 	}
 	if !reflect.DeepEqual(s.TagsFor("fp1"), []string{"stay"}) {
@@ -136,7 +136,7 @@ func TestUnassignKeepsPaletteEntry(t *testing.T) {
 	s := New()
 	s.Assign("fp1", "solo")
 	s.Unassign("fp1", "solo")
-	if !s.Has("solo") {
+	if !s.has("solo") {
 		t.Error("unassign should keep the tag in the palette")
 	}
 	if len(s.TagsFor("fp1")) != 0 {
@@ -408,7 +408,7 @@ func TestFailedReloadLeavesTheStoreUntouched(t *testing.T) {
 		t.Fatal("Reload accepted a file Load refuses")
 	}
 
-	if _, ok := s.Color("hero"); !ok {
+	if _, ok := s.color("hero"); !ok {
 		t.Error("the palette lost a tag to a reload that failed")
 	}
 	if got := s.TagsFor("crc32:aa:1"); len(got) != 1 || got[0] != "hero" {
@@ -463,7 +463,7 @@ func TestLoadGivesAnUndefinedTagItsDefaultColor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, ok := s.Color("hero")
+	got, ok := s.color("hero")
 	if !ok {
 		t.Fatal("hero is assigned but absent from the palette")
 	}
@@ -627,7 +627,7 @@ func TestSaveRefusesToClobberAnEditMadeSinceLoad(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := after.Color("villain"); !ok {
+	if _, ok := after.color("villain"); !ok {
 		t.Error("the other writer's tag is gone from the file")
 	}
 
@@ -639,7 +639,7 @@ func TestSaveRefusesToClobberAnEditMadeSinceLoad(t *testing.T) {
 	if got := mine.TagsFor("fp-a"); len(got) != 0 {
 		t.Errorf("TagsFor(fp-a) = %v after a reload, want the unsaved edit gone", got)
 	}
-	if _, ok := mine.Color("villain"); !ok {
+	if _, ok := mine.color("villain"); !ok {
 		t.Error("Reload did not pick up the other writer's tag")
 	}
 	if err := mine.Save(p); err != nil {
@@ -691,7 +691,7 @@ func TestRenameReportsAMissingTag(t *testing.T) {
 				t.Fatalf("Rename(%q, %q) = %v, wantErr %v", tc.old, tc.neu, err, tc.wantErr)
 			}
 			if tc.wantErr && tc.neu != "" {
-				if _, ok := s.Color(tc.neu); ok {
+				if _, ok := s.color(tc.neu); ok {
 					t.Errorf("%q was defined despite the source not existing", tc.neu)
 				}
 			}
@@ -1037,7 +1037,7 @@ func TestAFailedSaveLeavesTheStoreRecoverable(t *testing.T) {
 	if len(s.TagsFor("crc32:bbbb:2")) != 0 {
 		t.Error("an assignment the file never received survived the reload")
 	}
-	if !s.Has("villain") {
+	if !s.has("villain") {
 		t.Error("the reload did not pick up the outside edit")
 	}
 	// And the recovered store can save again, against the file it now matches.
@@ -1064,7 +1064,7 @@ func TestAFailedReloadChangesNothing(t *testing.T) {
 	if err := s.Reload(p); err == nil {
 		t.Fatal("Reload over an unparseable file must fail")
 	}
-	if !s.Has("hero") || len(s.TagsFor("crc32:aaaa:1")) != 1 {
+	if !s.has("hero") || len(s.TagsFor("crc32:aaaa:1")) != 1 {
 		t.Error("a failed reload emptied the store instead of leaving it alone")
 	}
 }

@@ -109,10 +109,11 @@ func TestFingerprintStableAndRefreshRecomputes(t *testing.T) {
 
 func mustScan(t *testing.T, root string) []Asset {
 	t.Helper()
-	assets, err := Scan(root)
+	ix, err := Build(Options{Root: root})
 	if err != nil {
 		t.Fatal(err)
 	}
+	assets := ix.Assets
 	return assets
 }
 

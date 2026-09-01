@@ -100,10 +100,13 @@ func TestScanSidekickCharacter(t *testing.T) {
 		{guid: "to1", pathname: "Assets/Synty/SidekickCharacters/Resources/Meshes/SK_TORS.fbx", asset: "TORSFBX", preview: true},
 	})
 
-	assets, err := Scan(root)
+	// Built with a cache dir because the part ids are resolved through this same index
+	// below, the way the frontend resolves them.
+	ix, err := Build(Options{Root: root, CacheDir: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}
+	assets := ix.Assets
 	var ch *Asset
 	for i := range assets {
 		if assets[i].Name == "Warrior_01" {
@@ -123,10 +126,6 @@ func TestScanSidekickCharacter(t *testing.T) {
 	// dropped. Resolved through the index rather than recomputed with id(): the
 	// frontend fetches /api/content per part, so what matters is that each id reaches
 	// an asset the index can serve, which calling id() on both sides cannot show.
-	ix, err := Build(Options{Root: root, CacheDir: t.TempDir()})
-	if err != nil {
-		t.Fatal(err)
-	}
 	var got []string
 	for _, pid := range ch.Source.Parts {
 		part, ok := ix.Lookup(pid)
@@ -184,10 +183,11 @@ func scanPackage(t *testing.T, entries []unityGUID) map[string]bool {
 	t.Helper()
 	root, mk := libRoot(t)
 	writeUnityPackage(t, mk("synty", "SIDEKICK", "SIDEKICK_Unity_2021_3_v1_0_0.unitypackage"), entries)
-	assets, err := Scan(root)
+	ix, err := Build(Options{Root: root})
 	if err != nil {
 		t.Fatal(err)
 	}
+	assets := ix.Assets
 	kept := map[string]bool{}
 	for _, a := range assets {
 		kept[a.Name] = true
@@ -359,10 +359,11 @@ func scanPackagePaths(t *testing.T, entries []unityGUID) map[string]bool {
 	t.Helper()
 	root, mk := libRoot(t)
 	writeUnityPackage(t, mk("synty", "SIDEKICK", "SIDEKICK_Unity_2021_3_v1_0_0.unitypackage"), entries)
-	assets, err := Scan(root)
+	ix, err := Build(Options{Root: root})
 	if err != nil {
 		t.Fatal(err)
 	}
+	assets := ix.Assets
 	kept := map[string]bool{}
 	for _, a := range assets {
 		kept[a.Source.Pathname] = true
@@ -410,10 +411,11 @@ func TestAnOversizeSidekickDefinitionIsRefusedNotTruncated(t *testing.T) {
 	root, mk := libRoot(t)
 	writeUnityPackage(t, mk("synty", "SIDEKICK", "SIDEKICK_Unity_2021_3_v1_0_0.unitypackage"),
 		[]unityGUID{head, torso, sk, prefab})
-	assets, err := Scan(root)
+	ix, err := Build(Options{Root: root})
 	if err != nil {
 		t.Fatal(err)
 	}
+	assets := ix.Assets
 	var character *Asset
 	kept := map[string]bool{}
 	for i := range assets {

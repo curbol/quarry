@@ -38,10 +38,11 @@ func TestGLBClipSplit(t *testing.T) {
 	writeGLB(t, mk("quaternius", "UAL", "UAL1_RM.glb"), "Walk", "Run")      // _RM sibling -> kept whole
 	writeGLB(t, mk("quaternius", "UAL", "Prop.glb"), "Spin")                // single anim -> kept whole
 
-	assets, err := Scan(root)
+	ix, err := Build(Options{Root: root})
 	if err != nil {
 		t.Fatal(err)
 	}
+	assets := ix.Assets
 	var clips, whole []Asset
 	for _, a := range assets {
 		if a.Source.Clip != "" {
@@ -207,10 +208,11 @@ func TestScanImageDimensions(t *testing.T) {
 		{guid: "bbb", pathname: "Assets/P/PackedFirst.png", asset: string(encodePNG(t, 8, 6)), assetFirst: true},
 	})
 
-	assets, err := Scan(root)
+	ix, err := Build(Options{Root: root})
 	if err != nil {
 		t.Fatal(err)
 	}
+	assets := ix.Assets
 	idx := byName(assets)
 
 	want := map[string][2]int{"Loose.png": {12, 5}, "Zipped.png": {7, 9}, "Packed.png": {3, 4}, "PackedFirst.png": {8, 6}}
@@ -261,10 +263,11 @@ func TestScanFixtureLibrary(t *testing.T) {
 	// dot-dir working files must be skipped entirely.
 	os.WriteFile(mk("synty", ".ref", "junk.png"), []byte("X"), 0o644)
 
-	assets, err := Scan(root)
+	ix, err := Build(Options{Root: root})
 	if err != nil {
 		t.Fatal(err)
 	}
+	assets := ix.Assets
 	idx := byName(assets)
 
 	// Heart.fbx from SourceFiles is present, model category, fbx thumb, variant set.

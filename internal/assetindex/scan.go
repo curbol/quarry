@@ -435,17 +435,6 @@ func uniqueClipNames(names []string) []string {
 	return out
 }
 
-// Scan walks the library root and returns every browseable asset: loose files and
-// the entries inside .zip / .unitypackage archives, de-duplicated (see dedup).
-// Unreadable archives are skipped; Build reports why in Index.Skipped.
-func Scan(root string) ([]Asset, error) {
-	ix, err := Build(Options{Root: root})
-	if err != nil {
-		return nil, err
-	}
-	return ix.Assets, nil
-}
-
 // vendorPack derives the vendor (first path segment) and pack (second segment) of
 // a root-relative path. A file directly under a vendor has no pack, and a file
 // sitting loose in the library root (a receipt, a README) has neither — naming it

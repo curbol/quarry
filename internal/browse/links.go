@@ -46,7 +46,7 @@ func (s *server) resolveRelatedLocked(dtos []assetDTO) {
 // expandRelated pulls companion cards into a tag-filtered result: any card from the
 // pre-tag-filter set (preTag) that shares a link group with a match. It relaxes only
 // the tag filter, so other facets and the text search still apply (a companion must
-// have survived them to be in preTag). Matches keep their order; companions follow.
+// have survived them to be in preTag).
 func expandRelated(filtered, preTag []assetDTO) []assetDTO {
 	if len(filtered) == 0 {
 		return filtered

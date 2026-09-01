@@ -1164,3 +1164,27 @@ func TestCardsSerializeEmptySetsAsArraysOnBothPaths(t *testing.T) {
 		})
 	}
 }
+
+// The URL quarry prints is also the one it opens, so it has to be dialable. A wildcard
+// bind is how someone serves other machines, and it reports as "[::]:port" — an address
+// a browser will not open, on a branch where the Host guard is off and localhost would
+// have worked.
+func TestTheAdvertisedURLIsOneABrowserCanOpen(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		addr net.Addr
+		want string
+	}{
+		{"loopback v4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 8788}, "127.0.0.1:8788"},
+		{"loopback v6", &net.TCPAddr{IP: net.IPv6loopback, Port: 8788}, "[::1]:8788"},
+		{"wildcard v6", &net.TCPAddr{IP: net.IPv6unspecified, Port: 8788}, "localhost:8788"},
+		{"wildcard v4", &net.TCPAddr{IP: net.IPv4zero, Port: 8788}, "localhost:8788"},
+		{"routable", &net.TCPAddr{IP: net.IPv4(192, 168, 1, 5), Port: 8788}, "192.168.1.5:8788"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if got := browsableHost(c.addr); got != c.want {
+				t.Errorf("browsableHost(%s) = %q, want %q", c.addr, got, c.want)
+			}
+		})
+	}
+}

@@ -234,7 +234,7 @@ func Serve(ctx context.Context, addr string, ix *assetindex.Index, tagsPath stri
 	srv := &http.Server{Handler: h}
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(ln) }()
-	addrURL := "http://" + ln.Addr().String()
+	addrURL := "http://" + browsableHost(ln.Addr())
 	fmt.Printf("browse %d assets at %s  (Ctrl-C to stop)\n", len(ix.Assets), addrURL)
 	if s.tagsEnabled {
 		fmt.Printf("tags: %s\n", tagsPath)
@@ -265,6 +265,19 @@ func Serve(ctx context.Context, addr string, ix *assetindex.Index, tagsPath stri
 func isLoopback(a net.Addr) bool {
 	ta, ok := a.(*net.TCPAddr)
 	return ok && ta.IP.IsLoopback()
+}
+
+// browsableHost is the listener's address written so a browser can open it. A wildcard
+// bind — `--addr :8788`, which is how someone serves other machines — reports as
+// "[::]:8788", and that is not an address anything dials: the one URL quarry prints and
+// hands to the browser would be the one thing that does not work, while localhost on the
+// same port serves fine. The warning on that branch keeps ln.Addr() itself, where naming
+// the wildcard is the point.
+func browsableHost(a net.Addr) string {
+	if ta, ok := a.(*net.TCPAddr); ok && ta.IP.IsUnspecified() {
+		return net.JoinHostPort("localhost", strconv.Itoa(ta.Port))
+	}
+	return a.String()
 }
 
 func (s *server) index(w http.ResponseWriter, r *http.Request) {
@@ -432,14 +445,12 @@ func (s *server) computeResults(query url.Values) []assetDTO {
 	// companions, then filter by the requested tags, so a card matches on its whole
 	// tag set. The count/total below reflect the post-filter result set.
 	s.decorate(grouped)
-	// Expansion relaxes the tag filter, so with no tag filter there is nothing to
-	// relax and every card is already present. Checking here keeps the copy below from
-	// duplicating a library-sized result set to guarantee a no-op.
+	// Expansion relaxes the tag filter, so with no tag filter there is nothing to relax
+	// and every card is already present.
 	includeRelated := query.Get("includeRelated") == "1" && len(query["tag"]) > 0
-	var preTag []assetDTO
-	if includeRelated {
-		preTag = append([]assetDTO(nil), grouped...)
-	}
+	// filterByTags leaves its input intact, so the pre-filter set is the slice already
+	// in hand — a companion has to have survived every other filter to be in it.
+	preTag := grouped
 	grouped = filterByTags(grouped, query["tag"], query.Get("tagmode"))
 	if includeRelated {
 		grouped = expandRelated(grouped, preTag)

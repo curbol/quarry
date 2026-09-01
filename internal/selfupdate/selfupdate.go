@@ -211,6 +211,21 @@ func platformAsset(rel *release, goos, goarch string) (string, error) {
 	return "", fmt.Errorf("no asset matching %s; available: %v", suffix, names)
 }
 
+// sweepStaleStaging removes staging directories abandoned by an interrupted update.
+// Failures are ignored: this is tidying, not part of the update, and a directory that
+// cannot be removed must not stop the one thing that repairs a broken install.
+func sweepStaleStaging(dir string) {
+	matches, err := filepath.Glob(filepath.Join(dir, ".quarry-update-*"))
+	if err != nil {
+		return
+	}
+	for _, m := range matches {
+		if fi, err := os.Stat(m); err == nil && time.Since(fi.ModTime()) > safewrite.StaleTempAge {
+			os.RemoveAll(m)
+		}
+	}
+}
+
 // currentExecutable is a seam. os.Executable answers for the test binary, so without
 // it nothing could drive Run past the version check — leaving the fetch, the platform
 // match, the symlink resolution and the replacement joined together only in production.
@@ -232,6 +247,12 @@ func downloadAndReplace(token, assetURL string) error {
 // happens beside exe and the target is only ever replaced by a rename, so a failure
 // at any point leaves the working binary exactly as it was.
 func installTo(token, assetURL, exe string) error {
+	// An interrupted update leaves its staging dir behind: there is no signal handler on
+	// this path, so Ctrl-C during a download kills the process before the defer below,
+	// and nothing else ever clears it. Swept the way replaceBinary clears a stale aside
+	// and safewrite clears an abandoned temp — by age, since anything younger could be
+	// another update running right now.
+	sweepStaleStaging(filepath.Dir(exe))
 	// Stage next to the target binary so the final rename stays on one filesystem
 	// (a temp dir under /tmp is often a separate device, and rename can't cross it).
 	tmp, err := os.MkdirTemp(filepath.Dir(exe), ".quarry-update-*")

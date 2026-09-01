@@ -216,10 +216,11 @@ func TestDuplicateClipNamesGetDistinctIdentities(t *testing.T) {
 	root, mk := libRoot(t)
 	writeGLB(t, mk("Quaternius", "AnimLib", "anims.glb"), "Walk", "Walk", "", "Run")
 
-	assets, err := Scan(root)
+	ix, err := Build(Options{Root: root})
 	if err != nil {
 		t.Fatal(err)
 	}
+	assets := ix.Assets
 	if len(assets) != 4 {
 		t.Fatalf("got %d assets, want one per clip: %+v", len(assets), assets)
 	}
@@ -473,10 +474,11 @@ func TestDedupWithAndWithoutAPackDir(t *testing.T) {
 		dir := append(layout, "Heart.fbx")
 		os.WriteFile(mk(dir...), []byte("FBXHEART"), 0o644)
 		writeZip(t, mk(append(layout, "bundle.zip")...), map[string]string{"Heart.fbx": "FBXHEART"})
-		assets, err := Scan(root)
+		ix, err := Build(Options{Root: root})
 		if err != nil {
 			t.Fatal(err)
 		}
+		assets := ix.Assets
 		n := 0
 		for _, a := range assets {
 			if a.Name == "Heart.fbx" {
@@ -942,10 +944,11 @@ func TestDuplicateZipEntryNamesIndexOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	assets, err := Scan(root)
+	ix, err := Build(Options{Root: root})
 	if err != nil {
 		t.Fatal(err)
 	}
+	assets := ix.Assets
 	var things []Asset
 	for _, a := range assets {
 		if a.Name == "Thing.fbx" {
@@ -973,10 +976,11 @@ func TestDotPathsAreSkippedInsideArchivesToo(t *testing.T) {
 		".git/config":                       "HIDDEN",
 		"SourceFiles/.editorconfig":         "HIDDEN",
 	})
-	assets, err := Scan(root)
+	ix, err := Build(Options{Root: root})
 	if err != nil {
 		t.Fatal(err)
 	}
+	assets := ix.Assets
 	for _, a := range assets {
 		if strings.Contains(a.Source.Entry, "/.") || strings.HasPrefix(a.Source.Entry, ".") {
 			t.Errorf("indexed %q from inside a dot-path; the loose walk drops those", a.Source.Entry)

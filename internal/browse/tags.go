@@ -100,13 +100,17 @@ func (s *server) unionTagsLocked(fps []string) []string {
 // filterByTags keeps cards matching the requested tags against the card's union tag
 // set: AND requires all, OR (the default) requires any.
 //
-// It compacts dtos in place, so the caller must not keep using the slice it passed.
+// The matches go into a slice of their own rather than compacting dtos in place. In
+// place is cheaper by one allocation, but it destroys the input — and includeRelated
+// needs the pre-filter set to find companions in, so it was copying the whole library's
+// cards to keep one. Sizing to the matches instead makes the common case smaller and
+// the expansion case free, and leaves no "do not reuse what you passed" rule to keep.
 func filterByTags(dtos []assetDTO, tags []string, mode string) []assetDTO {
 	if len(tags) == 0 {
 		return dtos
 	}
 	and := mode == "and"
-	out := dtos[:0]
+	var out []assetDTO
 	for _, d := range dtos {
 		if matchTags(d.Tags, tags, and) {
 			out = append(out, d)

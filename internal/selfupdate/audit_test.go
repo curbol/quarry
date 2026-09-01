@@ -14,6 +14,9 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
+
+	"github.com/curbol/quarry/internal/safewrite"
 )
 
 // fakeBinary is bytes that pass the executable sniff on the running platform, so a
@@ -950,4 +953,38 @@ func swapExecutable(t *testing.T, fn func() (string, error)) func() {
 	old := currentExecutable
 	currentExecutable = fn
 	return func() { currentExecutable = old }
+}
+
+// Nothing installs a signal handler on the update path, so Ctrl-C during a download kills
+// the process before installTo's defer and strands its staging directory beside the
+// binary — one more per interrupted attempt, forever, since nothing else looks there.
+func TestAnAbandonedStagingDirectoryIsSweptByAge(t *testing.T) {
+	dir := t.TempDir()
+	old := filepath.Join(dir, ".quarry-update-oldone")
+	fresh := filepath.Join(dir, ".quarry-update-running")
+	mine := filepath.Join(dir, "my-notes")
+	for _, d := range []string{old, fresh, mine} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	aged := time.Now().Add(-safewrite.StaleTempAge - time.Hour)
+	if err := os.Chtimes(old, aged, aged); err != nil {
+		t.Fatal(err)
+	}
+
+	sweepStaleStaging(dir)
+
+	if _, err := os.Stat(old); !os.IsNotExist(err) {
+		t.Errorf("the abandoned staging dir survived: %v", err)
+	}
+	// Anything younger could be another update in flight, and racing one is worse than
+	// leaving it.
+	if _, err := os.Stat(fresh); err != nil {
+		t.Errorf("a staging dir young enough to be someone's running update was removed: %v", err)
+	}
+	// The sweep is over one glob in a directory the user owns — often ~/.local/bin.
+	if _, err := os.Stat(mine); err != nil {
+		t.Errorf("the sweep removed something that is not quarry's: %v", err)
+	}
 }

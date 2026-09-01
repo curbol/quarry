@@ -74,3 +74,27 @@ export function spacerRows({ start, end, total, cols }) {
     after: Math.ceil(Math.max(0, total - end) / cols),
   };
 }
+
+// windowDelta turns "the live range is `live`, the wanted range is `want`" into the
+// edits that move one to the other: how many cards to drop off each end, and which
+// sub-ranges to add back. `splice` is false when the two ranges do not overlap at all,
+// where replacing the whole window is both simpler and no more work.
+//
+// Here rather than in the render method it drives, for the reason the rest of this file
+// is here: an off-by-one inserts a duplicated row or leaves a gap in the middle of a
+// 150k-item grid, and the whole-window fallback hides it again on the next big jump.
+// The caller does the DOM; this decides what the DOM should be.
+export function windowDelta({ live, want, active }) {
+  const keepFrom = Math.max(live.start, want.start);
+  const keepTo = Math.min(live.end, want.end);
+  if (!active || keepFrom >= keepTo) {
+    return { splice: false, dropTop: 0, dropBottom: 0, addBefore: null, addAfter: null };
+  }
+  return {
+    splice: true,
+    dropTop: keepFrom - live.start,
+    dropBottom: live.end - keepTo,
+    addBefore: want.start < keepFrom ? { start: want.start, end: keepFrom } : null,
+    addAfter: want.end > keepTo ? { start: keepTo, end: want.end } : null,
+  };
+}

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { lastMotionTime, trimmedDuration, DEAD_TAIL } from '../assets/cliptrim.js';
+import { lastMotionTime, trimmedDuration, DEAD_TAIL, STILL_TRACK } from '../assets/cliptrim.js';
 
 // A track that moves steadily for `moving` frames and then holds its last value.
 // valueSize 1 keeps the arithmetic readable; the code is per-component either way.
@@ -56,6 +56,27 @@ test('a track that never really moves contributes nothing', () => {
   // ...and cannot drag a real track's answer later than it belongs.
   const real = padded({ frames: 21, moving: 6 });
   assert.equal(lastMotionTime([still, real]).toFixed(2), '0.50');
+  // Nor can it produce a trim of its own: a clip where nothing moves is left at its
+  // stored duration rather than cut to nothing.
+  assert.equal(trimmedDuration([still], 2.0), 0, 'a clip where nothing moves is left alone');
+});
+
+// What STILL_TRACK has to separate, in absolute terms rather than in terms of itself:
+// float noise on a bone that is not animated, from a real but small rotation. Written
+// against the constant, this test would move with it and pin nothing — and both
+// directions are silent. Too high and a subtle hand or finger animation is discarded as
+// noise, so the clip is reported as stopping before it does; too low and a numerically
+// noisy bone holds every clip in a padded pack open to its full slot length.
+test('float noise is not motion, but a small real rotation is', () => {
+  // Peak per-keyframe change is exactly `step` for a single-component track.
+  const noise = padded({ frames: 21, moving: 6, step: 1e-5 });
+  assert.equal(lastMotionTime([noise]), 0, '1e-5 per frame is a bone that is not animated');
+
+  const subtle = padded({ frames: 21, moving: 6, step: 1e-2 });
+  assert.equal(lastMotionTime([subtle]).toFixed(2), '0.50', '1e-2 per frame is a real, small rotation');
+
+  // And the constant itself sits between them, so the two claims above are about it.
+  assert.ok(STILL_TRACK > 1e-5 && STILL_TRACK <= 1e-2, `STILL_TRACK = ${STILL_TRACK}`);
 });
 
 test('a dead tail is only cut when it is worth cutting', () => {

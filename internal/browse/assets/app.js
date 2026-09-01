@@ -1,6 +1,6 @@
 import { contentURL, thumbURL } from '/static/scene.js';
 import { lazyWork, modelThumbs, forgetThumbs, ensureFont } from '/static/thumbs.js';
-import { LIVE, wantedRange, visibleRange, needsRebuild, spacerRows } from '/static/gridwindow.js';
+import { LIVE, wantedRange, visibleRange, needsRebuild, spacerRows, windowDelta } from '/static/gridwindow.js';
 import { iconEl, protoClone } from '/static/icons.js';
 import { nextTags } from '/static/tagedit.js';
 import { startViewer } from '/static/viewer.js';
@@ -249,14 +249,17 @@ const gridWindow = {
   render(start, end, m) {
     const total = state.items.length;
     const rows = spacerRows({ start, end, total, cols: m.cols });
-    const keepFrom = Math.max(this.start, start);
-    const keepTo = Math.min(this.end, end);
+    const d = windowDelta({
+      live: { start: this.start, end: this.end },
+      want: { start, end },
+      active: this.active,
+    });
 
-    if (this.active && keepFrom < keepTo) {
-      for (let i = this.start; i < keepFrom; i++) this.drop(this.top.nextElementSibling);
-      for (let i = keepTo; i < this.end; i++) this.drop(this.bottom.previousElementSibling);
-      if (start < keepFrom) this.top.after(this.cards(start, keepFrom));
-      if (end > keepTo) this.bottom.before(this.cards(keepTo, end));
+    if (d.splice) {
+      for (let i = 0; i < d.dropTop; i++) this.drop(this.top.nextElementSibling);
+      for (let i = 0; i < d.dropBottom; i++) this.drop(this.bottom.previousElementSibling);
+      if (d.addBefore) this.top.after(this.cards(d.addBefore.start, d.addBefore.end));
+      if (d.addAfter) this.bottom.before(this.cards(d.addAfter.start, d.addAfter.end));
     } else {
       // First activation, or a jump far enough that nothing live is still wanted. The
       // cards being replaced include the ones fetchPage appended before recycling

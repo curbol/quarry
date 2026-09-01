@@ -4,7 +4,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  LIVE, SLACK, wantedRange, visibleRange, needsRebuild, spacerRows,
+  LIVE, SLACK, wantedRange, visibleRange, needsRebuild, spacerRows, windowDelta,
 } from '../assets/gridwindow.js';
 
 // A realistic desktop grid: six columns of 216px rows under a 900px viewport.
@@ -159,4 +159,76 @@ test('SLACK leaves room to scroll before the rebuild is due', () => {
   // stutter, so the margin has to exceed what one viewport can cross.
   const perScreen = Math.ceil(VIEWPORT_H / ROW_H) * COLS;
   assert.ok(SLACK > perScreen, `slack of ${SLACK} items is under one screenful (${perScreen})`);
+});
+
+// windowDelta decides which cards render() splices in and out. The DOM work is driven
+// by its counts, so an off-by-one removes a spacer or leaves a row duplicated in the
+// middle of a 150k-item grid — and the whole-window fallback hides it again on the next
+// big jump, which is why it is checked here rather than watched for.
+const delta = (live, want, active = true) => windowDelta({ live, want, active });
+
+// Exhaustive over small ranges: these two properties are what "the splice is correct"
+// means, and they are cheap enough to check over every pair.
+const RANGES = [];
+for (let start = 0; start <= 6; start++) for (let end = start; end <= 6; end++) RANGES.push({ start, end });
+
+test('a splice never drops more cards than are live', () => {
+  for (const live of RANGES) {
+    for (const want of RANGES) {
+      const d = delta(live, want);
+      if (!d.splice) continue;
+      assert.ok(d.dropTop >= 0 && d.dropBottom >= 0, `negative drop for ${live.start}..${live.end} -> ${want.start}..${want.end}`);
+      assert.ok(d.dropTop + d.dropBottom <= live.end - live.start,
+        `dropping ${d.dropTop}+${d.dropBottom} of ${live.end - live.start} live (${live.start}..${live.end} -> ${want.start}..${want.end})`);
+    }
+  }
+});
+
+test('what is kept plus what is added is exactly what was wanted, each item once', () => {
+  for (const live of RANGES) {
+    for (const want of RANGES) {
+      const d = delta(live, want);
+      if (!d.splice) continue;
+      const seen = new Map();
+      const count = (r) => { for (let i = r.start; i < r.end; i++) seen.set(i, (seen.get(i) || 0) + 1); };
+      // What survives the two drops, expressed the way the DOM has it: the live range
+      // minus its ends.
+      count({ start: live.start + d.dropTop, end: live.end - d.dropBottom });
+      if (d.addBefore) count(d.addBefore);
+      if (d.addAfter) count(d.addAfter);
+      const got = [...seen.keys()].sort((a, b) => a - b);
+      const expected = [];
+      for (let i = want.start; i < want.end; i++) expected.push(i);
+      assert.deepEqual(got, expected, `${live.start}..${live.end} -> ${want.start}..${want.end} covers ${got}, want ${expected}`);
+      for (const [item, n] of seen) {
+        assert.equal(n, 1, `item ${item} appears ${n} times (${live.start}..${live.end} -> ${want.start}..${want.end})`);
+      }
+    }
+  }
+});
+
+test('nothing live still wanted is a whole-window replacement, not a splice', () => {
+  assert.equal(delta({ start: 0, end: 100 }, { start: 200, end: 300 }).splice, false);
+  // Touching but not overlapping is still nothing to keep.
+  assert.equal(delta({ start: 0, end: 100 }, { start: 100, end: 200 }).splice, false);
+});
+
+test('an inactive window is always a whole replacement, whatever the ranges say', () => {
+  assert.equal(delta({ start: 0, end: 100 }, { start: 10, end: 110 }, false).splice, false);
+});
+
+test('scrolling down drops from the top and adds below', () => {
+  const d = delta({ start: 0, end: 100 }, { start: 20, end: 120 });
+  assert.equal(d.dropTop, 20);
+  assert.equal(d.dropBottom, 0);
+  assert.equal(d.addBefore, null);
+  assert.deepEqual(d.addAfter, { start: 100, end: 120 });
+});
+
+test('scrolling up drops from the bottom and adds above', () => {
+  const d = delta({ start: 20, end: 120 }, { start: 0, end: 100 });
+  assert.equal(d.dropTop, 0);
+  assert.equal(d.dropBottom, 20);
+  assert.deepEqual(d.addBefore, { start: 0, end: 20 });
+  assert.equal(d.addAfter, null);
 });

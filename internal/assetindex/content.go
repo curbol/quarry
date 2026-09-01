@@ -94,6 +94,11 @@ func (ix *Index) openUnpacked(a Asset, member string, want int64) (io.ReadCloser
 		return nil, 0, tornError(a, member, n, want)
 	}
 	if err := ix.discardExtraction(a.Source.ArchivePath); err != nil {
+		// The claim is spent on a repair that happened. A discard that failed — a full
+		// or read-only cache dir, an EIO on a network mount — repaired nothing, and
+		// holding the claim would answer tornError for every later request against this
+		// archive even after the cause was fixed.
+		ix.releaseRebuild(fp)
 		return nil, 0, err
 	}
 	rc, n, err = ix.openUnpackedMember(a, member)
@@ -138,6 +143,15 @@ func (ix *Index) claimRebuild(fp string) bool {
 	}
 	ix.rebuilt[fp] = true
 	return true
+}
+
+// releaseRebuild gives the claim back when the repair it was taken for did not happen.
+// The once-per-extraction rule is about not paying a full decompress twice for a tree
+// that was never the cause; a discard that failed says nothing about the tree.
+func (ix *Index) releaseRebuild(fp string) {
+	ix.extractMu.Lock()
+	defer ix.extractMu.Unlock()
+	delete(ix.rebuilt, fp)
 }
 
 // openUnpackedMember opens one extracted member, holding the archive's read lock from
@@ -186,6 +200,19 @@ func (ix *Index) archiveMu(archivePath string) *sync.RWMutex {
 // open while the tree goes away. ensureExtracted clears its single-flight entry after
 // every call precisely so a dest that disappears is extracted again rather than
 // reported present by a spent Once.
+//
+// Unpublished by a rename, the way it was published by one, and only then deleted.
+// os.RemoveAll on the live tree records its first error and keeps going, then fails to
+// unlink the directory itself — leaving a directory that still exists with an arbitrary
+// subset of its members gone. ensureExtracted's fast path is a stat of exactly that
+// directory, so it would be treated as complete from then on: not repaired by a later
+// request, not by a restart, and not by --reindex, since the archive's bytes never
+// moved and the tree is named for its fingerprint. The rename is one directory entry,
+// so the tree is either wholly gone or wholly intact.
+//
+// The failure of the delete afterwards is not the caller's problem — the extraction is
+// already unpublished and will rebuild — and what is left behind sits in stagingDir,
+// which PruneUnpacked sweeps by age.
 func (ix *Index) discardExtraction(archivePath string) error {
 	fp, err := fingerprint(archivePath)
 	if err != nil {
@@ -194,7 +221,28 @@ func (ix *Index) discardExtraction(archivePath string) error {
 	mu := ix.archiveMu(archivePath)
 	mu.Lock()
 	defer mu.Unlock()
-	return os.RemoveAll(filepath.Join(ix.unpackedDir(), fp))
+	dest := filepath.Join(ix.unpackedDir(), fp)
+	if _, err := os.Stat(dest); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if err := os.MkdirAll(ix.stagingDir(), 0o755); err != nil {
+		return err
+	}
+	condemned, err := os.MkdirTemp(ix.stagingDir(), "discard-*")
+	if err != nil {
+		return err
+	}
+	// Into a fresh directory of its own, so a name already there cannot make the
+	// rename a no-op or a nested move.
+	if err := os.Rename(dest, filepath.Join(condemned, fp)); err != nil {
+		os.RemoveAll(condemned)
+		return err
+	}
+	os.RemoveAll(condemned)
+	return nil
 }
 
 // unpackedEntry is where one extracted unitypackage member sits, with the guid

@@ -2084,3 +2084,167 @@ func TestStatePathsAreAbsoluteFromARelativeCacheDir(t *testing.T) {
 		}
 	}
 }
+
+// A discard is how a torn extraction is repaired, so it must be all-or-nothing. Deleting
+// the live tree in place is not: os.RemoveAll records its first error and keeps going,
+// then cannot unlink the directory, leaving one that still exists with an arbitrary
+// subset of its members gone — and ensureExtracted's fast path is a stat of exactly that
+// directory, so the remains would be served as complete from then on, past a restart and
+// past --reindex. Unpublishing by rename first is what makes the outcome binary.
+func TestDiscardIsAllOrNothingAndLeavesNoTreeBehind(t *testing.T) {
+	root, mk := libRoot(t)
+	archive := mk("v", "Pack", "Pack_A_v1.unitypackage")
+	const a1, a2 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "cccccccccccccccccccccccccccccccc"
+	writeUnityPackage(t, archive, []unityGUID{
+		{guid: a1, pathname: "Assets/One.fbx", asset: "ONEBYTES"},
+		{guid: a2, pathname: "Assets/Two.fbx", asset: "TWOBYTES"},
+	})
+	ix, err := Build(Options{Root: root, CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc, _, err := ix.Open(ix.Assets[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc.Close()
+
+	fp, err := fingerprint(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dest := filepath.Join(ix.unpackedDir(), fp)
+	if _, err := os.Stat(dest); err != nil {
+		t.Fatalf("the extraction should be published by now: %v", err)
+	}
+	if err := ix.discardExtraction(archive); err != nil {
+		t.Fatal(err)
+	}
+	// Wholly gone, not partly: a surviving directory is what the stat fast path would
+	// read as a complete extraction.
+	if _, err := os.Stat(dest); !os.IsNotExist(err) {
+		t.Errorf("stat(dest) = %v, want IsNotExist: a tree that still exists is treated as complete", err)
+	}
+	// And nothing parked in staging, which is where the condemned tree goes on its way
+	// out — left there, it would sit until PruneUnpacked's age sweep.
+	if entries, err := os.ReadDir(ix.stagingDir()); err == nil && len(entries) != 0 {
+		t.Errorf("staging holds %d entries after a discard that succeeded", len(entries))
+	}
+	// Both members come back, so the discard really did lead to a fresh extraction
+	// rather than to a hole that reads as a miss.
+	for _, want := range []struct {
+		i    int
+		body string
+	}{{0, "ONEBYTES"}, {1, "TWOBYTES"}} {
+		rc, _, err := ix.Open(ix.Assets[want.i])
+		if err != nil {
+			t.Fatalf("re-open %d: %v", want.i, err)
+		}
+		b, _ := io.ReadAll(rc)
+		rc.Close()
+		if string(b) != want.body {
+			t.Errorf("member %d = %q, want %q", want.i, b, want.body)
+		}
+	}
+	// Discarding what is not there is how a concurrent instance's prune looks; it is
+	// not a failure, and reporting one would fail a repair that already happened.
+	if err := ix.discardExtraction(archive); err != nil {
+		t.Errorf("discard of an already-absent extraction = %v, want nil", err)
+	}
+}
+
+// The atomicity itself, which only shows under a removal that fails partway. A directory
+// the process cannot unlink from is enough: os.RemoveAll then deletes the members it can
+// reach, fails on the rest, and cannot unlink the extraction directory — leaving a
+// directory that still exists and is missing members. ensureExtracted's fast path is a
+// stat of that directory, so those members would 404 for good. Unpublished by a rename,
+// the tree leaves whole and re-extracts.
+func TestADiscardThatCannotDeleteStillUnpublishesTheWholeTree(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores the directory permissions this test uses to make a delete fail")
+	}
+	root, mk := libRoot(t)
+	archive := mk("v", "Pack", "Pack_A_v1.unitypackage")
+	const a1, a2 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "cccccccccccccccccccccccccccccccc"
+	writeUnityPackage(t, archive, []unityGUID{
+		{guid: a1, pathname: "Assets/One.fbx", asset: "ONEBYTES"},
+		{guid: a2, pathname: "Assets/Two.fbx", asset: "TWOBYTES"},
+	})
+	cache := t.TempDir()
+	// The condemned tree keeps its permissions wherever it is moved to, so the sweep is
+	// over the whole cache dir rather than the one path. Registered before anything is
+	// locked down, and it runs before TempDir's own cleanup.
+	t.Cleanup(func() {
+		filepath.WalkDir(cache, func(p string, d fs.DirEntry, err error) error {
+			if err == nil && d.IsDir() {
+				os.Chmod(p, 0o700)
+			}
+			return nil
+		})
+	})
+	ix, err := Build(Options{Root: root, CacheDir: cache})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc, _, err := ix.Open(ix.Assets[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc.Close()
+
+	fp, err := fingerprint(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dest := filepath.Join(ix.unpackedDir(), fp)
+	if err := os.Chmod(filepath.Join(dest, a1), 0o500); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ix.discardExtraction(archive); err != nil {
+		t.Fatalf("discard = %v; the tree can be unpublished even when it cannot be deleted", err)
+	}
+	if _, err := os.Stat(dest); !os.IsNotExist(err) {
+		t.Fatalf("stat(dest) = %v, want IsNotExist: a tree left half-deleted is read as complete "+
+			"by the stat fast path, so its missing members never come back", err)
+	}
+	// The undeletable remains are parked in staging, outside the tree PruneUnpacked
+	// sweeps by name, where its age sweep clears them.
+	if entries, err := os.ReadDir(ix.stagingDir()); err != nil || len(entries) == 0 {
+		t.Errorf("staging = %v (%v); the condemned tree should be waiting there", entries, err)
+	}
+	// Both members are served again, from a fresh extraction.
+	for _, want := range []struct {
+		i    int
+		body string
+	}{{0, "ONEBYTES"}, {1, "TWOBYTES"}} {
+		rc, _, err := ix.Open(ix.Assets[want.i])
+		if err != nil {
+			t.Fatalf("re-open %d: %v", want.i, err)
+		}
+		b, _ := io.ReadAll(rc)
+		rc.Close()
+		if string(b) != want.body {
+			t.Errorf("member %d = %q, want %q", want.i, b, want.body)
+		}
+	}
+}
+
+// The rebuild claim is spent once per extraction because a second disagreement means the
+// tree was never the cause. A discard that failed repaired nothing, so holding the claim
+// there answers tornError for every later request against the archive — including after
+// the cause (a full disk, a read-only cache dir) is fixed.
+func TestAFailedDiscardDoesNotSpendTheRebuildClaim(t *testing.T) {
+	ix := &Index{}
+	const fp = "crc32:dead:1"
+	if !ix.claimRebuild(fp) {
+		t.Fatal("the first claim must be granted")
+	}
+	if ix.claimRebuild(fp) {
+		t.Fatal("the second claim must be refused while the first is held")
+	}
+	ix.releaseRebuild(fp)
+	if !ix.claimRebuild(fp) {
+		t.Error("a released claim must be grantable again, or a failed discard freezes the archive")
+	}
+}

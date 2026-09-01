@@ -44,13 +44,14 @@ jobs:
       # fans out over the tree, so the suite is worth running under the detector.
       - run: go test -race ./...
 
-  # The grid's card recycling, the thumbnail worker's job dispatch, rig matching and
-  # folding a tag edit into a card are arithmetic, message ordering and set logic: a
-  # mistake in any of them leaves the UI working and merely slow or subtly wrong, which
-  # is what no Go test and no eye reliably catches. The pure halves live in
-  # assets/gridwindow.js, jobtracker.js, rigmatch.js and tagedit.js and are checked
-  # here. Node's own test runner, no package.json and nothing installed, so this stays a
-  # runtime rather than an ecosystem.
+  # The grid's card recycling, the thumbnail worker's job dispatch, rig matching,
+  # folding a tag edit into a card and deciding where a padded clip stops are
+  # arithmetic, message ordering and set logic: a mistake in any of them leaves the UI
+  # working and merely slow or subtly wrong, which is what no Go test and no eye
+  # reliably catches. The pure halves live in assets/gridwindow.js, jobtracker.js,
+  # rigmatch.js, tagedit.js and cliptrim.js and are checked here. Node's own test
+  # runner, no package.json and nothing installed, so this stays a runtime rather than
+  # an ecosystem.
   js:
     runs-on: ubuntu-latest
     steps:

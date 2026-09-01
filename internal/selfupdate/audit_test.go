@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -701,4 +702,226 @@ func TestReplaceBinaryDoesNotMoveTheOldOneAsideOnPOSIX(t *testing.T) {
 	if !bytes.Equal(got, fakeBinary("NEW")) {
 		t.Errorf("binary content = %q, want the new one", got)
 	}
+}
+
+// The asset-name contract lives in three places — the release workflow's platform
+// table, releaseSuffix here, and install.sh's uname mapping — and drifting them apart
+// is invisible until a release ships: everything builds, every test passes, and then
+// `quarry update` cannot find its asset on the platforms CI never runs. Since update is
+// itself the recovery path, the tool cannot fix that for the user.
+//
+// Checked against the workflow as text rather than against a second hand-copy of it,
+// because a hand-copy asserts the mapping against itself.
+func TestReleaseSuffixMatchesTheWorkflowLabels(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", "release.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := regexp.MustCompile(`"([a-z0-9]+)/([a-z0-9]+)/([a-z0-9-]+)"`)
+	found := map[string]string{}
+	for _, m := range entry.FindAllStringSubmatch(string(b), -1) {
+		found[m[1]+"/"+m[2]] = m[3] + ".zip"
+	}
+	if len(found) == 0 {
+		t.Fatal("no platform entries found in release.yml; this test has stopped checking anything")
+	}
+	for platform, want := range found {
+		got, ok := releaseSuffix[platform]
+		if !ok {
+			t.Errorf("release.yml builds %s but releaseSuffix has no entry: `quarry update` on that platform cannot find its asset", platform)
+			continue
+		}
+		if got != want {
+			t.Errorf("%s: releaseSuffix says %q, release.yml publishes %q", platform, got, want)
+		}
+	}
+	// Every suffix quarry will ask for has to be one the workflow actually publishes.
+	// windows/arm64 is the documented exception: it runs the x86-64 build under
+	// emulation, so it deliberately points at a label of its own that is published.
+	published := map[string]bool{}
+	for _, suffix := range found {
+		published[suffix] = true
+	}
+	for platform, suffix := range releaseSuffix {
+		if !published[suffix] {
+			t.Errorf("%s asks for %q, which release.yml does not publish", platform, suffix)
+		}
+	}
+}
+
+// install.sh composes the same label from uname, so it drifts the same way and breaks
+// the first install rather than the first update.
+func TestInstallScriptComposesPublishedLabels(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("..", "..", "install.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(b)
+	oses := regexp.MustCompile(`os="([a-z0-9]+)"`).FindAllStringSubmatch(src, -1)
+	arches := regexp.MustCompile(`arch="([a-z0-9]+)"`).FindAllStringSubmatch(src, -1)
+	if len(oses) == 0 || len(arches) == 0 {
+		t.Fatal("install.sh's platform mapping did not parse; this test has stopped checking anything")
+	}
+	published := map[string]bool{}
+	for _, suffix := range releaseSuffix {
+		published[suffix] = true
+	}
+	// The script builds "${os}-${arch}"; not every combination is real (mac-arm64,
+	// linux-apple), so this asserts that each one it *can* produce is either published
+	// or an impossible pairing, and that at least the real ones are covered.
+	real := map[string]bool{"mac-intel": true, "mac-apple": true, "linux-intel": true, "linux-arm64": true}
+	for _, o := range oses {
+		for _, a := range arches {
+			label := o[1] + "-" + a[1]
+			if !real[label] {
+				continue
+			}
+			if !published[label+".zip"] {
+				t.Errorf("install.sh can ask for %s.zip, which is not a label the release publishes", label)
+			}
+		}
+	}
+	for label := range real {
+		if !published[label+".zip"] {
+			t.Errorf("%s.zip is a platform install.sh supports but the release does not publish", label)
+		}
+	}
+}
+
+// The whole of Run, end to end: fetch, version compare, platform match, download,
+// symlink resolution, replacement. Nothing drove it past the version check before,
+// because os.Executable answers for the test binary — so every one of those joins
+// existed only in production, on the path whose failure leaves a user with no working
+// binary and no working `update` to recover with.
+func TestRunReplacesTheBinaryItIsPointedAt(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "test-token")
+	dir := t.TempDir()
+	exe := filepath.Join(dir, installedBinaryName())
+	if err := os.WriteFile(exe, fakeBinary("OLD"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Reached through a symlink, which is how a ~/.local/bin install commonly sits:
+	// Run must replace the real file, not turn the link into a regular one.
+	link := filepath.Join(dir, "link-to-quarry")
+	if err := os.Symlink(exe, link); err != nil {
+		t.Skipf("symlinks unavailable here: %v", err)
+	}
+	defer swapExecutable(t, func() (string, error) { return link, nil })()
+
+	asset := zipWith(t, installedBinaryName(), fakeBinary("NEW"))
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/assets/") {
+			w.Write(asset)
+			return
+		}
+		fmt.Fprintf(w, `{"tag_name":"v9.9.9","assets":[{"name":"quarry-9.9.9-%s","url":%q}]}`,
+			releaseSuffix[runtime.GOOS+"/"+runtime.GOARCH], "http://"+r.Host+"/assets/1")
+	}))
+	defer srv.Close()
+	old := releasesAPIURL
+	releasesAPIURL = srv.URL
+	defer func() { releasesAPIURL = old }()
+
+	if err := Run("1.2.3", ""); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	got, err := os.ReadFile(exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, fakeBinary("NEW")) {
+		t.Errorf("the real binary was not replaced: %q", got)
+	}
+	fi, err := os.Lstat(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		t.Error("the symlink was replaced by a regular file; the real install is now stale")
+	}
+}
+
+// A download that fails after the version check leaves the old binary in place — the
+// state a user can still run, and still run `update` from.
+func TestRunLeavesAWorkingBinaryWhenTheDownloadFails(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "test-token")
+	dir := t.TempDir()
+	exe := filepath.Join(dir, installedBinaryName())
+	if err := os.WriteFile(exe, fakeBinary("OLD"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	defer swapExecutable(t, func() (string, error) { return exe, nil })()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/assets/") {
+			http.Error(w, "gone", http.StatusNotFound)
+			return
+		}
+		fmt.Fprintf(w, `{"tag_name":"v9.9.9","assets":[{"name":"quarry-9.9.9-%s","url":%q}]}`,
+			releaseSuffix[runtime.GOOS+"/"+runtime.GOARCH], "http://"+r.Host+"/assets/1")
+	}))
+	defer srv.Close()
+	old := releasesAPIURL
+	releasesAPIURL = srv.URL
+	defer func() { releasesAPIURL = old }()
+
+	if err := Run("1.2.3", ""); err == nil {
+		t.Fatal("Run over a failed download returned nil")
+	}
+	got, err := os.ReadFile(exe)
+	if err != nil {
+		t.Fatalf("the binary is gone after a failed update: %v", err)
+	}
+	if !bytes.Equal(got, fakeBinary("OLD")) {
+		t.Errorf("binary = %q, want the old one left intact", got)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Errorf("a failed update left %d entries in the install dir, want only the binary", len(entries))
+	}
+}
+
+// A platform the release does not build for must fail before anything is replaced, and
+// say what it looked for — a wrong-architecture binary passes checkExecutable, since
+// every architecture shares the ELF magic.
+func TestRunRefusesAPlatformTheReleaseDoesNotBuild(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "test-token")
+	dir := t.TempDir()
+	exe := filepath.Join(dir, installedBinaryName())
+	if err := os.WriteFile(exe, fakeBinary("OLD"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	defer swapExecutable(t, func() (string, error) { return exe, nil })()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"tag_name":"v9.9.9","assets":[{"name":"quarry-9.9.9-solaris-sparc.zip","url":%q}]}`,
+			"http://"+r.Host+"/assets/1")
+	}))
+	defer srv.Close()
+	old := releasesAPIURL
+	releasesAPIURL = srv.URL
+	defer func() { releasesAPIURL = old }()
+
+	err := Run("1.2.3", "")
+	if err == nil {
+		t.Fatal("Run with no matching asset returned nil")
+	}
+	if !strings.Contains(err.Error(), releaseSuffix[runtime.GOOS+"/"+runtime.GOARCH]) {
+		t.Errorf("error %q does not name the asset it looked for", err)
+	}
+	got, err := os.ReadFile(exe)
+	if err != nil || !bytes.Equal(got, fakeBinary("OLD")) {
+		t.Errorf("the binary was disturbed by a failure that happened before any download")
+	}
+}
+
+// swapExecutable points the update path at a chosen binary and returns the restore.
+func swapExecutable(t *testing.T, fn func() (string, error)) func() {
+	t.Helper()
+	old := currentExecutable
+	currentExecutable = fn
+	return func() { currentExecutable = old }
 }

@@ -211,8 +211,13 @@ func platformAsset(rel *release, goos, goarch string) (string, error) {
 	return "", fmt.Errorf("no asset matching %s; available: %v", suffix, names)
 }
 
+// currentExecutable is a seam. os.Executable answers for the test binary, so without
+// it nothing could drive Run past the version check — leaving the fetch, the platform
+// match, the symlink resolution and the replacement joined together only in production.
+var currentExecutable = os.Executable
+
 func downloadAndReplace(token, assetURL string) error {
-	exe, err := os.Executable()
+	exe, err := currentExecutable()
 	if err != nil {
 		return fmt.Errorf("locating current binary: %w", err)
 	}

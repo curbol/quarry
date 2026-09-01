@@ -136,6 +136,57 @@ func TestResolveDirs(t *testing.T) {
 				})
 			}
 
+			// Every branch returns an absolute path, which is the promise. A flag is the
+			// one place a relative value is honoured rather than refused — it is this
+			// invocation saying "here" — but it is resolved, not passed through.
+			t.Run("a relative flag resolves against the working directory", func(t *testing.T) {
+				clearQuarryEnv(t)
+				t.Setenv(r.xdgEnv, "")
+				got, err := r.resolve(filepath.Join(".", "local-state"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !filepath.IsAbs(got) {
+					t.Errorf("got %q, want an absolute path", got)
+				}
+				wd, err := os.Getwd()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got != filepath.Join(wd, "local-state") {
+					t.Errorf("got %q, want it resolved against %q", got, wd)
+				}
+			})
+
+			// An own env var is not one invocation's choice: it sits in a shell rc and
+			// follows the user into every directory, which is the case the XDG branch
+			// refuses a relative value for. QUARRY_CACHE_DIR=.quarry would give each
+			// directory quarry is run from its own index and unpacked-archive tree.
+			t.Run("a relative own env var is refused", func(t *testing.T) {
+				clearQuarryEnv(t)
+				t.Setenv(r.xdgEnv, "")
+				t.Setenv(r.ownEnv, ".quarry")
+				got, err := r.resolve("")
+				if err == nil {
+					t.Fatalf("resolved to %q; want an error naming %s", got, r.ownEnv)
+				}
+				if !strings.Contains(err.Error(), r.ownEnv) {
+					t.Errorf("error %q does not name the variable at fault", err)
+				}
+			})
+
+			// os.UserHomeDir hands back $HOME unexamined, so a relative one arrives here
+			// as a relative result from the branch least able to look like it produced one.
+			t.Run("a relative home is an error, not a relative path", func(t *testing.T) {
+				clearQuarryEnv(t)
+				t.Setenv(r.xdgEnv, "")
+				t.Setenv("HOME", "relative-home")
+				got, err := r.resolve("")
+				if err == nil {
+					t.Fatalf("resolved to %q with a relative $HOME; want an error", got)
+				}
+			})
+
 			// With no home and no env there is nowhere to resolve to. Returning a
 			// cwd-relative name instead would put the cache — and every unpacked archive
 			// — inside whatever directory quarry happened to be run from, which is most

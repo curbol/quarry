@@ -115,6 +115,12 @@ install() {
   unzip -q "${tmp}/${file}" -d "$tmp"
   verify_binary "${tmp}/${BINARY_NAME}"
   chmod +x "${tmp}/${BINARY_NAME}"
+  # A directory of that name would swallow the rename below — `mv file dir` moves the
+  # file *into* it — leaving a directory on PATH under the name of the binary.
+  if [[ -d "${INSTALL_DIR}/${BINARY_NAME}" ]]; then
+    err "${INSTALL_DIR}/${BINARY_NAME} is a directory; remove it and re-run"
+    exit 1
+  fi
   # Same filesystem, so this is one atomic rename: PATH holds either the old binary
   # or the complete new one, never a half-written file.
   mv "${tmp}/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
@@ -132,4 +138,7 @@ detect_platform
 latest_version
 install
 check_path
-"${INSTALL_DIR}/${BINARY_NAME}" version || err "installed but 'quarry version' failed"
+# The only end-to-end check, so its failure has to be the script's. `|| err ...` alone
+# exits 0, because err's status is printf's — and the documented invocation pipes this
+# into bash, where a caller chaining on `&&` would read that as a clean install.
+"${INSTALL_DIR}/${BINARY_NAME}" version || { err "installed but 'quarry version' failed"; exit 1; }

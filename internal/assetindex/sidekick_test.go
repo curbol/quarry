@@ -32,6 +32,54 @@ func TestParseSidekick(t *testing.T) {
 	}
 }
 
+// A ColorSet nested under a part, rather than beside the Parts block, is the shape the
+// top-level guard does not see: every line indented under Parts is inside it, so a
+// scanner blind to depth collects the swatch names as parts. Each then resolves to no
+// mesh, and the character is marked unassembled — which is not a broken card, but it is
+// what tells the walk it can drop the pack's prefabs, materials and combined meshes, so
+// every character in the pack keeps its byproducts beside it in the grid.
+func TestParseSidekickIgnoresNamesNestedUnderAPart(t *testing.T) {
+	sk := "" +
+		"Name: Hero_01\n" +
+		"Parts:\n" +
+		"- Name: SK_HEAD\n" +
+		"  PartType: Head\n" +
+		"  ColorSet:\n" +
+		"  - Name: Skin_01\n" +
+		"  - Name: Skin_02\n" +
+		"  BlendShapes:\n" +
+		"  - Name: Jaw_Wide\n" +
+		"- Name: SK_TORS\n" +
+		"  PartType: Torso\n"
+
+	name, parts := parseSidekick([]byte(sk))
+	if name != "Hero_01" {
+		t.Errorf("name = %q, want Hero_01", name)
+	}
+	want := []string{"SK_HEAD", "SK_TORS"}
+	if !reflect.DeepEqual(parts, want) {
+		t.Errorf("parts = %v, want %v: only the block's own items are parts", parts, want)
+	}
+}
+
+// The items' own indent is read from the first one rather than assumed, since nothing
+// says a .sk indents its lists at column zero.
+func TestParseSidekickReadsPartsIndentedAsABlock(t *testing.T) {
+	sk := "" +
+		"Name: Hero_02\n" +
+		"Parts:\n" +
+		"  - Name: SK_HEAD\n" +
+		"    ColorSet:\n" +
+		"      - Name: Skin_01\n" +
+		"  - Name: SK_TORS\n"
+
+	_, parts := parseSidekick([]byte(sk))
+	want := []string{"SK_HEAD", "SK_TORS"}
+	if !reflect.DeepEqual(parts, want) {
+		t.Errorf("parts = %v, want %v", parts, want)
+	}
+}
+
 func TestParseSidekickEmpty(t *testing.T) {
 	name, parts := parseSidekick([]byte("Name: Foo\nSpecies: 1\n"))
 	if name != "Foo" || len(parts) != 0 {

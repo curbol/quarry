@@ -42,6 +42,23 @@ jobs:
         id: version
         run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
+      # The linker silently ignores -X for a symbol that does not exist, so moving or
+      # renaming main.version ships every binary reporting DevVersion — which is exactly
+      # what `quarry update` refuses to run on, for everyone who installs it, with the
+      # update path itself being the recovery. Nothing else catches that: the build
+      # succeeds, main_test.go asserts against the same variable whatever its value, and
+      # install.sh only checks that `quarry version` exits 0.
+      - name: Verify the version stamp reaches the binary
+        env:
+          VERSION: ${{ steps.version.outputs.VERSION }}
+        run: |
+          go build -ldflags "-X main.version=${VERSION}" -o /tmp/quarry-stamp .
+          got=$(/tmp/quarry-stamp version | awk '{print $2}')
+          if [ "$got" != "$VERSION" ]; then
+            echo "version stamp is '$got', want '$VERSION': -X did not reach main.version"
+            exit 1
+          fi
+
       - name: Build release artifacts
         env:
           VERSION: ${{ steps.version.outputs.VERSION }}

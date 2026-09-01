@@ -551,7 +551,13 @@ async function apiTag(method, body) {
       method, headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     });
-  } catch {
+  } catch (e) {
+    // Reported, not swallowed. The store is the one thing quarry writes, so a write
+    // that did not land has to say so: returning false alone left a delete or a rename
+    // that never reached the server indistinguishable from a click the UI ignored,
+    // while the same request failing with a 500 raised an alert.
+    console.error('tag palette edit failed', e);
+    reportTagError(null);
     return false;
   }
   const data = await res.json().catch(() => null);
@@ -952,7 +958,9 @@ function thumbContent(a) {
     // a page of a font pack would otherwise pull every one of them at card creation.
     lazyWork.when(el, () => {
       ensureFont(a, el).then((fam) => { el.style.fontFamily = `"${fam}", serif`; })
-        .catch(() => el.replaceWith(iconEl(a.category)));
+        // Falling back to the category icon is the right answer on screen, but silently
+        // it is indistinguishable from a font that simply has no preview.
+        .catch((e) => { console.warn('font preview failed', a.relPath, e); el.replaceWith(iconEl(a.category)); });
     });
     return el;
   }

@@ -9,12 +9,21 @@ import (
 
 // parseSidekick reads a Synty Sidekick character definition (.sk): a top-level
 // "Name:" naming the character and a top-level "Parts:" block of "- Name:" entries
-// naming the body-part meshes it assembles. Only the Parts block is collected — a
-// later top-level key (ColorSet, BlendShapes) ends it, so a "Name" nested under one
-// of those never leaks in. The format is YAML-shaped but shallow, so a line scanner
-// suffices and avoids a YAML dependency.
+// naming the body-part meshes it assembles. Only that block is collected, and only its
+// own items: a later top-level key (ColorSet, BlendShapes) ends the block, and an item
+// indented past the first one is inside a part rather than beside it. The format is
+// YAML-shaped but shallow, so a line scanner suffices and avoids a YAML dependency.
+//
+// Depth matters because a name that is not a part still has to resolve to a mesh. One
+// that does not leaves the character short of a part, which is not fatal on its own —
+// it is assembled from what did resolve — but it does mean the pack's byproducts are
+// no longer recognised as accounted for, so every character in it keeps its prefab, its
+// material and its combined mesh beside it in the grid.
 func parseSidekick(data []byte) (name string, parts []string) {
 	inParts := false
+	// The column the block's own items sit at, learned from the first one, since a .sk
+	// may be written with any indent. -1 while unknown.
+	itemCol := -1
 	for _, raw := range strings.Split(string(data), "\n") {
 		line := strings.TrimRight(raw, "\r")
 		if line == "" {
@@ -22,14 +31,20 @@ func parseSidekick(data []byte) (name string, parts []string) {
 		}
 		if c := line[0]; c == ' ' || c == '\t' || c == '-' {
 			if inParts {
-				if t := strings.TrimSpace(line); strings.HasPrefix(t, "- Name:") {
-					parts = append(parts, strings.TrimSpace(t[len("- Name:"):]))
+				if col := indentOf(line); strings.HasPrefix(line[col:], "- Name:") {
+					switch {
+					case itemCol < 0:
+						itemCol = col
+					case col > itemCol:
+						continue // nested under a part (a ColorSet entry, a blend shape)
+					}
+					parts = append(parts, strings.TrimSpace(line[col+len("- Name:"):]))
 				}
 			}
 			continue
 		}
 		// A top-level key ends any open Parts block, then may open a new one.
-		inParts = false
+		inParts, itemCol = false, -1
 		switch {
 		case name == "" && strings.HasPrefix(line, "Name:"):
 			name = strings.TrimSpace(line[len("Name:"):])
@@ -38,6 +53,18 @@ func parseSidekick(data []byte) (name string, parts []string) {
 		}
 	}
 	return name, parts
+}
+
+// indentOf is the byte offset of a line's first non-blank character. Tabs and spaces
+// each count as one, which is what YAML requires of a file that mixes them anyway: the
+// items of one block are written the same way as each other.
+func indentOf(line string) int {
+	for i := 0; i < len(line); i++ {
+		if line[i] != ' ' && line[i] != '\t' {
+			return i
+		}
+	}
+	return len(line)
 }
 
 // maxSidekickBytes bounds a .sk read. A character definition is a name and a short

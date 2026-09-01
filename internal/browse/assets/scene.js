@@ -297,8 +297,18 @@ function oneCharacter(root) {
   const dropped = new Set(drop);
   // A copy's bones can carry the kept character's below them, so lift those out before
   // unlinking, or removing a namesake takes the character with it.
+  //
+  // Lifted to the nearest ancestor that is itself staying. traverse is pre-order, so a
+  // dropped bone is visited before any dropped bone under it: re-parenting onto b.parent
+  // without this check can hand a kept bone to a bone that is removed a moment later,
+  // taking it along. keep.bones still holds it, so the bind succeeds and nothing errors
+  // — it is simply no longer reached by updateMatrixWorld, and whatever it drives freezes
+  // at a stale world matrix while the rest of the body animates.
   for (const b of drop) {
-    for (const child of b.children.slice()) if (!dropped.has(child)) b.parent.add(child);
+    let host = b.parent;
+    while (host && dropped.has(host)) host = host.parent;
+    if (!host) continue;
+    for (const child of b.children.slice()) if (!dropped.has(child)) host.add(child);
   }
   for (const b of drop) if (b.parent) b.parent.remove(b);
   root.traverse((n) => { if (n.isSkinnedMesh) n.bind(keep, n.bindMatrix); });
@@ -654,12 +664,22 @@ function rigEntry(item, root) {
 // as an animation itself — nothing in its name marks it as the rig — so a caller that
 // can rank what comes back asks for animations too; one that takes results in name
 // order must not, or a pack's hundreds of clips crowd out its single body.
+// Null, not [], when the search itself failed. The two are not the same answer: the
+// callers memoize a scope as searched, and recording that against a request that never
+// completed retires the scope for the session on the strength of a dropped connection.
 async function rigCandidates({ q, vendor, limit, types, sort }) {
   const p = new URLSearchParams({ limit: String(limit), q });
   for (const t of types) p.append('type', t);
   if (vendor) p.set('vendor', vendor);
   if (sort) p.set('sort', sort);
-  try { return (await (await fetch('/api/assets?' + p)).json()).items || []; } catch { return []; }
+  try {
+    const res = await fetch('/api/assets?' + p);
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    return (await res.json()).items || [];
+  } catch (e) {
+    console.warn('rig search failed', q, vendor || '', e);
+    return null;
+  }
 }
 
 // resolveRig finds a rig a clip can play on: the best registry match, the next one if
@@ -709,7 +729,7 @@ async function resolveRig(bones, asset, tryLoad, cancelled = () => false) {
 // heaviest file is often a .blend the preview cannot read at all.
 async function packRigs(pack, vendor, name) {
   const page = await rigCandidates({ q: pack, vendor, limit: 500, types: ['model', 'animation'], sort: 'size' });
-  return packRigCandidates(page, name);
+  return page && packRigCandidates(page, name);
 }
 
 // ---- character registry: match a clip-only animation to a rig it can play on ----
@@ -798,8 +818,15 @@ const CharRegistry = {
     if (!series) return;
     const scope = (asset.vendor || '') + '\x00' + series;
     if (this.namedTried.has(scope)) return;
+    // Recorded before the search so a second clip in the series does not repeat it, and
+    // taken back below if the search never completed: a dropped request is not evidence
+    // that this vendor names no body after its clips.
     this.namedTried.add(scope);
     const items = await rigCandidates({ q: series, vendor: asset.vendor, limit: 8, types: ['model'] });
+    if (!items) {
+      this.namedTried.delete(scope);
+      return;
+    }
     const named = items.filter((it) => nameSeries(it.name) === series);
     const pick = named.find((it) => it.pack === asset.pack) || named[0];
     if (pick) await this.register(pick);
@@ -814,14 +841,18 @@ const CharRegistry = {
     this.seeded = true;
     const terms = ['PolygonSyntyCharacter', 'Character', 'SK_Mannequin', '_Model', 'Base_Mesh', 'SM_Chr'];
     let added = 0;
+    let failed = false;
     for (const t of terms) {
       if (added >= 3) return;
-      try {
-        const r = await fetch('/api/assets?type=model&limit=4&q=' + encodeURIComponent(t));
-        const items = (await r.json()).items;
-        for (const it of items.slice(0, 2)) { if (await this.register(it)) added++; if (added >= 3) return; }
-      } catch { /* skip */ }
+      const items = await rigCandidates({ q: t, limit: 4, types: ['model'] });
+      if (!items) { failed = true; continue; }
+      for (const it of items.slice(0, 2)) { if (await this.register(it)) added++; if (added >= 3) return; }
     }
+    // Registered nothing and at least one search never completed. "Seeded" has to mean
+    // the question was asked, not that it was attempted: left set, a page that lost its
+    // connection for a moment gives every mesh-less clip the category icon for the rest
+    // of the session.
+    if (failed && added === 0) this.seeded = false;
   },
   // When the seed didn't cover a clip's rig, look for a body in the clip's own vendor
   // (a clip's native character usually ships in the same vendor's packs).
@@ -839,16 +870,27 @@ const CharRegistry = {
     const scope = vendor + '\u0000' + (pack || '');
     const tried = this.discovered.get(scope);
     if (tried && searchedSkeleton(tried, want)) return;
+    // Recorded before the search, because it is also what stops a second clip on this
+    // skeleton repeating fourteen model loads while the first is still running. Rolled
+    // back at the end if a search never completed: establishing that a pack ships no
+    // body is expensive and worth remembering, but only when it was actually
+    // established, and a failed request looks exactly like an empty result otherwise.
     this.discovered.set(scope, (tried || []).concat([want]));
+    const rollback = () => {
+      if (tried) this.discovered.set(scope, tried);
+      else this.discovered.delete(scope);
+    };
     // Load candidate bodies until one actually covers this clip (a single showcase mesh can
     // win by bone count yet be a multi-skeleton mesh register now rejects, and some bodies
     // ship a different skeleton family that shares no bone names). Stop at the first covering
     // rig; bound the loads so a vendor without a match doesn't scan the whole library.
     const seen = new Set(this.list().map((e) => e.id));
     let loaded = 0;
-    // Reports whether the search is over — either a rig now covers the clip, or the
-    // per-vendor load budget is spent.
+    let failed = false;
+    // Reports whether the search is over — either a rig now covers the clip, the
+    // per-vendor load budget is spent, or a search did not complete.
     const consider = async (items) => {
+      if (!items) { failed = true; return true; }
       for (const it of items) {
         if (loaded >= 14) return true;
         if (seen.has(it.id)) continue;
@@ -858,12 +900,16 @@ const CharRegistry = {
       }
       return false;
     };
-    // The pack shipping the clips usually ships what they animate, under whatever name
-    // its vendor happens to use — a name search cannot find it, but weight can.
-    if (pack && await consider(await packRigs(pack, vendor, name))) return;
-    for (const t of ['Character', 'Hero', 'Human', 'Knight', 'Warrior', 'Body', 'Model', 'Base']) {
-      if (await consider(await rigCandidates({ q: t, vendor, limit: 8, types: ['model'] }))) return;
-    }
+    const search = async () => {
+      // The pack shipping the clips usually ships what they animate, under whatever name
+      // its vendor happens to use — a name search cannot find it, but weight can.
+      if (pack && await consider(await packRigs(pack, vendor, name))) return;
+      for (const t of ['Character', 'Hero', 'Human', 'Knight', 'Warrior', 'Body', 'Model', 'Base']) {
+        if (await consider(await rigCandidates({ q: t, vendor, limit: 8, types: ['model'] }))) return;
+      }
+    };
+    await search();
+    if (failed) rollback();
   },
 };
 

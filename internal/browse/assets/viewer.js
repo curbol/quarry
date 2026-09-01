@@ -366,8 +366,10 @@ export function startViewer(container, asset, panels) {
     const run = async (q) => {
       const my = ++seq;
       if (!q) { items = suggestKnown(); active = -1; render(); return; }
+      // null is a search that failed rather than one that found nothing; the picker has
+      // nothing better to show either way, but it must not be handed a non-array.
       const found = await rigCandidates({ q, limit: 8, types: ['model', 'animation'] });
-      if (my === seq) { items = found; active = -1; render(); }
+      if (my === seq) { items = found || []; active = -1; render(); }
     };
     let t;
     input.addEventListener('input', () => { clearTimeout(t); t = setTimeout(() => run(input.value.trim()), 180); });

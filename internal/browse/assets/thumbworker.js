@@ -72,49 +72,61 @@ async function ensureRenderer() {
 const files = new Map(); // file path -> parsed+oriented file, reused across its split clips
 const rigs = new Map();  // matched character id -> loaded rig, cloned per clip
 
-function snap(object, box) {
+// snap draws one object into the shared canvas, or declines when the job asking for it
+// has been abandoned. current is threaded all the way down here rather than checked
+// only around build(), because the deadline stops a job from being *waited on* while
+// its work keeps running: every await below is a place an abandoned job can resume,
+// and the canvas, the camera and the two caches are the very things the queue exists
+// to give each job alone.
+function snap(object, box, current) {
+  if (!current()) return false;
   scene.add(object);
   frameBox(box, camera, null);
   renderer.render(scene, camera);
   scene.remove(object);
-}
-
-// build renders one thumbnail to the canvas and resolves true, or false when there is
-// nothing to draw (a mesh-less clip with no matching rig).
-async function build(asset) {
-  if (asset.thumb === 'sidekick') return await buildSidekick(asset);
-  const key = asset.source && asset.source.clip && asset.source.filePath;
-  return key ? await buildShared(asset, key) : await buildStandalone(asset);
-}
-
-async function buildSidekick(asset) {
-  const root = await loadSidekick(asset.source && asset.source.parts);
-  if (!root) return false;
-  const refBox = prepareClipRig(root, null);
-  snap(root, refBox);
-  dispose(root);
   return true;
 }
 
-async function buildStandalone(asset) {
+// build renders one thumbnail to the canvas and resolves true, or false when there is
+// nothing to draw (a mesh-less clip with no matching rig) or the job was abandoned.
+async function build(asset, current) {
+  if (asset.thumb === 'sidekick') return await buildSidekick(asset, current);
+  const key = asset.source && asset.source.clip && asset.source.filePath;
+  return key ? await buildShared(asset, key, current) : await buildStandalone(asset, current);
+}
+
+async function buildSidekick(asset, current) {
+  const root = await loadSidekick(asset.source && asset.source.parts);
+  if (!root) return false;
+  const refBox = prepareClipRig(root, null);
+  const ok = snap(root, refBox, current);
+  dispose(root);
+  return ok;
+}
+
+async function buildStandalone(asset, current) {
   const obj = await loadModel(contentURL(asset.id), asset.ext);
   const rootRest = captureRootRest(obj);
   if (isRenderable(obj)) {
     const cs = clipsForAsset(obj.animations, asset);
     const refBox = prepareClipRig(obj, null);
     if (cs.length) poseAt(obj, stripRootMotion(cs[0], rootBoneName(obj), obj.userData.upAxis));
-    snap(obj, refBox);
+    const ok = snap(obj, refBox, current);
     dispose(obj);
-    return true;
+    return ok;
   }
   const clips = clipsForAsset(obj.animations, asset);
   dispose(obj);
-  return clips.length ? await buildPosed(clips[0], asset, rootRest) : false;
+  return clips.length ? await buildPosed(clips[0], asset, rootRest, current) : false;
 }
 
-async function buildShared(asset, key) {
+async function buildShared(asset, key, current) {
   let pending = files.get(key);
   if (!pending) {
+    // Checked before the cache is touched, not only before the draw: evictFiles
+    // disposes the oldest entry outright, and an abandoned job seeding a new one can
+    // push out the file the running job is holding.
+    if (!current()) return false;
     pending = loadSharedFile(asset);
     files.set(key, pending);
     evictFiles();
@@ -124,12 +136,12 @@ async function buildShared(asset, key) {
   if (ctx.renderable) {
     const cs = clipsForAsset(ctx.obj.animations, asset);
     const mixer = cs.length ? poseAt(ctx.obj, stripRootMotion(cs[0], ctx.rootBoneName, ctx.upAxis)) : null;
-    snap(ctx.obj, ctx.refBox);
+    const ok = snap(ctx.obj, ctx.refBox, current);
     if (mixer) mixer.stopAllAction();
-    return true;
+    return ok;
   }
   const cs = clipsForAsset(ctx.obj.animations, asset);
-  return cs.length ? await buildPosed(cs[0], asset, ctx.rootRest) : false;
+  return cs.length ? await buildPosed(cs[0], asset, ctx.rootRest, current) : false;
 }
 
 async function loadSharedFile(asset) {
@@ -157,7 +169,8 @@ function evictFiles() {
 // is bounded like the file cache above. The template owns what it holds (a clone
 // shares it), so an evicted one is disposed outright rather than as a clone. Jobs are
 // serialized and each disposes its clone before returning, so nothing evicted here is
-// still on screen.
+// still on screen — which holds only because an abandoned job, the one thing that does
+// run alongside another, is stopped from reaching rigs.set below.
 function evictRigs() {
   const CAP = 4;
   while (rigs.size > CAP) {
@@ -173,8 +186,11 @@ function evictRigs() {
 // entries are cached across page loads, so a re-index leaves stale ids behind, and
 // remembering the failure instead would make every clip thumbnail for that vendor fail
 // for the rest of the session.
-async function rigFor(clip, asset) {
+async function rigFor(clip, asset, current) {
   return resolveRig(clipBones(clip), asset, async (m) => {
+    // An abandoned job stops loading candidates rather than working through the
+    // remaining thirteen, and above all stops writing to the template cache.
+    if (!current()) return null;
     const cached = rigs.get(m.id);
     if (cached) return cached;
     // A candidate that will not load is not a failure of this thumbnail — rig
@@ -183,26 +199,31 @@ async function rigFor(clip, asset) {
     const rig = await loadModel(contentURL(m.id), m.ext)
       .then((r) => (isRenderable(r) ? alignBindToRest(oneCharacter(r)) : (dispose(r), null)))
       .catch((e) => { console.warn('rig candidate failed to load', m.id, m.name, e); return null; });
-    if (rig) {
-      rigs.set(m.id, rig);
-      evictRigs();
+    if (!rig) return null;
+    if (!current()) {
+      // Loaded after the job was abandoned: caching it would evict a template the
+      // running job may already have cloned, and a clone shares what it holds.
+      dispose(rig);
+      return null;
     }
+    rigs.set(m.id, rig);
+    evictRigs();
     return rig;
   });
 }
 
-async function buildPosed(clip, asset, rootRest) {
+async function buildPosed(clip, asset, rootRest, current) {
   const vendor = asset.vendor;
-  const template = await rigFor(clip, asset);
+  const template = await rigFor(clip, asset, current);
   if (!template) return false;
   const rig = hideAlternates(cloneRig(template));
   const refBox = prepareClipRig(rig, isSynty(vendor) ? null : rootRest);
   const posed = stripRootMotion(await retargetedFor(clip, vendor, rig), rootBoneName(rig), rig.userData.upAxis);
   const mixer = poseAt(rig, posed);
-  snap(rig, refBox);
+  const ok = snap(rig, refBox, current);
   mixer.stopAllAction();
   disposeClone(rig);
-  return true;
+  return ok;
 }
 
 // downscale turns a source image into a grid-sized PNG. createImageBitmap resizes
@@ -305,14 +326,14 @@ self.onmessage = (e) => {
       // would wedge this single queue and leave every card behind it spinning.
       const ok = await withTimeout((async () => {
         await ensureRenderer();
-        // Re-checked after every await, because a deadline only stops this job from
-        // being waited on — the work itself keeps running, and everything below it
-        // touches the one canvas, camera and rig cache the queue exists to give each
-        // job alone. An abandoned job that reaches snap() renders into the canvas the
-        // next one is about to encode, and its model is then cached under that card's
-        // id for the rest of the page.
+        // Re-checked here and threaded into build, because a deadline only stops this
+        // job from being waited on — the work itself keeps running, and everything
+        // below it touches the one canvas, camera and two caches the queue exists to
+        // give each job alone. Bracketing build() alone left every await inside it
+        // unguarded: an abandoned job reaching snap() renders into the canvas the next
+        // one is about to encode, and its model is then cached under that card's id.
         if (!current()) return null;
-        if (!(await build(asset))) return null;
+        if (!(await build(asset, current))) return null;
         if (!current()) return null;
         return canvas.convertToBlob({ type: 'image/png' });
       })());

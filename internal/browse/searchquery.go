@@ -29,6 +29,13 @@ const maxQueryDepth = 32
 func parseQuery(s string) *searchQuery {
 	if len(s) > maxQueryBytes {
 		s = s[:maxQueryBytes]
+		// Back to a rune boundary. The cut is by byte, and []rune turns a trailing
+		// partial one into U+FFFD, which no asset name contains — so the last term
+		// matches nothing and the implicit AND makes the whole query return nothing.
+		// Truncation is meant to narrow the query, not answer it.
+		for len(s) > 0 && !utf8.ValidString(s) {
+			s = s[:len(s)-1]
+		}
 	}
 	toks := dropUnmatchedClose(tokenize(s))
 	if len(toks) == 0 {

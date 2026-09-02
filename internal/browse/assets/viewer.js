@@ -478,7 +478,13 @@ export function startViewer(container, asset, panels) {
       if (!root) { showPlaceholder('Could not assemble this character.'); return; }
     } else {
       try { root = await loadModel(contentURL(asset.id), asset.ext); }
-      catch { showPlaceholder('Could not load this model.'); return; }
+      catch (e) {
+        // The placeholder says something is wrong; only the console can say whether it
+        // was the fetch or the parse.
+        console.warn('model failed to load', asset.id, e);
+        showPlaceholder('Could not load this model.');
+        return;
+      }
     }
     if (stopped) { dispose(root); return; }
     const cs = clipsForAsset(root.animations, asset);

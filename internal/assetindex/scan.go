@@ -110,6 +110,7 @@ func walkLibrary(absRoot string, follow bool) ([]libEntry, []SkippedFile, []stri
 	w := &walker{root: absRoot, follow: follow, visited: map[string]bool{}}
 	w.visited[start] = true
 	err := w.tree(start, "")
+	w.dropCoveredLinks()
 	return w.entries, w.skipped, w.linkRoots, err
 }
 
@@ -122,6 +123,9 @@ type walker struct {
 	entries   []libEntry
 	skipped   []SkippedFile
 	linkRoots []string
+	// linked records the file symlinks this walk indexed, so the decision can be
+	// re-made once every directory link has been followed. See dropCoveredLinks.
+	linked []linkedFile
 	// visited holds the resolved roots of the walks already made, so a link back into
 	// a tree already covered — or into one covering it — terminates instead of
 	// looping. A link is refused by containment (see covered); an ordinary descent
@@ -134,6 +138,57 @@ type walker struct {
 
 func (w *walker) skip(rel string, err error) {
 	w.skipped = append(w.skipped, SkippedFile{RelPath: rel, Reason: err.Error()})
+}
+
+// linkedFile is one file symlink the walk followed, with the positions of the entry it
+// produced and the link root it authorised so both can be withdrawn together.
+type linkedFile struct {
+	entry  int
+	root   int
+	rel    string
+	target string
+}
+
+// dropCoveredLinks withdraws the file symlinks whose targets another walk turned out
+// to cover, or that two links pointed at alike. Whether a link duplicates something is
+// only fully decided once every directory link has been followed: a "latest" alias
+// inside a drive is normally listed before the link that brings that drive into the
+// library, so the walk covering its target has not happened yet when the alias is
+// reached, and the check the directory branch makes against visited would pass. Left
+// in, the same bytes come back twice, once under the alias and once under the real
+// name, as two cards the grid shows side by side.
+//
+// The link root goes with the entry, since it was widening what Open accepts for a
+// file nothing indexes any more.
+func (w *walker) dropCoveredLinks() {
+	dropEntry, dropRoot := map[int]bool{}, map[int]bool{}
+	claimed := map[string]bool{}
+	for _, lf := range w.linked {
+		switch {
+		case w.covered(lf.target):
+		case claimed[lf.target]:
+		default:
+			claimed[lf.target] = true
+			continue
+		}
+		dropEntry[lf.entry], dropRoot[lf.root] = true, true
+		w.skip(lf.rel, fmt.Errorf("symlink to %s, which this scan has already walked", lf.target))
+	}
+	if len(dropEntry) == 0 {
+		return
+	}
+	w.entries = compact(w.entries, dropEntry)
+	w.linkRoots = compact(w.linkRoots, dropRoot)
+}
+
+func compact[T any](s []T, drop map[int]bool) []T {
+	out := s[:0]
+	for i, v := range s {
+		if !drop[i] {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 // covered reports a directory some earlier walk already reached. Exact equality is
@@ -267,15 +322,26 @@ func (w *walker) symlink(p, r string) error {
 		w.skip(r, err)
 		return nil
 	}
-	if !info.IsDir() {
-		// The resolved file authorises itself and nothing else in its directory.
-		// Without this Open refuses the very asset the scan just indexed.
-		w.linkRoots = append(w.linkRoots, target)
-		w.file(p, r, filepath.Base(p), info)
-		return nil
-	}
+	// A target some earlier walk already reached is a duplicate whichever kind it is:
+	// the same bytes come back a second time under the link's name, as a second card
+	// the grid shows beside the first. For a directory that is a whole tree; for a file
+	// it is the ordinary "latest" alias sitting inside a drive this scan already
+	// follows, which is why the file case cannot skip this check on its way past.
 	if w.covered(target) {
 		w.skip(r, fmt.Errorf("symlink to %s, which this scan has already walked", target))
+		return nil
+	}
+	if !info.IsDir() {
+		// The resolved file authorises itself and nothing else in its directory.
+		// Without this Open refuses the very asset the scan just indexed. Recorded only
+		// when the file actually became an entry, so a symlinked sidecar does not widen
+		// what Open accepts for nothing.
+		before := len(w.entries)
+		w.file(p, r, filepath.Base(p), info)
+		if len(w.entries) > before {
+			w.linked = append(w.linked, linkedFile{entry: before, root: len(w.linkRoots), rel: r, target: target})
+			w.linkRoots = append(w.linkRoots, target)
+		}
 		return nil
 	}
 	w.visited[target] = true

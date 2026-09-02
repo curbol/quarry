@@ -150,9 +150,15 @@ func TestPairingPairsAcrossDirectoriesOnWindows(t *testing.T) {
 	}
 }
 
-// The same-directory preference is a tie-break between candidates, so it has to read
-// a real directory. Taking every loose asset's directory as the same empty string made
-// it fire for every candidate at once, leaving the pick to whichever RM came first.
+// The same-directory preference is a tie-break between candidates, so it has to read a
+// real directory on a host whose separator is not the one archive entries use.
+//
+// It pins the directory term discriminating two candidates over Windows loose paths,
+// and nothing more: splitting a loose path on "/" instead does not fail here, because
+// the un-split directory then moves into the file base and lands the two characters in
+// different groups, where they never compete. That regression belongs to
+// TestPairingPairsAcrossDirectoriesOnWindows, where the polluted base splits a real
+// pair across groups and pairing stops altogether.
 func TestPickRMPrefersTheSameDirectoryOnWindows(t *testing.T) {
 	windowsPaths(t)
 	at := func(id string, parts ...string) assetindex.Asset {
@@ -320,5 +326,42 @@ func TestPickRMStillPairsAcrossDirectoriesWhenThatIsAllThereIs(t *testing.T) {
 	}
 	if !suppressed["walkRM"] {
 		t.Error("walkRM was not suppressed")
+	}
+}
+
+// The directory outranks the archive, and every other case here has the two agreeing
+// or one of them constant across candidates — so a pickRM that consulted the archive
+// first left the whole suite green while inverting the rule. The same-archive candidate
+// is listed first so a first-match implementation fails too.
+func TestPickRMRanksDirectoryAboveArchive(t *testing.T) {
+	sibling, _ := buildRootMotionPairs([]assetindex.Asset{
+		zipAnim("walk", "synty", "P", "/a.zip", "Anims/Walk.fbx"),
+		zipAnim("same-archive-other-dir", "synty", "P", "/a.zip", "RootMotion/Walk_RM.fbx"),
+		zipAnim("other-archive-same-dir", "synty", "P", "/b.zip", "Anims/Walk_RM.fbx"),
+	})
+	if got := sibling["walk"]; got != "other-archive-same-dir" {
+		t.Errorf("walk paired with %q, want other-archive-same-dir: the directory outranks the archive", got)
+	}
+}
+
+// A group whose in-place assets are ragged — some directories shipping their own RM,
+// one not — used to hand the odd one out a neighbour's, because the weighting has no
+// floor and a candidate matching on nothing still scored above the initial -1. A whole
+// FBX card carries no clip name, so the frontend matches every clip in that file and
+// plays another character's travel animation on this one's body.
+func TestARaggedGroupLeavesTheOddCardUnpaired(t *testing.T) {
+	sibling, suppressed := buildRootMotionPairs([]assetindex.Asset{
+		zipAnim("goblin", "synty", "P", "/p.zip", "Anims/Goblin/Walk.fbx"),
+		zipAnim("goblinRM", "synty", "P", "/p.zip", "Anims/Goblin/Walk_RM.fbx"),
+		zipAnim("orc", "synty", "P", "/p.zip", "Anims/Orc/Walk.fbx"),
+	})
+	if got := sibling["goblin"]; got != "goblinRM" {
+		t.Errorf("goblin paired with %q, want goblinRM", got)
+	}
+	if got, ok := sibling["orc"]; ok {
+		t.Errorf("orc paired with %q; its own directory ships no RM, so it has none", got)
+	}
+	if !suppressed["goblinRM"] {
+		t.Error("goblinRM was not suppressed by the card that does play it")
 	}
 }

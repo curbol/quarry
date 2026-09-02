@@ -1,9 +1,8 @@
-import { contentURL, thumbURL } from '/static/scene.js';
+import { contentURL, thumbURL } from '/static/charstore.js';
 import { lazyWork, modelThumbs, forgetThumbs, ensureFont } from '/static/thumbs.js';
 import { LIVE, wantedRange, visibleRange, needsRebuild, spacerRows, windowDelta } from '/static/gridwindow.js';
 import { iconEl, protoClone } from '/static/icons.js';
 import { nextTags } from '/static/tagedit.js';
-import { startViewer } from '/static/viewer.js';
 
 const PAGE = 200;
 
@@ -66,9 +65,12 @@ let inflight = null;
 async function fetchPage() {
   if (state.done) return;
   if (state.loading) return inflight;
-  const run = loadPage();
-  inflight = run.finally(() => { if (inflight === run) inflight = null; });
-  return inflight;
+  // finally() returns a new promise, so the chain has to be built before it is stored:
+  // assigning run.finally(...) and then comparing against run inside the callback
+  // compares against something inflight never held, and the latch is never released.
+  const run = loadPage().finally(() => { if (inflight === run) inflight = null; });
+  inflight = run;
+  return run;
 }
 
 async function loadPage() {
@@ -97,6 +99,7 @@ async function loadPage() {
     els.empty.hidden = state.total !== 0;
     state.failed = false;
     els.error.hidden = true;
+    reanchorLightbox();
   } catch (e) {
     // Everything that consumes the response is inside the try, not just the fetch: a
     // body that parses but is missing a field would otherwise throw with the loading
@@ -1087,6 +1090,7 @@ const lb = {
   prev: document.getElementById('lb-prev'),
   next: document.getElementById('lb-next'),
   index: -1,
+  asset: null,
 };
 let activeViewer = null;
 
@@ -1098,11 +1102,58 @@ let lbGen = 0;
 // navigation resumes where it left off instead of at the top of the document.
 let lbReturnFocus = null;
 
+// lbInert tracks whether the page behind the lightbox is already inert, so arrowing
+// between assets — which re-runs openLightbox — does not overwrite lbReturnFocus with
+// a control inside the dialog.
+let lbInert = false;
+
+// setPageInert makes everything except the lightbox unreachable, by keyboard and to
+// assistive tech alike. Read off document.body each time rather than captured once:
+// the load and tag error paragraphs are siblings of the grid and are shown and hidden
+// independently of it.
+function setPageInert(on) {
+  for (const el of document.body.children) {
+    if (el !== lb.root) el.inert = on;
+  }
+  lbInert = on;
+}
+
 // updateLbNav enables/disables the prev/next arrows for the current position in the
 // loaded result set. Next stays enabled at the tail while more pages can still load.
 function updateLbNav() {
   lb.prev.disabled = lb.index <= 0;
   lb.next.disabled = lb.index < 0 || (lb.index >= state.items.length - 1 && state.done);
+}
+
+// startViewerFor loads the 3D viewer on first use. viewer.js pulls in three, both
+// loaders and OrbitControls, and a module body runs only once its whole graph has been
+// fetched and instantiated — so importing it at the top of this file put all of that in
+// front of the very first /api/assets request, for a page whose first screen is a grid
+// of icons and spinners. Nothing else here needs three at all.
+//
+// The import is awaited, so the same generation check the rest of openLightbox uses has
+// to cover the assignment: arrowing on before it resolves would otherwise leave a viewer
+// running for the previous asset with nothing holding it to stop.
+async function startViewerFor(a, gen) {
+  const { startViewer } = await import('/static/viewer.js');
+  if (gen !== lbGen) return;
+  activeViewer = startViewer(lb.view, a, { character: lb.character });
+}
+
+// reanchorLightbox re-finds the open lightbox's asset in a result set that has been
+// rebuilt under it. lb.index is a position into state.items, and reset() empties that
+// list without closing the lightbox — editing a tag from inside the lightbox does
+// exactly that whenever a tag filter is on, since the edit changes which cards match.
+// Left alone the index points into the old set, so the next arrow press opens an
+// unrelated asset and the arrows' disabled state describes a list that is gone.
+//
+// Not finding it is the right answer when the edit removed the asset from the filtered
+// set: navLightbox bails on a negative index and updateLbNav disables both arrows, so
+// the arrows go dead rather than stepping somewhere arbitrary.
+function reanchorLightbox() {
+  if (lb.root.hidden || !lb.asset) return;
+  lb.index = state.items.findIndex((x) => x.id === lb.asset.id);
+  updateLbNav();
 }
 
 // navLightbox steps to an adjacent asset in the filtered result set, loading the next
@@ -1125,6 +1176,9 @@ function openLightbox(a) {
   // while it is up would edit this card's tags under the next card's name.
   closeTagMenu();
   const gen = ++lbGen;
+  // Kept as well as the index, because the index is a position into a list a tag edit
+  // can rebuild while this stays open. See reanchorLightbox.
+  lb.asset = a;
   lb.index = state.items.indexOf(a);
   updateLbNav();
   lb.name.textContent = a.name;
@@ -1168,7 +1222,7 @@ function openLightbox(a) {
 
   lb.view.replaceChildren();
   if (a.thumb === 'glb' || a.thumb === 'fbx' || a.thumb === 'sidekick') {
-    activeViewer = startViewer(lb.view, a, { character: lb.character });
+    startViewerFor(a, gen);
   } else if (bitmap) {
     // The expanded view shows the full-resolution image, not the small Unity
     // preview.png a unitypackage entry may also carry; fall back to that preview,
@@ -1191,8 +1245,14 @@ function openLightbox(a) {
   // Cards are focusable and open on Enter, so a card left focused behind the modal
   // would re-open the lightbox on every Enter — building a second viewer each time —
   // and Tab would walk the grid underneath.
-  if (!els.grid.inert) lbReturnFocus = document.activeElement;
-  els.grid.inert = true;
+  //
+  // Everything outside the dialog, not the grid alone: the header sits before the grid
+  // in document order, so Tab off the last control in the lightbox lands in the search
+  // box and then walks the filter buttons, all of them behind the backdrop and none of
+  // them showing a focus ring. Typing there re-runs the query under an open lightbox.
+  // aria-modal says the rest of the page is inert, so it has to be.
+  if (!lbInert) lbReturnFocus = document.activeElement;
+  setPageInert(true);
   document.getElementById('lb-close').focus();
 }
 
@@ -1365,6 +1425,11 @@ function relatedThumb(it) {
 
 function closeLightbox() {
   lb.root.hidden = true;
+  // Closing retires the generation the way opening the next asset does. Everything
+  // async the panel started checks it before touching anything, and startViewerFor is
+  // the one that must not land afterwards: the viewer it would assign owns a render
+  // loop and a WebGL scene, into a lightbox nothing is going to close again.
+  lbGen++;
   // Anchored to a control inside the lightbox, so without this it is left floating
   // over the grid with nothing to dismiss it but a stray click.
   closeTagMenu();
@@ -1377,9 +1442,11 @@ function closeLightbox() {
   lb.character.replaceChildren();
   lb.related.replaceChildren();
   lb.related.hidden = true;
-  // The grid was made inert on open so Enter could not re-trigger the card behind the
+  lb.index = -1;
+  lb.asset = null;
+  // The page was made inert on open so Enter could not re-trigger the card behind the
   // modal; hand focus back to where it came from.
-  els.grid.inert = false;
+  setPageInert(false);
   if (lbReturnFocus && lbReturnFocus.isConnected) lbReturnFocus.focus();
   lbReturnFocus = null;
 }

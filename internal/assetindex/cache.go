@@ -69,11 +69,13 @@ type Index struct {
 
 	// extractMu guards all three maps. extractions single-flights one archive's unpack;
 	// archiveMus holds each archive's reader/rebuild lock (see archiveMu); rebuilt
-	// records the extractions a torn member has already been repaired for.
+	// records the extractions a torn member has already been repaired for, each entry
+	// a channel closed once that repair has finished, so readers that did not win the
+	// claim can wait for it instead of answering for it.
 	extractMu   sync.Mutex
 	extractions map[string]*extraction
 	archiveMus  map[string]*sync.RWMutex
-	rebuilt     map[string]bool
+	rebuilt     map[string]chan struct{}
 
 	zips zipReaders
 }

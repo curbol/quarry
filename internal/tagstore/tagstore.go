@@ -364,17 +364,6 @@ func (s *Store) FingerprintsByTag() map[string][]string {
 	return m
 }
 
-// Counts returns the number of fingerprints each tag is applied to.
-func (s *Store) Counts() map[string]int {
-	m := map[string]int{}
-	for _, set := range s.assign {
-		for id := range set {
-			m[id]++
-		}
-	}
-	return m
-}
-
 // Tags returns the palette sorted by id.
 func (s *Store) Tags() []TagDef {
 	out := make([]TagDef, 0, len(s.colors))

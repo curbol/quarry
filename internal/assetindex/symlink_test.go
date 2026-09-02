@@ -322,6 +322,60 @@ func TestFollowedFileSymlinkIsServable(t *testing.T) {
 	}
 }
 
+// The file-link version of the overlap below, and the one the directory check did not
+// cover: a "latest" alias resolving into a tree this scan also follows is a second card
+// for the same bytes, under the alias's name. Only the directory branch consulted
+// covered, so the file branch walked straight past it.
+//
+// Both orders, because they are caught by different halves. A drive link listed first is
+// already in visited when the alias is reached. An alias listed first is not covered by
+// anything yet — the walk that will cover it has not happened — so the decision can only
+// be re-made once the walk is over, which is what dropCoveredLinks is for.
+func TestAFileLinkIntoAFollowedTreeIsNotIndexedTwice(t *testing.T) {
+	for _, tc := range []struct{ name, alias, drive string }{
+		{"drive link first", "zz-Latest.glb", "aa-drive"},
+		{"alias first", "aa-Latest.glb", "zz-drive"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			outside := t.TempDir()
+			real := filepath.Join(outside, "v3", "Sword.glb")
+			writeFile(t, real, "GLBBYTES")
+
+			root, mk := libRoot(t)
+			// Siblings in one directory, so the walk's lexical order is the case name.
+			if err := os.Symlink(real, mk("lib", tc.alias)); err != nil {
+				t.Skipf("symlinks unavailable: %v", err)
+			}
+			if err := os.Symlink(outside, mk("lib", tc.drive)); err != nil {
+				t.Skipf("symlinks unavailable: %v", err)
+			}
+
+			ix, err := Build(Options{Root: root, CacheDir: t.TempDir(), FollowSymlinks: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(ix.Assets) != 1 || ix.Assets[0].Name != "Sword.glb" {
+				t.Errorf("assets = %v, want Sword.glb once, by its real name", names(ix.Assets))
+			}
+			// The alias authorised its target for serving and the drive link already
+			// covers it. Left behind, every Open pays for the extra root.
+			for _, lr := range ix.LinkRoots {
+				if lr == real {
+					t.Errorf("link roots %v still carry the withdrawn alias's target", ix.LinkRoots)
+				}
+			}
+			if len(ix.Skipped) != 1 {
+				t.Errorf("skipped = %v, want the dropped alias reported", ix.Skipped)
+			}
+			rc, _, err := ix.Open(ix.Assets[0])
+			if err != nil {
+				t.Fatalf("Open: %v — the surviving card must still serve", err)
+			}
+			rc.Close()
+		})
+	}
+}
+
 // Two links into overlapping trees (a drive, and a pack inside it) reach the nested
 // tree twice. The link to the inner tree is refused when the outer one was followed
 // first, and the inner tree is pruned from the outer walk when it was not — either

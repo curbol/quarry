@@ -1,7 +1,20 @@
+// Guard tests accumulated from audits. Two rules they are written to, both learned
+// from guards that had quietly stopped checking anything:
+//
+// A guard over a value it does not own derives that value rather than restating it. A
+// restated copy narrows the guard to whatever someone remembered to add to the copy,
+// and it must also assert its own parsing found something, so a format change fails
+// loudly rather than matching nothing.
+//
+// A guard over a constant straddles it: two inputs either side of it that land on
+// different answers, then an assertion that the constant lies between them. Written
+// well clear of it, a test pins only the direction and leaves the value free to drift.
+
 package browse
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,6 +23,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -344,9 +358,10 @@ func TestEveryWriteEndpointRefusesWhenTaggingIsDisabled(t *testing.T) {
 // re-pointed at 127.0.0.1 is same-origin with quarry — no preflight, and it can read
 // every response. The Host header is what still carries the attacker's domain.
 func TestHostGuardRejectsARebindingHost(t *testing.T) {
+	bound := &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 8788}
 	guarded := guardHost(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-	}))
+	}), bound)
 	srv := httptest.NewServer(guarded)
 	t.Cleanup(srv.Close)
 
@@ -369,6 +384,9 @@ func TestHostGuardRejectsARebindingHost(t *testing.T) {
 		{"evil.example.:8788", http.StatusForbidden},
 		{"quarry.attacker.test", http.StatusForbidden},
 		{"192.168.1.9:8788", http.StatusForbidden},
+		// Not this listener's address: 127.0.0.2 is loopback, but a request naming it
+		// did not reach a server bound to 127.0.0.1 by dialling it.
+		{"127.0.0.2:8788", http.StatusForbidden},
 	} {
 		req, err := http.NewRequest(http.MethodGet, srv.URL, nil)
 		if err != nil {
@@ -384,6 +402,47 @@ func TestHostGuardRejectsARebindingHost(t *testing.T) {
 		resp.Body.Close()
 		if resp.StatusCode != tc.want {
 			t.Errorf("Host %q = %d, want %d", tc.host, resp.StatusCode, tc.want)
+		}
+	}
+}
+
+// isLoopback accepts all of 127.0.0.0/8 while loopbackHosts lists only 127.0.0.1, so a
+// server bound anywhere else in that range installed the guard and then refused the
+// address it was bound to — including the URL quarry prints and hands to the browser,
+// which 403'd on every request with nothing working and no rebinding to defend against.
+func TestHostGuardAcceptsTheAddressItIsBoundTo(t *testing.T) {
+	bound := &net.TCPAddr{IP: net.IPv4(127, 0, 0, 2), Port: 8788}
+	guarded := guardHost(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}), bound)
+	srv := httptest.NewServer(guarded)
+	t.Cleanup(srv.Close)
+
+	for _, tc := range []struct {
+		host string
+		want int
+	}{
+		{"127.0.0.2:8788", http.StatusOK},
+		{"127.0.0.2", http.StatusOK},
+		// The standard names stay admissible, and a rebound one stays refused: the
+		// listener's own address is added to the set, not substituted for it.
+		{"localhost:8788", http.StatusOK},
+		{"127.0.0.1:8788", http.StatusOK},
+		{"evil.example:8788", http.StatusForbidden},
+		{"127.0.0.3:8788", http.StatusForbidden},
+	} {
+		req, err := http.NewRequest(http.MethodGet, srv.URL, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Host = tc.host
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != tc.want {
+			t.Errorf("Host %q on a listener bound to %s = %d, want %d", tc.host, bound, resp.StatusCode, tc.want)
 		}
 	}
 }
@@ -930,33 +989,59 @@ func TestIsLoopbackDecidesTheHostGuard(t *testing.T) {
 	}
 }
 
-// The end of the same wire, through Serve itself: a loopback listener refuses a
+// The end of the same wire, through the production path: a loopback listener refuses a
 // rebound Host, and a routable one — which --addr is an explicit request for — serves
-// the machines that have their own names for this one.
+// the machines that have their own names for this one, and says so.
+//
+// serveOn, not a listener of this test's own with the branch repeated on it. Repeating
+// it asserted against a copy: replacing the condition in Serve with `if false` left the
+// whole suite green, because nothing else drove Serve at all. The same held for the
+// warning, which the invariant names ("the routable branch made silent") and which no
+// test could observe while it went straight to os.Stderr.
 func TestServeAppliesTheHostGuardOnlyOnLoopback(t *testing.T) {
 	for _, c := range []struct {
 		name, addr string
 		wantStatus int
+		wantWarn   bool
 	}{
-		{"loopback refuses a rebound host", "127.0.0.1:0", http.StatusForbidden},
-		{"routable serves it", "0.0.0.0:0", http.StatusOK},
+		{"loopback refuses a rebound host, silently", "127.0.0.1:0", http.StatusForbidden, false},
+		{"routable serves it, and warns", "127.0.0.1:0", http.StatusOK, true},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			ln, err := net.Listen("tcp", c.addr)
 			if err != nil {
 				t.Skipf("cannot listen on %s here: %v", c.addr, err)
 			}
-			s, err := newServer(&assetindex.Index{}, tagstore.New(), "")
+			// A routable bind needs an interface this machine may not have and a port a
+			// sandbox may not open, so the routable branch is reached by handing serveOn a
+			// loopback listener that reports a routable address. isLoopback reads Addr()
+			// and nothing else, which is the invariant ("isLoopback is the only thing
+			// deciding which branch runs") stated as a fixture.
+			var addr net.Listener = ln
+			if c.wantWarn {
+				addr = routableAddr{ln}
+			}
+			ix := &assetindex.Index{Root: "/library"}
+			s, err := newServer(ix, tagstore.New(), "")
 			if err != nil {
 				t.Fatal(err)
 			}
-			h := s.handler()
-			if isLoopback(ln.Addr()) {
-				h = guardHost(h)
-			}
-			srv := &http.Server{Handler: h}
-			go srv.Serve(ln)
-			t.Cleanup(func() { srv.Close() })
+			var out, warn bytes.Buffer
+			opened := make(chan string, 1)
+			// Not the real opener: the listener is closed as soon as this test returns,
+			// so a browser launched here arrives at a dead ephemeral port — a window in
+			// the developer's face reporting a connection failure, on every run of the
+			// suite.
+			env := serveEnv{out: &out, warn: &warn, open: func(u string) { opened <- u }}
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan error, 1)
+			go func() { done <- s.serveOn(ctx, addr, ix, "", env) }()
+			t.Cleanup(func() {
+				cancel()
+				if err := <-done; err != nil {
+					t.Errorf("serveOn: %v", err)
+				}
+			})
 
 			req, err := http.NewRequest("GET", "http://"+ln.Addr().String()+"/api/assets", nil)
 			if err != nil {
@@ -969,10 +1054,34 @@ func TestServeAppliesTheHostGuardOnlyOnLoopback(t *testing.T) {
 			}
 			defer resp.Body.Close()
 			if resp.StatusCode != c.wantStatus {
-				t.Errorf("Host: evil.example on %s = %d, want %d", ln.Addr(), resp.StatusCode, c.wantStatus)
+				t.Errorf("Host: evil.example on %s = %d, want %d", addr.Addr(), resp.StatusCode, c.wantStatus)
+			}
+			if got := warn.Len() > 0; got != c.wantWarn {
+				t.Errorf("warned = %v, want %v (warning was %q)", got, c.wantWarn, warn.String())
+			}
+			if c.wantWarn && !strings.Contains(warn.String(), ix.Root) {
+				t.Errorf("the warning does not name the scan root it is exposing: %q", warn.String())
+			}
+			// Whatever quarry prints has to be the address it also hands the browser, or
+			// the one URL it opens is the one thing that does not work.
+			select {
+			case got := <-opened:
+				if !strings.Contains(out.String(), got) {
+					t.Errorf("opened %q, but printed %q", got, out.String())
+				}
+			default:
+				t.Error("serveOn did not open the browser at all")
 			}
 		})
 	}
+}
+
+// routableAddr reports a routable address for a listener that is really on loopback,
+// so the branch --addr takes for other machines is reachable without one.
+type routableAddr struct{ net.Listener }
+
+func (r routableAddr) Addr() net.Addr {
+	return &net.TCPAddr{IP: net.IPv4(192, 168, 1, 9), Port: r.Listener.Addr().(*net.TCPAddr).Port}
 }
 
 // A tag's palette count sits in the same slot as the vendor and category facet counts,
@@ -1186,5 +1295,169 @@ func TestTheAdvertisedURLIsOneABrowserCanOpen(t *testing.T) {
 				t.Errorf("browsableHost(%s) = %q, want %q", c.addr, got, c.want)
 			}
 		})
+	}
+}
+
+// frontendImports returns the module specifiers one asset file imports, separated
+// because the two mean different things here: a static import is on the importer's own
+// critical path, a dynamic one is fetched when it is first used. Relative and /static/
+// specifiers come back resolved to a path under assets/; anything else — a bare "three",
+// the import map's "three/addons/" prefix — comes back as written, for the caller to
+// resolve through the map.
+func frontendImports(t *testing.T, file string) (static, dynamic []string) {
+	t.Helper()
+	b, err := assetsFS.ReadFile("assets/" + file)
+	if err != nil {
+		t.Fatalf("assets/%s is not embedded: %v", file, err)
+	}
+	resolve := func(spec string) string {
+		switch {
+		case strings.HasPrefix(spec, "/static/"):
+			return strings.TrimPrefix(spec, "/static/")
+		case strings.HasPrefix(spec, "./"):
+			return path.Join(path.Dir(file), strings.TrimPrefix(spec, "./"))
+		}
+		return spec
+	}
+	// Multiline: a module's imports are one per line and none of them is the first. An
+	// empty result is legitimate — the five Node-tested modules import nothing at all —
+	// so the callers assert that the files which do import parsed.
+	for _, m := range regexp.MustCompile(`(?m)^import[^;]*?from\s+'([^']+)'`).FindAllStringSubmatch(string(b), -1) {
+		static = append(static, resolve(m[1]))
+	}
+	for _, m := range regexp.MustCompile(`\bimport\(\s*'([^']+)'`).FindAllStringSubmatch(string(b), -1) {
+		dynamic = append(dynamic, resolve(m[1]))
+	}
+	return static, dynamic
+}
+
+// importMap is index.html's map, as {specifier or prefix: path under assets/}.
+func importMap(t *testing.T) map[string]string {
+	t.Helper()
+	index, err := assetsFS.ReadFile("assets/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := map[string]string{}
+	for _, g := range regexp.MustCompile(`"([^"]+)"\s*:\s*"/static/([^"]+)"`).FindAllStringSubmatch(string(index), -1) {
+		m[g[1]] = g[2]
+	}
+	if len(m) == 0 {
+		t.Fatal("index.html's import map did not parse; this guard has stopped checking anything")
+	}
+	return m
+}
+
+// mapSpec resolves a bare specifier through the import map, longest prefix first, and
+// reports whether the map covers it at all.
+func mapSpec(m map[string]string, spec string) (string, bool) {
+	if target, ok := m[spec]; ok {
+		return target, true
+	}
+	best := ""
+	for name := range m {
+		if strings.HasSuffix(name, "/") && strings.HasPrefix(spec, name) && len(name) > len(best) {
+			best = name
+		}
+	}
+	if best == "" {
+		return "", false
+	}
+	return m[best] + strings.TrimPrefix(spec, best), true
+}
+
+// There is no bundler, so a module specifier is resolved by the browser against this
+// server and a wrong one is a blank page with one console line. Nothing in the Go tests
+// fetches /static/, and the Node tests load only the modules that import nothing, so a
+// renamed or unembedded file is invisible until someone opens the UI.
+//
+// The import map is checked alongside so the pair cannot drift: scene.js reaches three
+// by absolute path precisely because a worker has no import map, and it has to be the
+// same file the map names or the page loads two three instances.
+func TestEveryFrontendImportResolvesToAnEmbeddedFile(t *testing.T) {
+	entries, err := assetsFS.ReadDir("assets")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var modules []string
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".js") {
+			modules = append(modules, e.Name())
+		}
+	}
+	if len(modules) == 0 {
+		t.Fatal("no .js files embedded; this guard has stopped checking anything")
+	}
+	m := importMap(t)
+
+	checked := 0
+	for _, file := range modules {
+		static, dynamic := frontendImports(t, file)
+		for _, spec := range append(append([]string{}, static...), dynamic...) {
+			checked++
+			resolved := spec
+			if !strings.Contains(spec, "/") || !strings.HasSuffix(spec, ".js") || !exists(resolved) {
+				if target, ok := mapSpec(m, spec); ok {
+					resolved = target
+				}
+			}
+			if !exists(resolved) {
+				t.Errorf("%s imports %q, which resolves to assets/%s and is not embedded", file, spec, resolved)
+			}
+		}
+	}
+	// Enough of them, or a regex that stopped matching passes this vacuously. The five
+	// import-free modules are the exception, held by their own invariant.
+	if checked < len(modules) {
+		t.Errorf("parsed %d imports across %d modules; this guard has stopped reading them", checked, len(modules))
+	}
+
+	// The map's own targets have to exist too, or viewer.js's bare "three" resolves to
+	// nothing while every absolute-path importer keeps working.
+	for name, target := range m {
+		p := strings.TrimSuffix(target, "/")
+		if !exists(p) {
+			if _, err := assetsFS.ReadDir("assets/" + p); err != nil {
+				t.Errorf("index.html maps %q to /static/%s, which is not embedded", name, target)
+			}
+		}
+	}
+}
+
+func exists(p string) bool {
+	_, err := assetsFS.ReadFile("assets/" + p)
+	return err == nil
+}
+
+// app.js draws a grid of icons and spinners and needs three for none of it. Statically
+// importing scene.js or viewer.js puts three, both loaders and OrbitControls in front of
+// the first /api/assets request, because a module body runs only once its whole graph has
+// been fetched and instantiated — and the regression is invisible, since the page still
+// works and is merely slower to show anything.
+func TestTheGridDoesNotLoadThreeToRenderItself(t *testing.T) {
+	seen := map[string]bool{}
+	var walk func(string)
+	walk = func(file string) {
+		if seen[file] {
+			return
+		}
+		seen[file] = true
+		static, _ := frontendImports(t, file) // dynamic imports are the point, so not followed
+		for _, spec := range static {
+			if exists(spec) {
+				walk(spec)
+				continue
+			}
+			t.Errorf("app.js statically reaches %q, via %s: the grid's first paint waits on it", spec, file)
+		}
+	}
+	walk("app.js")
+	if len(seen) < 2 {
+		t.Fatal("app.js's import graph came out empty; this guard has stopped reading it")
+	}
+	for _, banned := range []string{"scene.js", "viewer.js", "thumbworker.js"} {
+		if seen[banned] {
+			t.Errorf("%s is in app.js's static import graph; import it dynamically where it is used", banned)
+		}
 	}
 }

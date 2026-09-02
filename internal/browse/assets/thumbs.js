@@ -7,7 +7,8 @@
 // Nothing here knows about cards, queries or the lightbox. It takes an element and an
 // asset descriptor and fills the element in when the element is worth filling.
 
-import { contentURL, CharRegistry } from '/static/scene.js';
+import { contentURL, CharRegistry } from '/static/charstore.js';
+import { ThumbCache } from '/static/thumbcache.js';
 
 // ---- fonts ----
 
@@ -66,16 +67,6 @@ function evictFonts() {
 
 // ---- lazy 3D thumbnails: one shared renderer, sequential queue, cached ----
 
-// THUMB_CACHE_MAX is how many rendered thumbnails stay resident. Each is a PNG blob
-// the browser keeps alive until its object URL is revoked, so this is a memory bound,
-// not a hit-rate tuning knob: a few screenfuls in either scroll direction.
-const THUMB_CACHE_MAX = 400;
-
-// NO_RENDER_MAX bounds the memo of assets with nothing to draw. Entries are ids
-// rather than blobs, so this can be far larger than the thumbnail cache, but it still
-// must not grow to one per asset in the library.
-const NO_RENDER_MAX = 5000;
-
 // lazyWork defers per-card work (a thumbnail render, a font download) until the card
 // is near the viewport. An IntersectionObserver holds its targets and a card that
 // never scrolled into view is never unobserved, so every caller dropping a node must
@@ -110,21 +101,15 @@ lazyWork.init();
 // thread. No parsing or WebGL happens here, so a large model never blocks the UI.
 class ModelThumbnails {
   constructor() {
-    // Rendered thumbnails are blobs the browser holds until their URL is revoked, so
-    // the cache is bounded: a session that scrolls a 150k-asset library would
-    // otherwise accumulate every PNG it ever drew. Insertion order is eviction order,
-    // refreshed on each hit.
-    this.cache = new Map();   // asset.id -> object URL (a rendered blob)
-    this.pending = new Map(); // asset.id -> { holders, seq } awaiting one render
-    // Assets the worker has already answered "nothing to draw" for. Bounded like the
-    // cache: a settled answer is worth remembering, but not for every asset in a
-    // 150k-item library at once.
-    this.noRender = new Set();
+    // What is resident, what is in flight, and what has already been answered "nothing
+    // to draw" — all of it in thumbcache.js, which is checked by the Node tests. This
+    // class is what a browser is needed for: the observer, the object URLs, the decode,
+    // and the worker.
+    this.jobs = new ThumbCache();
     // Holders showing the category icon because nothing was drawn for them. They are
-    // no longer observed — that is the point of settling — so clearing noRender alone
+    // no longer observed — that is the point of settling — so clearing the memo alone
     // would never reach them again. See reseed.
     this.settled = new Set();
-    this.seq = 0;
     this.watch();
     this.dead = false;
     this.worker = new Worker('/static/thumbworker.js', { type: 'module' });
@@ -146,7 +131,7 @@ class ModelThumbnails {
   // keeps the category icon it was given before the user answered the question.
   reseed() {
     if (this.dead) return;
-    this.noRender.clear();
+    this.jobs.clearNoRender();
     // Forgetting the answer is not enough to ask the question again. Both places that
     // settle "nothing to draw" stop observing the holder, so the cards this exists for
     // — the ones on screen when the user picked the body — would keep their category
@@ -186,13 +171,10 @@ class ModelThumbnails {
     if (this.dead) return;
     this.dead = true;
     console.error('thumbnail worker stopped; 3D previews in the grid are unavailable', message || '');
-    for (const { holders } of this.pending.values()) {
-      for (const holder of holders) {
-        if (holder.isConnected) holder.classList.remove('loading');
-        this.vis.unobserve(holder);
-      }
+    for (const holder of this.jobs.drainPending()) {
+      if (holder.isConnected) holder.classList.remove('loading');
+      this.vis.unobserve(holder);
     }
-    this.pending.clear();
     this.vis.disconnect();
   }
   // forget lets go of one card the grid is dropping: the render queued for it is
@@ -205,47 +187,27 @@ class ModelThumbnails {
   }
   cancel(holder) {
     const asset = holder._asset;
-    const p = asset && this.pending.get(asset.id);
-    if (!p || !p.holders.has(holder)) return;
-    p.holders.delete(holder);
+    if (!asset) return;
+    const wanted = this.jobs.release(asset.id, holder);
     holder.classList.remove('loading');
-    // Still wanted while another card on screen shows the same asset: cancelling on
-    // the first one to scroll away would leave the rest spinning for a render nobody
-    // is going to ask for again.
-    if (p.holders.size) return;
-    this.pending.delete(asset.id);
-    this.worker.postMessage({ type: 'cancel', id: asset.id });
+    if (wanted) this.worker.postMessage({ type: 'cancel', id: asset.id });
   }
   request(holder) {
     const asset = holder._asset;
     if (this.dead) return;
-    // A settled "nothing to draw" outlives the card that learned it. The grid rebuilds
-    // its live window every few dozen rows, and re-asking costs the worker the whole
-    // rig discovery again — up to fourteen model downloads to re-establish that no rig
-    // in this vendor fits.
-    if (this.noRender.has(asset.id)) {
+    const next = this.jobs.route(asset.id, holder);
+    if (next.kind === 'settled') {
       holder.classList.remove('loading');
       this.settle(holder);
       return;
     }
-    const cached = this.cache.get(asset.id);
-    if (cached) { this.touch(asset.id); this.swap(holder, cached); return; }
+    if (next.kind === 'cached') { this.swap(holder, next.url); return; }
     holder.classList.add('loading');
-    // One asset can be on screen twice — a grid card, and the same asset in the
-    // lightbox's "parts of this set" strip — and one render answers both. Joining the
-    // request already in flight is what keeps the second holder from sitting on its
-    // category icon until it happens to scroll back into view.
-    const inFlight = this.pending.get(asset.id);
-    if (inFlight) { inFlight.holders.add(holder); return; }
-    // Each request carries a sequence number the worker echoes back, so a result for a
-    // request that was since cancelled and re-made is recognisable as stale. Matching on
-    // the id alone let a superseded job's result land on the current card's entry.
-    const seq = ++this.seq;
-    this.pending.set(asset.id, { holders: new Set([holder]), seq });
+    if (next.kind === 'joined') return;
     // Only the fields the worker's build needs — DTOs aren't structured-clone-friendly wholesale.
     this.worker.postMessage({
       id: asset.id,
-      seq,
+      seq: next.seq,
       asset: {
         id: asset.id, name: asset.name, ext: asset.ext, vendor: asset.vendor, pack: asset.pack, thumb: asset.thumb,
         source: {
@@ -257,42 +219,22 @@ class ModelThumbnails {
       },
     });
   }
-  touch(id) {
-    const url = this.cache.get(id);
-    this.cache.delete(id);
-    this.cache.set(id, url);
-  }
-  remember(id, url) {
-    // Replacing an entry revokes what it held: overwriting the key would leave the old
-    // URL alive with nothing tracking it, outside the cache bound entirely.
-    const prev = this.cache.get(id);
-    if (prev && prev !== url) URL.revokeObjectURL(prev);
-    this.cache.set(id, url);
-    while (this.cache.size > THUMB_CACHE_MAX) {
-      const oldest = this.cache.keys().next().value;
-      URL.revokeObjectURL(this.cache.get(oldest));
-      this.cache.delete(oldest);
-    }
-  }
   onResult({ id, seq, blob }) {
-    const p = this.pending.get(id);
-    // Stale: this request was cancelled, or superseded by a later one whose result is
-    // the one to use. Dropping it before the object URL exists is what keeps a
-    // displaced URL from escaping the cache bound unrevoked.
-    if (!p || p.seq !== seq) return;
-    this.pending.delete(id);
+    // Claimed before any object URL exists, which is what keeps a displaced URL from
+    // escaping the cache bound unrevoked when the result turns out to be stale.
+    const holders = this.jobs.claim(id, seq);
+    if (!holders) return;
     if (blob) {
       const url = URL.createObjectURL(blob);
-      this.remember(id, url);
-      for (const holder of p.holders) {
+      // The cache decides which URLs are no longer reachable; releasing them is this
+      // side's job, since it is the side that minted them.
+      for (const stale of this.jobs.remember(id, url)) URL.revokeObjectURL(stale);
+      for (const holder of holders) {
         if (holder.isConnected) this.swap(holder, url);
       }
     } else {
-      this.noRender.add(id);
-      while (this.noRender.size > NO_RENDER_MAX) {
-        this.noRender.delete(this.noRender.values().next().value);
-      }
-      for (const holder of p.holders) {
+      this.jobs.markNoRender(id);
+      for (const holder of holders) {
         if (!holder.isConnected) continue;
         holder.classList.remove('loading'); // no render (failed / mesh-less with no rig)
         // Settled: there is nothing to draw for this asset, so stop watching rather than

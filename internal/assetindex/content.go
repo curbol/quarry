@@ -90,9 +90,22 @@ func (ix *Index) openUnpacked(a Asset, member string, want int64) (io.ReadCloser
 	// disagreement after one means the cause was never the tree, so retrying would
 	// spend that cost on every request for the rest of the run — and each discard
 	// deletes the tree this archive's healthy members are being served from.
-	if !ix.claimRebuild(fp) {
-		return nil, 0, tornError(a, member, n, want)
+	//
+	// "After" is the whole of that argument, and a crash tears the tail of an
+	// extraction rather than one member of it: safewrite.Stream does not fsync, so the
+	// members still buffered when the machine stopped all come back short together, and
+	// a grid load asks for several of them at once. A caller that did not win the claim
+	// is simultaneous with the winner, not after it, and its member is about to be
+	// restored — so it waits for that repair and reads again, and reports only if the
+	// bytes are still wrong once the tree has been rebuilt.
+	done, won := ix.claimRebuild(fp)
+	if !won {
+		<-done
+		return ix.reopenRepaired(a, member, want)
 	}
+	// Closed on every exit below, so a waiter is never left blocked on a repair that
+	// returned early.
+	defer close(done)
 	if err := ix.discardExtraction(a.Source.ArchivePath); err != nil {
 		// The claim is spent on a repair that happened. A discard that failed — a full
 		// or read-only cache dir, an EIO on a network mount — repaired nothing, and
@@ -101,7 +114,16 @@ func (ix *Index) openUnpacked(a Asset, member string, want int64) (io.ReadCloser
 		ix.releaseRebuild(fp)
 		return nil, 0, err
 	}
-	rc, n, err = ix.openUnpackedMember(a, member)
+	return ix.reopenRepaired(a, member, want)
+}
+
+// reopenRepaired re-reads a member once the repair of its extraction has finished,
+// whether this caller performed it or waited for someone else's. Only a member still
+// short after the tree has been rebuilt is evidence of anything: answering on the
+// strength of the read that triggered the repair would fail a request for bytes the
+// repair had already restored.
+func (ix *Index) reopenRepaired(a Asset, member string, want int64) (io.ReadCloser, int64, error) {
+	rc, n, err := ix.openUnpackedMember(a, member)
 	if err == nil && tornMember(n, want) {
 		rc.Close()
 		return nil, 0, tornError(a, member, n, want)
@@ -130,19 +152,24 @@ func tornError(a Asset, member string, n, want int64) error {
 	return fmt.Errorf("extracted %s is %d bytes, want %d", a.RelPath, n, want)
 }
 
-// claimRebuild reports whether this caller should rebuild the extraction named by fp,
-// claiming it so no later one repeats the work. See openUnpacked for why it is once.
-func (ix *Index) claimRebuild(fp string) bool {
+// claimRebuild claims the rebuild of the extraction named by fp for this caller, so no
+// other one repeats the work; won is false when someone else holds the claim, and done
+// is then the channel that claimant closes once its repair has finished. A claim taken
+// and finished earlier in the run hands back a channel that is already closed, so a
+// later disagreement costs one more open rather than a second full decompress. See
+// openUnpacked for why the repair is once and why the losers wait rather than report.
+func (ix *Index) claimRebuild(fp string) (done chan struct{}, won bool) {
 	ix.extractMu.Lock()
 	defer ix.extractMu.Unlock()
-	if ix.rebuilt[fp] {
-		return false
+	if d, taken := ix.rebuilt[fp]; taken {
+		return d, false
 	}
 	if ix.rebuilt == nil {
-		ix.rebuilt = map[string]bool{}
+		ix.rebuilt = map[string]chan struct{}{}
 	}
-	ix.rebuilt[fp] = true
-	return true
+	d := make(chan struct{})
+	ix.rebuilt[fp] = d
+	return d, true
 }
 
 // releaseRebuild gives the claim back when the repair it was taken for did not happen.

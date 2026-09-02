@@ -17,7 +17,8 @@ Scope: $ARGUMENTS
 - **No arguments:** review every `.go` file under `internal/` and at the repo root
   (`main.go`, `main_test.go`), the embedded frontend in `internal/browse/assets/`
   (`app.js`, `viewer.js`, `scene.js`, `thumbs.js`, `thumbworker.js`, `gridwindow.js`,
-  `jobtracker.js`, `rigmatch.js`, `tagedit.js`, `cliptrim.js`, `icons.js`, `index.html`,
+  `jobtracker.js`, `rigmatch.js`, `tagedit.js`, `cliptrim.js`, `thumbcache.js`,
+  `charstore.js`, `icons.js`, `index.html`,
   `style.css`), the Node tests in `internal/browse/jstest/`, `install.sh`,
   `config.example.toml`, and `.github/workflows/ci.yml` and `release.yml`.
 - **With scope:** interpret the user's wording to identify which packages, frontend
@@ -54,8 +55,9 @@ node --test 'internal/browse/jstest/*.test.mjs'  # needs node on PATH; nothing i
 The whole suite runs in seconds and is fully offline: browse tests run against
 `net/http/httptest` servers over indexes built in temp dirs, selfupdate against a stub
 release server, and nothing touches the network or a real asset library. The Node tests
-cover only the five THREE-free frontend modules (`gridwindow.js`, `jobtracker.js`,
-`rigmatch.js`, `tagedit.js`, `cliptrim.js`); every other frontend module (`app.js`,
+cover only the seven THREE-free frontend modules (`gridwindow.js`, `jobtracker.js`,
+`rigmatch.js`, `tagedit.js`, `cliptrim.js`, `thumbcache.js`, `charstore.js`); every
+other frontend module (`app.js`,
 `viewer.js`, `scene.js`, `thumbs.js`, `thumbworker.js`) has no test at all, so a green
 run says nothing about them. There is no Makefile, task runner, or linter config in the
 repo: `go vet` and `gofmt` are the only static analysis, so nothing decides Go style
@@ -100,7 +102,7 @@ agents run in parallel:
   load, the stale-file guard, `Discover`.
 - **Frontend**: `internal/browse/assets/app.js`, `viewer.js`, `scene.js`, `thumbs.js`,
   `thumbworker.js`, `gridwindow.js`, `jobtracker.js`, `rigmatch.js`, `tagedit.js`,
-  `cliptrim.js`, `icons.js`, `index.html`, `style.css`, and
+  `cliptrim.js`, `thumbcache.js`, `charstore.js`, `icons.js`, `index.html`, `style.css`, and
   `internal/browse/jstest/*.test.mjs`. Grid recycling, bounded caches, the lightbox's
   shared WebGL context, worker job dispatch, rig matching, clip retargeting, and
   deciding where a padded clip actually stops. No build step and no bundler: modules
@@ -242,11 +244,20 @@ each package's doc comment restates its own share.
   *Violation:* a per-file error aborting the build, or a bad root degrading to an empty
   index. Equally: a derivation that failed must not be cached, since the stat print
   describes the file, not whether reading it worked.
-- **The five Node-tested frontend modules import nothing.** `gridwindow.js`,
-  `jobtracker.js`, `rigmatch.js`, `tagedit.js`, and `cliptrim.js` are THREE-free and
-  dependency-free precisely so `node --test` can load them with no browser and nothing
-  installed. *Violation:* any `import` added to one of them. *Check:* `grep -n '^import'`
-  over the five files returns nothing.
+- **The Node-tested frontend modules stay loadable with nothing installed.**
+  `gridwindow.js`, `jobtracker.js`, `rigmatch.js`, `tagedit.js`, `cliptrim.js` and
+  `thumbcache.js` are THREE-free and import nothing at all; `charstore.js` is THREE-free
+  and imports only `./rigmatch.js`, relatively, which is what lets `node --test` resolve
+  it. *Violation:* any `import` added to the six, or an absolute `/static/` import added
+  to `charstore.js`. *Check:* `grep -n '^import'` over the six returns nothing.
+- **`app.js`'s static import graph reaches no three.js.** The grid's first paint waits on
+  the whole graph, and it needs three for none of it: `contentURL` / `thumbURL` and the
+  character registry come from `charstore.js`, and `viewer.js` is loaded with a dynamic
+  `import()` inside `openLightbox`. *Violation:* a static import of `scene.js`,
+  `viewer.js` or `thumbworker.js` anywhere reachable from `app.js`. *Check:*
+  `TestTheGridDoesNotLoadThreeToRenderItself` and
+  `TestEveryFrontendImportResolvesToAnEmbeddedFile` in `internal/browse/audit_test.go`
+  pin this and the import map alongside it.
 - **The release labels agree in three places.** `.github/workflows/release.yml` builds a
   fixed list of `goos/goarch/label` triples and publishes `quarry-<version>-<label>.zip`;
   `selfupdate.releaseSuffix` names the asset `quarry update` asks for; `install.sh`
@@ -387,9 +398,12 @@ each package's doc comment restates its own share.
 - Grid arithmetic (`gridwindow.js`): `wantedRange`, `visibleRange`, `needsRebuild`, and
   `spacerRows` over `LIVE` cards. A subtly wrong rebuild condition is invisible in the
   UI and merely rebuilds every row instead of every few hundred. Tier 2.
-- Job dispatch (`jobtracker.js`): the per-request sequence number is what makes "the same
-  asset, asked for again" distinct from "this exact request". Confirm a stale result
-  cannot displace an object URL a visible image is still using. Tier 1/2.
+- Job dispatch (`jobtracker.js`, `thumbcache.js`): the per-request sequence number is what
+  makes "the same asset, asked for again" distinct from "this exact request". Confirm a
+  stale result cannot displace an object URL a visible image is still using, and that
+  every URL `ThumbCache.remember` stops pointing at comes back to the caller to revoke —
+  the cache never revokes, so a returned URL that is dropped is a leak outside the bound.
+  Tier 1/2.
 - Edge cases: an empty library, a zero-asset pack, a corrupt archive mid-scan, an archive
   entry with a `..` path, a GLB whose JSON chunk is truncated, a `.sk` naming a part that
   is not present, a symlink cycle, a config.toml with an unknown key. Tier 1 if it
@@ -546,7 +560,7 @@ each package's doc comment restates its own share.
 **Test quality (assess each suite as a whole, not test by test)**
 
 Go tests use the standard library `testing` package with table-driven cases and
-`httptest` servers, with no testify. Frontend tests use Node's own runner over the five
+`httptest` servers, with no testify. Frontend tests use Node's own runner over the seven
 THREE-free modules, with no `package.json` and nothing installed; do not propose growing
 that into a general frontend harness. Each of `assetindex`, `browse`, and `selfupdate`
 also carries an `audit_test.go` of guard tests from earlier audits; a new invariant
@@ -594,10 +608,11 @@ No linter runs over the frontend, so nothing else decides these.
 - An `await` in a loop over a result page where the work is independent. Tier 3.
 - Module boundaries: `app.js` owns the page, `viewer.js` is the only three.js consumer on
   the main thread, `scene.js` is what the worker and the viewer share, and
-  `gridwindow.js` / `jobtracker.js` / `rigmatch.js` / `tagedit.js` / `cliptrim.js` are the
-  pure decisions below all of it. A three.js import appearing outside `viewer.js`,
-  `scene.js`, and `thumbworker.js` is a boundary erosion; any import at all in one of the
-  five pure modules breaks `node --test`. Tier 2.
+  `gridwindow.js` / `jobtracker.js` / `rigmatch.js` / `tagedit.js` / `cliptrim.js` /
+  `thumbcache.js` / `charstore.js` are the pure decisions below all of it. A three.js
+  import appearing outside `viewer.js`, `scene.js`, and `thumbworker.js` is a boundary
+  erosion; any import at all in one of the six import-free modules breaks `node --test`,
+  as does an absolute `/static/` one in `charstore.js`. Tier 2.
 
 **Cross-boundary consistency (flag here, synthesized in Step 4)**
 

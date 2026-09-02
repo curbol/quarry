@@ -276,4 +276,22 @@ func TestOverlongQueryIsTruncatedNotWidened(t *testing.T) {
 	if q.match(&rock) {
 		t.Error("an overlong query matched an unrelated asset")
 	}
+
+	// The cut is by byte and the tokenizer works in runes, so a multi-byte script puts
+	// the boundary inside a character two times in three: at 3 bytes a rune, 4096 lands
+	// one byte into the 1366th. []rune turns the stray byte into U+FFFD, which nothing
+	// in the library contains, so the truncated term matches nothing at all — where a
+	// clean cut leaves a prefix that still does. Narrowing, not answering.
+	long := strings.Repeat("刀", maxQueryBytes)
+	blade := assetindex.Asset{Name: long, Pack: "Weapons", RelPath: "w/blade.fbx"}
+	q = parseQuery(long)
+	if q == nil {
+		t.Fatal("an overlong non-ASCII query compiled to nil")
+	}
+	if !q.match(&blade) {
+		t.Error("a query truncated mid-rune matches nothing, so the whole grid comes back empty")
+	}
+	if q.match(&rock) {
+		t.Error("an overlong non-ASCII query matched an unrelated asset")
+	}
 }

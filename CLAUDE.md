@@ -22,9 +22,11 @@ gofmt -l .                      # list unformatted files
 ```
 
 The frontend's pure decisions — the grid's card recycling, the thumbnail worker's job
-dispatch, matching a mesh-less clip to a rig, folding a tag edit into a card, and
-deciding where a padded clip actually stops — are checked separately, because a mistake
-in any of them leaves the UI working and merely slow or subtly wrong:
+dispatch, which renders stay resident and which object URLs that releases, what the
+preview-character registry holds, matching a mesh-less clip to a rig, folding a tag edit
+into a card, and deciding where a padded clip actually stops — are checked separately,
+because a mistake in any of them leaves the UI working and merely slow, leaking, or
+subtly wrong:
 
 ```bash
 node --test 'internal/browse/jstest/*.test.mjs'
@@ -67,12 +69,16 @@ packages, each with a package doc comment stating its contract:
   bytes and thumbnails (three.js 3D previews, copy-path). Its frontend is plain ES
   modules under `assets/`, no build step: `app.js` is the page (grid, search, filters,
   tagging), `viewer.js` the lightbox's 3D preview and the only three.js consumer on the
-  page, `thumbs.js` the three caches a scroll has to keep bounded (rendered thumbnails,
-  registered fonts, deferred per-card work), `scene.js` the model/clip helpers the page
-  shares with `thumbworker.js`, and `gridwindow.js` / `jobtracker.js` / `rigmatch.js` /
-  `tagedit.js` / `cliptrim.js` the pure decisions the Node tests cover — all five
-  THREE-free precisely so they can be. `includeRelated=1` folds
-  each tag match's linked companions into results; `/api/link` and `/api/related`
+  main thread, `thumbs.js` the three caches a scroll has to keep bounded (rendered
+  thumbnails, registered fonts, deferred per-card work), `scene.js` the model/clip
+  helpers the page shares with `thumbworker.js`, and `gridwindow.js` / `jobtracker.js` /
+  `rigmatch.js` / `tagedit.js` / `cliptrim.js` / `thumbcache.js` / `charstore.js` the
+  pure decisions the Node tests cover — all seven THREE-free precisely so they can be,
+  and the first five import nothing at all. `app.js`'s static import graph reaches none
+  of the 3D stack: it takes `contentURL` / `thumbURL` and the character registry from
+  `charstore.js`, and loads `viewer.js` with a dynamic `import()` when a lightbox first
+  needs one, so the grid's first request does not wait on three.js. `includeRelated=1`
+  folds each tag match's linked companions into results; `/api/link` and `/api/related`
   write and resolve links. It also pairs each in-place animation with its root-motion
   (`_RM`) sibling (`pairing.go`): the in-place card carries `rootMotionId` and the RM
   card is hidden, so the preview's toggle can play the travel variant.

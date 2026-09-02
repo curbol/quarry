@@ -127,6 +127,11 @@ func newServer(ix *assetindex.Index, store *tagstore.Store, tagsPath string) (*s
 // loopbackHosts are the Host values a browser sends for a server bound to loopback.
 // Anything else reaching a loopback listener arrived by a name that resolves here,
 // which is the DNS-rebinding shape.
+//
+// Not the whole set on its own: isLoopback accepts all of 127.0.0.0/8, so guardHost is
+// also given the address the listener actually bound to. Without that, --addr
+// 127.0.0.2 installs the guard and then refuses the very URL quarry prints and opens,
+// where the Host is the bound address itself and there is nothing to protect against.
 var loopbackHosts = map[string]bool{
 	"localhost": true, "127.0.0.1": true, "::1": true, "[::1]": true,
 }
@@ -141,7 +146,14 @@ var loopbackHosts = map[string]bool{
 //
 // Only applied when the listener is on loopback: --addr on a routable interface is a
 // deliberate choice to serve other machines, which have their own names for this one.
-func guardHost(h http.Handler) http.Handler {
+func guardHost(h http.Handler, bound net.Addr) http.Handler {
+	// The listener's own address, which is a loopback one on every path that reaches
+	// here — that is what selected this branch — so admitting it cannot widen the guard
+	// onto a routable interface.
+	self := ""
+	if ta, ok := bound.(*net.TCPAddr); ok && !ta.IP.IsUnspecified() {
+		self = strings.ToLower(ta.IP.String())
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Browsers send a lowercase host without the trailing dot, but a hand-typed
 		// curl or an FQDN written "localhost." does not, and a 403 there reads as a bug
@@ -153,7 +165,7 @@ func guardHost(h http.Handler) http.Handler {
 			host = h
 		}
 		host = strings.TrimSuffix(host, ".")
-		if !loopbackHosts[host] {
+		if !loopbackHosts[host] && (self == "" || host != self) {
 			http.Error(w, "unexpected Host header", http.StatusForbidden)
 			return
 		}
@@ -219,27 +231,47 @@ func Serve(ctx context.Context, addr string, ix *assetindex.Index, tagsPath stri
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", addr, err)
 	}
+	return s.serveOn(ctx, ln, ix, tagsPath, serveEnv{out: os.Stdout, warn: os.Stderr, open: openBrowser})
+}
+
+// serveEnv is everything serveOn does outside the listener: where it reports, and what
+// it hands the URL to. Passed in rather than defaulted, so a test driving the real
+// wiring has to say what opening the browser means — a package-level default is
+// something a new test can forget, and forgetting it launches a real browser at an
+// ephemeral port the test is about to close.
+type serveEnv struct {
+	out  io.Writer
+	warn io.Writer
+	open func(url string)
+}
+
+// serveOn is the whole of Serve past the listener, split out so a test can drive the
+// real wiring. Which branch the Host guard takes, and the warning the other branch
+// prints, are decisions about a bound listener, and a test that opens its own listener
+// and repeats the decision is asserting against a copy of this rather than against it:
+// deleting either from here would leave such a test green.
+func (s *server) serveOn(ctx context.Context, ln net.Listener, ix *assetindex.Index, tagsPath string, env serveEnv) error {
 	h := s.handler()
 	if isLoopback(ln.Addr()) {
-		h = guardHost(h)
+		h = guardHost(h, ln.Addr())
 	} else {
 		// Deliberate, and the guard steps aside for it — but stepping aside silently is
 		// what makes it easy to leave on. There is no authentication anywhere here, so
 		// anyone who can reach this port can read any file under the scan root, and curl
 		// is not bound by the preflight the JSON content-type forces, so they can write
 		// the tag store too.
-		fmt.Fprintf(os.Stderr, "warning: %s is reachable from other machines, and quarry has no authentication:\n"+
+		fmt.Fprintf(env.warn, "warning: %s is reachable from other machines, and quarry has no authentication:\n"+
 			"  anyone who can reach it can read every file under %s and edit your tags.\n", ln.Addr(), ix.Root)
 	}
 	srv := &http.Server{Handler: h}
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(ln) }()
 	addrURL := "http://" + browsableHost(ln.Addr())
-	fmt.Printf("browse %d assets at %s  (Ctrl-C to stop)\n", len(ix.Assets), addrURL)
+	fmt.Fprintf(env.out, "browse %d assets at %s  (Ctrl-C to stop)\n", len(ix.Assets), addrURL)
 	if s.tagsEnabled {
-		fmt.Printf("tags: %s\n", tagsPath)
+		fmt.Fprintf(env.out, "tags: %s\n", tagsPath)
 	}
-	openBrowser(addrURL)
+	env.open(addrURL)
 
 	// Serving can stop on its own — the listener dies, the port is pulled away. Waiting
 	// only on ctx there would leave quarry sitting silently on a URL that answers
@@ -248,7 +280,7 @@ func Serve(ctx context.Context, addr string, ix *assetindex.Index, tagsPath stri
 	case <-ctx.Done():
 	case err := <-serveErr:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			return fmt.Errorf("serve %s: %w", addr, err)
+			return fmt.Errorf("serve %s: %w", ln.Addr(), err)
 		}
 		return nil
 	}

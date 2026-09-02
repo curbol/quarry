@@ -15,7 +15,7 @@ func TestLoadMissingIsEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(s.Tags()) != 0 || len(s.Counts()) != 0 {
+	if len(s.Tags()) != 0 || len(s.FingerprintsByTag()) != 0 {
 		t.Errorf("missing file should load empty, got %d tags", len(s.Tags()))
 	}
 }
@@ -43,8 +43,8 @@ func TestDefineAssignRoundTrip(t *testing.T) {
 	if !reflect.DeepEqual(got.TagsFor("crc32:abc:10"), []string{"hero", "wip"}) {
 		t.Errorf("tags for crc32:abc:10 = %v", got.TagsFor("crc32:abc:10"))
 	}
-	if got.Counts()["hero"] != 2 {
-		t.Errorf("hero count = %d, want 2", got.Counts()["hero"])
+	if n := len(got.FingerprintsByTag()["hero"]); n != 2 {
+		t.Errorf("hero is on %d fingerprints, want 2", n)
 	}
 }
 
@@ -110,8 +110,8 @@ func TestRenameOntoExistingMerges(t *testing.T) {
 	if c, _ := s.color("b"); c != "#bbbbbb" {
 		t.Errorf("merge should keep target color, got %q", c)
 	}
-	if s.Counts()["b"] != 2 {
-		t.Errorf("b count = %d, want 2", s.Counts()["b"])
+	if n := len(s.FingerprintsByTag()["b"]); n != 2 {
+		t.Errorf("b is on %d fingerprints, want 2", n)
 	}
 }
 
@@ -673,6 +673,48 @@ func TestSaveRefusesToClobberAnEditMadeSinceLoad(t *testing.T) {
 		t.Errorf("Save after Reload: %v, want it to succeed now that the store matches disk", err)
 	}
 }
+
+// Loading a path that is not there yet records a zero stamp deliberately: something
+// creating the file before the first save is the same lost edit as an outside write.
+//
+// That pairing — a store that *did* load, holding a zero stamp — is the ordinary shape
+// of the user-wide store on a fresh machine, since browse.Serve always calls Load. It
+// is also the one shape neither neighbouring test reaches: the never-loaded case takes
+// the export branch instead, and the clobber case above loads a file that exists.
+func TestSaveRefusesAFileCreatedSinceAMissingLoad(t *testing.T) {
+	p := filepath.Join(t.TempDir(), FileName)
+	mine, err := Load(p) // nothing there yet
+	if err != nil {
+		t.Fatal(err)
+	}
+	mine.Assign("fp-a", "hero")
+
+	// A second quarry, a checkout of a project store, an editor.
+	theirs := New()
+	theirs.Define("villain", "#445566")
+	if err := theirs.Save(p); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := mine.Save(p); !errors.Is(err, ErrStale) {
+		t.Fatalf("Save = %v, want ErrStale: the file appeared after an empty load", err)
+	}
+	after, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := after.color("villain"); !ok {
+		t.Error("the other writer's store was overwritten by one that had read nothing")
+	}
+	// And the recovery still works from here, so the refusal is not a dead end.
+	if err := mine.Reload(p); err != nil {
+		t.Fatal(err)
+	}
+	if err := mine.Save(p); err != nil {
+		t.Errorf("Save after Reload: %v", err)
+	}
+}
+
 func TestRenameReportsAMissingTag(t *testing.T) {
 	for _, tc := range []struct {
 		name, old, neu string
@@ -1014,11 +1056,5 @@ func TestFingerprintsByTag(t *testing.T) {
 	}
 	if len(got["unused"]) != 0 {
 		t.Errorf("unused = %v, want nothing", got["unused"])
-	}
-	// The same totals Counts reports, from the same assignments.
-	for id, fps := range got {
-		if len(fps) != s.Counts()[id] {
-			t.Errorf("%s: %d fingerprints but Counts says %d", id, len(fps), s.Counts()[id])
-		}
 	}
 }

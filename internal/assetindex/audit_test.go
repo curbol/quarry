@@ -1,3 +1,15 @@
+// Guard tests accumulated from audits. Two rules they are written to, both learned
+// from guards that had quietly stopped checking anything:
+//
+// A guard over a value it does not own derives that value rather than restating it. A
+// restated copy narrows the guard to whatever someone remembered to add to the copy,
+// and it must also assert its own parsing found something, so a format change fails
+// loudly rather than matching nothing.
+//
+// A guard over a constant straddles it: two inputs either side of it that land on
+// different answers, then an assertion that the constant lies between them. Written
+// well clear of it, a test pins only the direction and leaves the value free to drift.
+
 package assetindex
 
 import (
@@ -10,6 +22,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"reflect"
 	"strconv"
@@ -975,6 +988,14 @@ func TestDotPathsAreSkippedInsideArchivesToo(t *testing.T) {
 		"SourceFiles/.vscode/settings.json": "HIDDEN",
 		".git/config":                       "HIDDEN",
 		"SourceFiles/.editorconfig":         "HIDDEN",
+		// skipEntry's other half, which had no archive-side test at all: the only .meta
+		// assertion in the package was over a loose file, so it exercised the walk's own
+		// check rather than this one. An extracted-Unity-project zip ships a .meta beside
+		// every asset, so a regression here roughly doubles those archives' card count
+		// with every one of them landing as a "data" card — the same silent doubling the
+		// dot-path cases above exist to prevent.
+		"SourceFiles/Models/Keep.fbx.meta":   "SIDECAR",
+		"SourceFiles/Models/Keep.fbx.import": "SIDECAR",
 	})
 	ix, err := Build(Options{Root: root})
 	if err != nil {
@@ -984,6 +1005,9 @@ func TestDotPathsAreSkippedInsideArchivesToo(t *testing.T) {
 	for _, a := range assets {
 		if strings.Contains(a.Source.Entry, "/.") || strings.HasPrefix(a.Source.Entry, ".") {
 			t.Errorf("indexed %q from inside a dot-path; the loose walk drops those", a.Source.Entry)
+		}
+		if ext := strings.ToLower(path.Ext(a.Source.Entry)); ext == ".meta" || ext == ".import" {
+			t.Errorf("indexed the engine sidecar %q; the loose walk drops those too", a.Source.Entry)
 		}
 	}
 	if len(assets) != 1 {
@@ -1599,11 +1623,18 @@ func TestRebuildingATornExtractionDoesNotFailHealthySiblings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// One member torn the way a crash mid-extraction leaves it: the rename landed, the
-	// data blocks did not.
-	torn := ix.Assets[0]
-	if err := os.WriteFile(filepath.Join(dir, torn.Source.Guid, "asset"), nil, 0o644); err != nil {
-		t.Fatal(err)
+	// Torn the way a crash mid-extraction leaves it: the rename landed, the data blocks
+	// did not. A run of them rather than one, because that is the shape the failure has
+	// — safewrite.Stream does not fsync, so every member still buffered when the machine
+	// stopped comes back short together, and one grid load asks for several of them at
+	// once. With a single torn member every reader but one is healthy, which hides
+	// whether a reader that finds its own member short survives someone else's repair.
+	const tornCount = 40
+	for i := range tornCount {
+		torn := ix.Assets[i]
+		if err := os.WriteFile(filepath.Join(dir, torn.Source.Guid, "asset"), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	var wg sync.WaitGroup
@@ -2241,14 +2272,17 @@ func TestADiscardThatCannotDeleteStillUnpublishesTheWholeTree(t *testing.T) {
 func TestAFailedDiscardDoesNotSpendTheRebuildClaim(t *testing.T) {
 	ix := &Index{}
 	const fp = "crc32:dead:1"
-	if !ix.claimRebuild(fp) {
+	first, won := ix.claimRebuild(fp)
+	if !won {
 		t.Fatal("the first claim must be granted")
 	}
-	if ix.claimRebuild(fp) {
+	if again, won := ix.claimRebuild(fp); won {
 		t.Fatal("the second claim must be refused while the first is held")
+	} else if again != first {
+		t.Error("a refused claim must hand back the holder's channel, or the caller waits on nothing")
 	}
 	ix.releaseRebuild(fp)
-	if !ix.claimRebuild(fp) {
+	if _, won := ix.claimRebuild(fp); !won {
 		t.Error("a released claim must be grantable again, or a failed discard freezes the archive")
 	}
 }

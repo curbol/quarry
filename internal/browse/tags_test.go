@@ -159,8 +159,8 @@ func TestAssignToggleAndDTO(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if reloaded.Counts()["fresh"] != 1 {
-		t.Errorf("tag not persisted: counts = %v", reloaded.Counts())
+	if n := len(reloaded.FingerprintsByTag()["fresh"]); n != 1 {
+		t.Errorf("tag not persisted: fresh is on %d fingerprints, want 1", n)
 	}
 
 	// Toggle off removes it.

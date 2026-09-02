@@ -4,21 +4,11 @@
 // (which has no import map); it is the same file the document's import map points
 // "three" at, so a single three instance is shared across both.
 import * as THREE from '/static/vendor/three/three.module.min.js';
-import { clipsForAsset, clipsMatching, coversBones, hasNamedBody, matchRig, nameSeries, packRigCandidates, searchedSkeleton, stackedCharacter, storedBindFits } from '/static/rigmatch.js';
+import { clipsForAsset, clipsMatching, coversBones, nameSeries, packRigCandidates, searchedSkeleton, stackedCharacter, storedBindFits } from '/static/rigmatch.js';
 import { trimmedDuration } from '/static/cliptrim.js';
+import { CharRegistry, contentURL, thumbURL } from '/static/charstore.js';
 import { GLTFLoader } from '/static/vendor/three/jsm/loaders/GLTFLoader.js';
 import { FBXLoader } from '/static/vendor/three/jsm/loaders/FBXLoader.js';
-
-export const contentURL = (id) => '/api/content?id=' + encodeURIComponent(id);
-export const thumbURL = (id) => '/api/thumb?id=' + encodeURIComponent(id);
-
-// CharRegistry persists to localStorage on the main thread; a worker has none, so it
-// falls back to an in-memory store (its rig cache then lasts the worker's lifetime).
-const memStore = new Map();
-const store = {
-  get(k) { try { return typeof localStorage !== 'undefined' ? localStorage.getItem(k) : (memStore.has(k) ? memStore.get(k) : null); } catch { return memStore.has(k) ? memStore.get(k) : null; } },
-  set(k, v) { try { if (typeof localStorage !== 'undefined') localStorage.setItem(k, v); else memStore.set(k, v); } catch { memStore.set(k, v); } },
-};
 
 const BLANK_PIXEL = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
 const loadingManager = new THREE.LoadingManager();
@@ -139,8 +129,16 @@ async function loadRMClips(asset) {
     const rmObj = await loadModel(contentURL(asset.rootMotionId), asset.ext);
     const cs = clipsMatching(rmObj.animations, asset);
     dispose(rmObj);
+    // Both outcomes hide the toggle on a card whose payload advertised a sibling, and
+    // they are different problems: the file would not load at all, or it loaded and
+    // holds no clip under this card's name. Silently they look identical to a card that
+    // never had a sibling.
+    if (!cs.length) console.warn('root-motion sibling has no clip matching', asset.name, asset.rootMotionId);
     return cs.length ? cs : null;
-  } catch { return null; }
+  } catch (e) {
+    console.warn('root-motion sibling failed to load', asset.rootMotionId, e);
+    return null;
+  }
 }
 
 // posedBox returns the object's bounds from its posed skeleton (bone world positions), not
@@ -733,54 +731,13 @@ async function packRigs(pack, vendor, name) {
 }
 
 // ---- character registry: match a clip-only animation to a rig it can play on ----
-// A skinned character mesh whose bone names cover a clip's tracks can play that clip
-// directly (proven for the Synty rig: the native body and the clips share a rest
-// pose). Different rigs (e.g. the goblin A-pose rig) match a different body, or none
-// — in-browser retargeting of these mesh-less clips is unreliable, so a non-matching
-// rig falls back to the manual picker rather than a distorted pose.
-const CharRegistry = {
-  key: 'browsePreviewChars',
+// The half of the registry that has to load a model to answer: whether a candidate is a
+// rig, and where to look for one. Composed onto the object charstore.js exports rather
+// than wrapping it, so CharRegistry stays one thing at every call site while the
+// bookkeeping half is reachable — by app.js and thumbs.js — without this module and the
+// 3D stack behind it. Everything below may use the members from there through `this`.
+Object.assign(CharRegistry, {
   seeded: false,
-  list() { try { return JSON.parse(store.get(this.key)) || []; } catch { return []; } },
-  save(l) { try { store.set(this.key, JSON.stringify(l.slice(0, 40))); } catch { /* quota */ } },
-  // add records a character's rig, most recent first, and reports whether what the
-  // matcher can pick actually changed — the order is refreshed on every lightbox open
-  // and nothing downstream reads it.
-  add(entry) {
-    if (!entry.bones || entry.bones.length < 10) return false;
-    const l = this.list();
-    const prev = l.find((e) => e.id === entry.id);
-    // rigEntry rebuilds an entry from the model and knows nothing about pinning, so the
-    // flag is carried across here. Without it, opening a pinned character un-pins it.
-    if (prev && prev.pinned) entry = { ...entry, pinned: true };
-    const rest = l.filter((e) => e.id !== entry.id);
-    rest.unshift(entry);
-    this.save(rest);
-    return !prev || JSON.stringify(prev) !== JSON.stringify(entry);
-  },
-  remove(id) { this.save(this.list().filter((e) => e.id !== id)); },
-  // match picks the registered character whose skeleton best covers a clip's bones.
-  // A pinned character that covers the clip wins over a higher-coverage unpinned one,
-  // so pinning a body for a rig makes it the default for every clip on that rig.
-  // clipName settles the bodies coverage cannot separate — a pack's variants share one
-  // skeleton, so the one named for the clip's own series is the one it belongs on.
-  // Auto-match is scoped to the clip's own vendor: cross-vendor skeletons share enough
-  // bone names to pass the coverage bar but differ in rest pose, posing a clip into a
-  // shredded/T-posed garbage still. A legacy entry with no recorded vendor is a wildcard
-  // until it is re-registered (see register), so old caches keep working. The ranking
-  // itself is matchRig, in rigmatch.js, where it is checked without a GL context.
-  match(bones, vendor, clipName) { return matchRig(this.list(), bones, vendor, clipName); },
-  // pin reports whether the flag moved, so a caller can tell a real change from a
-  // click that re-asserted what was already true.
-  pin(id, on) {
-    const l = this.list();
-    const e = l.find((x) => x.id === id);
-    if (!e || !!e.pinned === !!on) return false;
-    e.pinned = on;
-    this.save(l);
-    return true;
-  },
-  isPinned(id) { return !!(this.list().find((x) => x.id === id) || {}).pinned; },
   async register(item) {
     const known = this.list().find((e) => e.id === item.id);
     // Trust a known entry only when its bones were recorded one name per bone; an entry
@@ -791,15 +748,20 @@ const CharRegistry = {
       return true;
     }
     let root;
-    try { root = await loadModel(contentURL(item.id), item.ext); } catch { return false; }
+    try {
+      root = await loadModel(contentURL(item.id), item.ext);
+    } catch (e) {
+      // Discovery reaches here for every candidate it tries, so a whole vendor failing
+      // to load looks exactly like a vendor that ships no rig at all: the picker is
+      // empty either way.
+      console.warn('rig candidate failed to load', item.id, e);
+      return false;
+    }
     const entry = rigEntry(item, root);
     dispose(root);
     if (entry) this.add(entry);
     return !!entry;
   },
-  // hasNamed reports whether the body this clip is named after is already registered, so
-  // registerNamed is only paid for when it is not. The ranking in match() does the rest.
-  hasNamed(asset) { return hasNamedBody(this.list(), asset && asset.vendor, asset && asset.name); },
   // registerNamed looks up the one body a clip's own name points at — HumanM_Model for
   // HumanM@CombatIdle1H01 — and registers it so match() has it to rank. A name search
   // rather than discoverForVendor's sweep: this is asking for a specific file, not
@@ -911,12 +873,17 @@ const CharRegistry = {
     await search();
     if (failed) rollback();
   },
-};
+});
+
+// contentURL, thumbURL and CharRegistry are re-exported from charstore.js so viewer.js
+// and thumbworker.js, which need this module anyway, keep one import for the pipeline
+// and the registry both.
+export { CharRegistry, contentURL, thumbURL };
 
 export {
   clipsForAsset, coversBones,
   loadModel, loadSidekick, normalizeClip, boneNames, clipBones, loadRMClips, isSynty,
   resolveRig, posedBox, frameBox, isRenderable, captureRootRest, uprightRig, prepareClipRig,
-  cloneRig, oneCharacter, alignBindToRest, hideAlternates, poseAt, retargetedFor, stripRootMotion, dispose, disposeClone, CharRegistry, rigEntry, rigCandidates, CLAY, _posedV,
+  cloneRig, oneCharacter, alignBindToRest, hideAlternates, poseAt, retargetedFor, stripRootMotion, dispose, disposeClone, rigEntry, rigCandidates, CLAY, _posedV,
   rootBone, rootBoneName,
 };

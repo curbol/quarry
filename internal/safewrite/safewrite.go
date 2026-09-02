@@ -21,7 +21,10 @@ const StaleTempAge = 24 * time.Hour
 // Atomic writes what encode produces to path through a temp file in path's own
 // directory, renamed into place. A reader therefore never sees a half-written file,
 // and a failure at any point leaves the previous contents untouched. The temp file
-// is removed on every failure path. tmpPattern is an os.CreateTemp pattern.
+// is removed on every failure path. tmpPattern is an os.CreateTemp pattern, and it has
+// to contain a "*": sweepStaleTemps reuses it as a filepath.Glob pattern, and without
+// one the glob matches the literal name while CreateTemp appends a random suffix, so
+// nothing an interrupted write abandons is ever swept and the failure is invisible.
 //
 // The bytes are fsynced before the rename, because rename atomicity alone only
 // survives a crashing process, not a crashing machine: the rename can reach the

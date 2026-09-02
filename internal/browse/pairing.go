@@ -102,17 +102,41 @@ func buildRootMotionPairs(assets []assetindex.Asset) (sibling map[string]string,
 		// Sword.fbx beside Sword.png, whose roughness-metallic map is Sword_RM.png — and
 		// testing the group as a whole would let the animation's presence hide a texture
 		// nothing will ever play.
+		// Whether the directory is decisive is a property of the group, not of the card
+		// being paired. A pack laid out per character keeps each clip beside its own RM,
+		// and there the directory is the only thing telling one character's "Walk" from
+		// another's — so a card whose own directory ships no RM has no sibling, rather
+		// than the neighbouring character's. A pack that puts every RM in one folder has
+		// no such pair anywhere in the group, and there the unrestricted weighting is
+		// what makes the layout pair at all.
+		sameDir := groupPairsByDirectory(assets, g.nonRM, g.rm)
 		for _, ni := range g.nonRM {
 			if assets[ni].Category != assetindex.CategoryAnimation {
 				continue
 			}
-			if rmID := pickRM(assets, g.rm, assets[ni]); rmID != "" {
+			if rmID := pickRM(assets, g.rm, assets[ni], sameDir); rmID != "" {
 				sibling[assets[ni].ID] = rmID
 				suppressed[rmID] = true
 			}
 		}
 	}
 	return sibling, suppressed
+}
+
+// groupPairsByDirectory reports whether any in-place asset in the group has an RM in
+// its own directory. See buildRootMotionPairs for why that is decided per group.
+func groupPairsByDirectory(assets []assetindex.Asset, nonRM, rm []int) bool {
+	dirs := make(map[string]bool, len(rm))
+	for _, ri := range rm {
+		d, _ := entryParts(assets[ri].Source)
+		dirs[d] = true
+	}
+	for _, ni := range nonRM {
+		if d, _ := entryParts(assets[ni].Source); dirs[d] {
+			return true
+		}
+	}
+	return false
 }
 
 // pickRM chooses the RM sibling for an in-place asset. The sibling has to be the same
@@ -122,33 +146,37 @@ func buildRootMotionPairs(assets []assetindex.Asset) (sibling map[string]string,
 // no sibling to offer, and pairing it anyway would both break the toggle and hide a
 // file the grid should still show.
 //
-// Among same-format candidates the terms are weighted, not ordered: the same
-// directory scores above the same archive, so a same-directory RM in another archive
-// beats a different-directory RM in this one. That is deliberate. A pack laid out per
-// character keeps a clip and its RM together, and the directory is the only thing
-// telling one character's "Walk" from another's; where the layout puts every RM in one
-// folder the term simply never fires and the archive term decides.
+// The directory outranks the archive, and does so as a filter rather than a weight.
+// sameDirOnly says the group has some in-place asset with an RM beside it, and in a
+// pack laid out per character the directory is the only thing telling one character's
+// "Walk" from another's — so a same-directory RM in another archive beats a
+// different-directory RM in this one, and a character whose own folder ships no RM
+// gets none rather than a neighbour's. Ranked instead of filtered, the neighbour's
+// would win by default and the frontend would play it on this character's body: a
+// plausible clip, out of a file that loads, with nothing to signal it. Where the layout
+// puts every RM in one folder no candidate is in the card's own directory anyway,
+// sameDirOnly is false, and the archive alone decides.
 //
-// The archive term matters because Pack is a directory name: one pack commonly ships
-// as both a SourceFiles zip and a unitypackage holding the same animations, which lands
-// both copies in one group. Without it every in-place card in that group picks the same
-// first RM — so the other archive's RM is never suppressed and shows up beside the card
-// it belongs to, while that card's toggle fetches a different archive than the one it
-// is displaying.
-func pickRM(assets []assetindex.Asset, rm []int, nonRM assetindex.Asset) string {
+// The archive matters because Pack is a directory name: one pack commonly ships as both
+// a SourceFiles zip and a unitypackage holding the same animations, which lands both
+// copies in one group. Without it every in-place card in that group picks the same first
+// RM — so the other archive's RM is never suppressed and shows up beside the card it
+// belongs to, while that card's toggle fetches a different archive than the one it is
+// displaying.
+func pickRM(assets []assetindex.Asset, rm []int, nonRM assetindex.Asset, sameDirOnly bool) string {
 	best, bestScore := "", -1
+	nonDir, _ := entryParts(nonRM.Source)
 	for _, ri := range rm {
 		r := assets[ri]
 		if r.Ext != nonRM.Ext {
 			continue
 		}
-		score := 0
-		rDir, _ := entryParts(r.Source)
-		if nonDir, _ := entryParts(nonRM.Source); rDir == nonDir {
-			score += 4
+		if rDir, _ := entryParts(r.Source); sameDirOnly && rDir != nonDir {
+			continue
 		}
+		score := 0
 		if r.Source.ArchivePath == nonRM.Source.ArchivePath {
-			score += 2
+			score++
 		}
 		if score > bestScore {
 			best, bestScore = r.ID, score

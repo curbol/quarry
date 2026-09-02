@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { lastMotionTime, trimmedDuration, DEAD_TAIL, STILL_TRACK } from '../assets/cliptrim.js';
+import { lastMotionTime, trimmedDuration, DEAD_TAIL, MOTION_FLOOR, STILL_TRACK } from '../assets/cliptrim.js';
 
 // A track that moves steadily for `moving` frames and then holds its last value.
 // valueSize 1 keeps the arithmetic readable; the code is per-component either way.
@@ -37,17 +37,23 @@ test('the latest-stopping track decides, not the first', () => {
 // The threshold is a share of each track's own peak, which is what lets a big mover and
 // a jittery bone coexist: an absolute floor would either ignore the quiet track
 // entirely or let the noisy one hold every clip open.
-test('end-of-clip jitter far below a track\'s own peak does not count as motion', () => {
-  const tr = padded({ frames: 21, moving: 6, step: 1 });
-  // A 1% wobble on the final frame, against a peak per-frame change of 1.
-  tr.values[20] = tr.values[19] + 0.01;
-  assert.equal(lastMotionTime([tr]).toFixed(2), '0.50', 'jitter under the floor is not the end');
-});
+//
+// The two deltas straddle MOTION_FLOOR rather than sitting far either side of it. Well
+// clear of it they pinned only the direction: the constant could be anything from 0.02
+// to 0.45 with every test green, and both errors are silent — too high cuts the end off
+// a slow settle, too low leaves every card in a padded pack holding a pose.
+test('a late change is motion exactly when it clears the track\'s own floor', () => {
+  // Peak per-keyframe change is 1, so the floor is MOTION_FLOOR in absolute terms.
+  const under = padded({ frames: 21, moving: 6, step: 1 });
+  under.values[20] = under.values[19] + 0.03;
+  assert.equal(lastMotionTime([under]).toFixed(2), '0.50', 'a wobble under the floor is not the end');
 
-test('a late change above the floor is the end, even when it is small', () => {
-  const tr = padded({ frames: 21, moving: 6, step: 1 });
-  tr.values[20] = tr.values[19] + 0.5; // half the peak, well over the 5% floor
-  assert.equal(lastMotionTime([tr]).toFixed(2), '2.00');
+  const over = padded({ frames: 21, moving: 6, step: 1 });
+  over.values[20] = over.values[19] + 0.08;
+  assert.equal(lastMotionTime([over]).toFixed(2), '2.00', 'a change over the floor is the end');
+
+  // And the constant itself sits between them, so the two claims above are about it.
+  assert.ok(MOTION_FLOOR > 0.03 && MOTION_FLOOR < 0.08, `MOTION_FLOOR = ${MOTION_FLOOR}`);
 });
 
 test('a track that never really moves contributes nothing', () => {

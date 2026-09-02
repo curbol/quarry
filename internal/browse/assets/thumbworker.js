@@ -39,18 +39,32 @@ const SIZE = 220;
 const canvas = new OffscreenCanvas(SIZE, SIZE);
 let renderer, scene, camera;
 
+// noContext latches a WebGL context this worker will never get: a browser blocklist, no
+// GPU, --disable-gpu without a software fallback. The retry below exists for a
+// transient startup race and cannot tell the two apart, so without the latch every
+// single card in the grid pays five failed context creations and 600ms of sleeping on
+// the one serialized queue, and logs an error for each. Nothing on the main thread
+// stops it either: that latch fires on worker.onerror, which covers a module that would
+// not load, not a worker running fine with no way to draw.
+let noContext = null;
+
 // Create the GL context lazily on the first job, not at worker load: creating it while
 // the page is still initializing races the main thread and can fail (swiftshader's
 // "BindToCurrentSequence failed"). Retry a few times to ride out a transient failure.
 async function ensureRenderer() {
   if (renderer) return;
+  if (noContext) throw noContext;
   for (let attempt = 0; ; attempt++) {
     try {
       renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
       renderer.setSize(SIZE, SIZE, false);
       break;
     } catch (e) {
-      if (attempt >= 4) throw e;
+      if (attempt >= 4) {
+        noContext = e;
+        console.error('no WebGL context in the thumbnail worker; 3D cards will keep their category icon', e);
+        throw e;
+      }
       await new Promise((r) => setTimeout(r, 150));
     }
   }
@@ -261,6 +275,9 @@ const JOB_TIMEOUT_MS = 30_000;
 // and an empty console, and the page then remembers the answer, so a transport failure
 // looks exactly like a settled one.
 function reportFailure(asset, e) {
+  // Once the context is known to be unavailable every card fails for the same reason,
+  // already reported once. Repeating it per card buries whatever else the console has.
+  if (noContext && e === noContext) return;
   console.error('thumbnail failed', asset && asset.id, asset && asset.name, e);
 }
 

@@ -1,3 +1,15 @@
+// Guard tests accumulated from audits. Two rules they are written to, both learned
+// from guards that had quietly stopped checking anything:
+//
+// A guard over a value it does not own derives that value rather than restating it. A
+// restated copy narrows the guard to whatever someone remembered to add to the copy,
+// and it must also assert its own parsing found something, so a format change fails
+// loudly rather than matching nothing.
+//
+// A guard over a constant straddles it: two inputs either side of it that land on
+// different answers, then an assertion that the constant lies between them. Written
+// well clear of it, a test pins only the direction and leaves the value free to drift.
+
 package selfupdate
 
 import (
@@ -587,9 +599,20 @@ func forceInstallRenameFailure(t *testing.T) {
 // resolves server-side to another repository's release, fetched with this user's token
 // and reported as if it were quarry's.
 func TestFetchReleaseRefusesATargetThatIsNotAVersion(t *testing.T) {
+	// Guarded: the append runs on the handler's goroutine and the reads below run on
+	// this one, with only a TCP round trip between them — which is not a happens-before
+	// edge the memory model recognises, as assetServer's own comment says.
+	var mu sync.Mutex
 	var asked []string
+	askedSoFar := func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), asked...)
+	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
 		asked = append(asked, r.URL.Path)
+		mu.Unlock()
 		fmt.Fprint(w, `{"tag_name":"v9.9.9","assets":[]}`)
 	}))
 	defer srv.Close()
@@ -606,11 +629,11 @@ func TestFetchReleaseRefusesATargetThatIsNotAVersion(t *testing.T) {
 		"-1.2.3",
 	} {
 		if _, err := fetchRelease("", target); err == nil {
-			t.Errorf("target %q was accepted; requests so far: %v", target, asked)
+			t.Errorf("target %q was accepted; requests so far: %v", target, askedSoFar())
 		}
 	}
-	if len(asked) != 0 {
-		t.Errorf("a rejected target still reached the network: %v", asked)
+	if got := askedSoFar(); len(got) != 0 {
+		t.Errorf("a rejected target still reached the network: %v", got)
 	}
 
 	// Ordinary versions, with and without the "v", still resolve.
@@ -619,8 +642,8 @@ func TestFetchReleaseRefusesATargetThatIsNotAVersion(t *testing.T) {
 			t.Errorf("target %q was refused: %v", target, err)
 		}
 	}
-	if len(asked) != 4 {
-		t.Errorf("release requests = %v, want one per accepted version", asked)
+	if got := askedSoFar(); len(got) != 4 {
+		t.Errorf("release requests = %v, want one per accepted version", got)
 	}
 }
 
@@ -772,7 +795,23 @@ func TestInstallScriptComposesPublishedLabels(t *testing.T) {
 	// The script builds "${os}-${arch}"; not every combination is real (mac-arm64,
 	// linux-apple), so this asserts that each one it *can* produce is either published
 	// or an impossible pairing, and that at least the real ones are covered.
-	real := map[string]bool{"mac-intel": true, "mac-apple": true, "linux-intel": true, "linux-arm64": true}
+	//
+	// Derived, never restated. Both loops below are gated on this set, so a hand-written
+	// copy narrows what they check to the platforms someone remembered to add to it: a
+	// new triple in release.yml with a matching releaseSuffix entry passed both guards
+	// while install.sh could not compose its label at all, which is the one failure this
+	// test exists for. Windows is excluded because install.sh sends it to the release
+	// zip directly rather than composing a label.
+	real := map[string]bool{}
+	for platform, suffix := range releaseSuffix {
+		if strings.HasPrefix(platform, "windows/") {
+			continue
+		}
+		real[strings.TrimSuffix(suffix, ".zip")] = true
+	}
+	if len(real) == 0 {
+		t.Fatal("no non-Windows platform in releaseSuffix; this test has stopped checking anything")
+	}
 	composable := map[string]bool{}
 	for _, o := range oses {
 		for _, a := range arches {
@@ -813,6 +852,21 @@ func TestInstallScriptComposesPublishedLabels(t *testing.T) {
 		if !regexp.MustCompile(want.pattern).MatchString(want.in) {
 			t.Errorf("%s no longer composes the asset name as <name>-<version>-<label>.zip; "+
 				"platformAsset matches on \"-\"+suffix and would stop finding it", want.file)
+		}
+	}
+	// So is the name of the binary *inside* the zip. extractBinary looks it up by exact
+	// name and install.sh unpacks to the same one, so renaming the entry in release.yml
+	// alone breaks `quarry update` for every existing user and a fresh install at the
+	// same moment — with nothing failing until a release has already shipped, and both
+	// recovery paths gone together.
+	for _, want := range []struct{ file, literal, in string }{
+		{"release.yml", `bin="` + binaryName + `"`, string(wf)},
+		{"release.yml", `bin="` + binaryName + `.exe"`, string(wf)},
+		{"install.sh", `BINARY_NAME="` + binaryName + `"`, src},
+	} {
+		if !strings.Contains(want.in, want.literal) {
+			t.Errorf("%s no longer names the archive entry %q (looked for %s); extractBinary and "+
+				"install.sh both find the binary by that exact name", want.file, binaryName, want.literal)
 		}
 	}
 }

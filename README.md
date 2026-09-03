@@ -26,7 +26,7 @@ upgrades in place, and `quarry update <version>` pins a specific one.
 ## Build from source
 
 ```bash
-go build -o quarry .      # requires Go 1.26+
+go build -o quarry .      # requires Go 1.27+
 ```
 
 ## Setup

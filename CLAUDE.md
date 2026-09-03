@@ -14,7 +14,7 @@ fingerprint scheme, the tag store format, or the cache layout.
 ## Build & test
 
 ```bash
-go build -o quarry .            # requires Go 1.26+
+go build -o quarry .            # requires Go 1.27+
 go test ./...                   # full suite
 go test ./internal/assetindex/ -run TestScan -v   # one package / one test
 go vet ./...

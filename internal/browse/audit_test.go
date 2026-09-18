@@ -1274,6 +1274,40 @@ func TestCardsSerializeEmptySetsAsArraysOnBothPaths(t *testing.T) {
 	}
 }
 
+// The same rule one level up, at the envelope. A tag filter that matches nothing is an
+// ordinary click — the ALL toggle over two tags no card shares — and app.js rejects a
+// response whose items is not an array, so a nil slice there reads on screen as a
+// failed load rather than as an empty grid. Asserted against the raw body because the
+// response struct decodes null and [] into the same nil slice.
+func TestAZeroMatchTagFilterAnswersAnEmptyArray(t *testing.T) {
+	srv, _ := enabledServer(t)
+	heart := itemByName(t, srv, "q=Heart", "Heart.fbx")
+	sword := itemByName(t, srv, "q=Sword", "Sword.glb")
+	doJSON(t, "POST", srv.URL+"/api/assign", map[string]any{"fingerprints": heart.Fingerprints, "tag": "a", "on": true}).Body.Close()
+	doJSON(t, "POST", srv.URL+"/api/assign", map[string]any{"fingerprints": sword.Fingerprints, "tag": "b", "on": true}).Body.Close()
+
+	// Each card carries one of the two tags, so requiring both matches nothing.
+	for _, q := range []string{"tag=a&tag=b&tagmode=and", "tag=a&q=Sword"} {
+		t.Run(q, func(t *testing.T) {
+			resp, err := http.Get(srv.URL + "/api/assets?" + q)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			b, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Contains(b, []byte(`"total":0`)) {
+				t.Fatalf("this case must match nothing, got %s", b)
+			}
+			if !bytes.Contains(b, []byte(`"items":[]`)) {
+				t.Errorf(`items is not an empty array, so the grid reports a failed load: %s`, b)
+			}
+		})
+	}
+}
+
 // The URL quarry prints is also the one it opens, so it has to be dialable. A wildcard
 // bind is how someone serves other machines, and it reports as "[::]:port" — an address
 // a browser will not open, on a branch where the Host guard is off and localhost would

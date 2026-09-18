@@ -6,7 +6,7 @@
 import * as THREE from '/static/vendor/three/three.module.min.js';
 import { clipsForAsset, clipsMatching, coversBones, nameSeries, packRigCandidates, searchedSkeleton, stackedCharacter, storedBindFits } from '/static/rigmatch.js';
 import { trimmedDuration } from '/static/cliptrim.js';
-import { CharRegistry, contentURL, thumbURL } from '/static/charstore.js';
+import { CharRegistry, contentURL, resolveRig, thumbURL } from '/static/charstore.js';
 import { GLTFLoader } from '/static/vendor/three/jsm/loaders/GLTFLoader.js';
 import { FBXLoader } from '/static/vendor/three/jsm/loaders/FBXLoader.js';
 
@@ -680,44 +680,6 @@ async function rigCandidates({ q, vendor, limit, types, sort }) {
   }
 }
 
-// resolveRig finds a rig a clip can play on: the best registry match, the next one if
-// that fails to load, then vendor discovery, then whatever that turns up. A cached
-// entry goes stale when a re-index changes its id, so a failed load evicts the entry
-// and the search continues rather than ending there.
-//
-// tryLoad is handed a registry entry and returns whatever the caller wants to keep —
-// a loaded rig, or true for a caller that only cares that it played — or a falsy value
-// when that entry could not be loaded. cancelled lets a caller that can be torn down
-// mid-await stop between attempts.
-//
-// The lightbox and the thumbnail worker both search this way, and the order matters to
-// what each of them shows: written out twice, one of them fell through to discovery
-// once every known entry had failed and the other gave up there.
-async function resolveRig(bones, asset, tryLoad, cancelled = () => false) {
-  const attempt = async () => {
-    for (let m = CharRegistry.match(bones, asset.vendor, asset.name); m && !cancelled(); m = CharRegistry.match(bones, asset.vendor, asset.name)) {
-      const got = await tryLoad(m);
-      if (got) return got;
-      CharRegistry.remove(m.id);
-    }
-    return null;
-  };
-  await CharRegistry.seed();
-  if (cancelled()) return null;
-  // A registry holding any body that fits settles the clip here, and the pack search that
-  // would turn up the body it is named after only runs when nothing fits at all — so a
-  // registry written before this session preferred the named one would go on answering
-  // with the other body for as long as it survives. Fetching the named body first is one
-  // search and at most one load, once per vendor and series, and leaves the ranking to it.
-  if (!CharRegistry.hasNamed(asset)) await CharRegistry.registerNamed(asset);
-  if (cancelled()) return null;
-  const known = await attempt();
-  if (known || cancelled()) return known;
-  await CharRegistry.discoverForVendor(asset, bones);
-  if (cancelled()) return null;
-  return attempt();
-}
-
 // packRigs picks what to try from the pack shipping a clip, heaviest first. Weight
 // alone finds a character body, which outweighs every clip beside it — but not a prop
 // rig: a bow its own clips animate is lighter than the character animations it ships
@@ -878,12 +840,12 @@ Object.assign(CharRegistry, {
 // contentURL, thumbURL and CharRegistry are re-exported from charstore.js so viewer.js
 // and thumbworker.js, which need this module anyway, keep one import for the pipeline
 // and the registry both.
-export { CharRegistry, contentURL, thumbURL };
+export { CharRegistry, contentURL, resolveRig, thumbURL };
 
 export {
   clipsForAsset, coversBones,
   loadModel, loadSidekick, normalizeClip, boneNames, clipBones, loadRMClips, isSynty,
-  resolveRig, posedBox, frameBox, isRenderable, captureRootRest, uprightRig, prepareClipRig,
+  posedBox, frameBox, isRenderable, captureRootRest, uprightRig, prepareClipRig,
   cloneRig, oneCharacter, alignBindToRest, hideAlternates, poseAt, retargetedFor, stripRootMotion, dispose, disposeClone, rigEntry, rigCandidates, CLAY, _posedV,
   rootBone, rootBoneName,
 };

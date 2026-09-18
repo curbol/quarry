@@ -110,7 +110,12 @@ func filterByTags(dtos []assetDTO, tags []string, mode string) []assetDTO {
 		return dtos
 	}
 	and := mode == "and"
-	var out []assetDTO
+	// Empty rather than nil: this is the only path to the response's items that can end
+	// with nothing, and a nil slice marshals to null, which app.js reads as a malformed
+	// response and reports as a failed load instead of an empty grid. Both branches of
+	// computeResults already build with make, so matching them here is what keeps a
+	// zero-match tag filter the same shape as a zero-match search.
+	out := []assetDTO{}
 	for _, d := range dtos {
 		if matchTags(d.Tags, tags, and) {
 			out = append(out, d)

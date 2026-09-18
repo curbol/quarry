@@ -87,3 +87,55 @@ export const CharRegistry = {
   // registerNamed is only paid for when it is not. The ranking in match() does the rest.
   hasNamed(asset) { return hasNamedBody(this.list(), asset && asset.vendor, asset && asset.name); },
 };
+
+// resolveRig finds a rig a clip can play on: the best registry match, the next one if
+// that fails to load, then vendor discovery, then whatever that turns up. A cached
+// entry goes stale when a re-index changes its id, so a failed load evicts the entry
+// and the search continues rather than ending there.
+//
+// tryLoad is handed a registry entry and returns whatever the caller wants to keep —
+// a loaded rig, or true for a caller that only cares that it played — or a falsy value
+// when that entry could not be loaded. cancelled says the caller has been torn down;
+// it is required because its two callers disagree about what a falsy tryLoad means and
+// a default would pick one of them silently.
+//
+// The eviction is the part to be careful with: a falsy result only proves the entry is
+// stale while the search is still wanted. A caller that gives up mid-await returns
+// falsy for every remaining candidate, and evicting on that empties the registry of
+// every body covering the skeleton — including ones seeded from the user's own pinned
+// characters — while leaving the memos that record a scope as already searched intact,
+// so nothing re-finds them. Checking cancelled after the await is what separates "this
+// entry does not load" from "nobody is waiting for it any more".
+//
+// It lives here rather than in scene.js because it is control flow over the registry
+// and two callbacks, with no THREE in it: seed, registerNamed and discoverForVendor are
+// composed onto CharRegistry by scene.js, and a test supplies its own.
+//
+// The lightbox and the thumbnail worker both search this way, and the order matters to
+// what each of them shows: written out twice, one of them fell through to discovery
+// once every known entry had failed and the other gave up there.
+export async function resolveRig(bones, asset, tryLoad, cancelled) {
+  const attempt = async () => {
+    for (let m = CharRegistry.match(bones, asset.vendor, asset.name); m && !cancelled(); m = CharRegistry.match(bones, asset.vendor, asset.name)) {
+      const got = await tryLoad(m);
+      if (got) return got;
+      if (cancelled()) return null;
+      CharRegistry.remove(m.id);
+    }
+    return null;
+  };
+  await CharRegistry.seed();
+  if (cancelled()) return null;
+  // A registry holding any body that fits settles the clip here, and the pack search that
+  // would turn up the body it is named after only runs when nothing fits at all — so a
+  // registry written before this session preferred the named one would go on answering
+  // with the other body for as long as it survives. Fetching the named body first is one
+  // search and at most one load, once per vendor and series, and leaves the ranking to it.
+  if (!CharRegistry.hasNamed(asset)) await CharRegistry.registerNamed(asset);
+  if (cancelled()) return null;
+  const known = await attempt();
+  if (known || cancelled()) return known;
+  await CharRegistry.discoverForVendor(asset, bones);
+  if (cancelled()) return null;
+  return attempt();
+}

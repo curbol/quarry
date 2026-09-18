@@ -109,13 +109,24 @@ func buildRootMotionPairs(assets []assetindex.Asset) (sibling map[string]string,
 		// than the neighbouring character's. A pack that puts every RM in one folder has
 		// no such pair anywhere in the group, and there the unrestricted weighting is
 		// what makes the layout pair at all.
-		sameDir := groupPairsByDirectory(assets, g.nonRM, g.rm)
+		//
+		// Asked per container format, because that is the granularity pickRM chooses at:
+		// one pack can ship its FBX copies beside their RM and split its GLB copies
+		// across folders, and a group-wide answer lets the FBX pair — which the GLB
+		// clips can never select — decide that the GLB ones have no sibling.
+		sameDirFor := map[string]bool{}
 		for _, ni := range g.nonRM {
-			if assets[ni].Category != assetindex.CategoryAnimation {
+			a := assets[ni]
+			if a.Category != assetindex.CategoryAnimation {
 				continue
 			}
-			if rmID := pickRM(assets, g.rm, assets[ni], sameDir); rmID != "" {
-				sibling[assets[ni].ID] = rmID
+			sameDir, asked := sameDirFor[a.Ext]
+			if !asked {
+				sameDir = groupPairsByDirectory(assets, g.nonRM, g.rm, a.Ext)
+				sameDirFor[a.Ext] = sameDir
+			}
+			if rmID := pickRM(assets, g.rm, a, sameDir); rmID != "" {
+				sibling[a.ID] = rmID
 				suppressed[rmID] = true
 			}
 		}
@@ -124,19 +135,63 @@ func buildRootMotionPairs(assets []assetindex.Asset) (sibling map[string]string,
 }
 
 // groupPairsByDirectory reports whether any in-place asset in the group has an RM in
-// its own directory. See buildRootMotionPairs for why that is decided per group.
-func groupPairsByDirectory(assets []assetindex.Asset, nonRM, rm []int) bool {
+// its own directory, over the pairs that could actually be made in container format
+// ext. See buildRootMotionPairs for why that is decided per group and per format.
+//
+// Both sides are narrowed to what pickRM would consider: an RM of another extension is
+// never selected, and a non-animation is never paired at all, so counting either would
+// let a pair nobody can make decide that a pair somebody can make is cross-directory.
+func groupPairsByDirectory(assets []assetindex.Asset, nonRM, rm []int, ext string) bool {
 	dirs := make(map[string]bool, len(rm))
 	for _, ri := range rm {
+		if assets[ri].Ext != ext {
+			continue
+		}
 		d, _ := entryParts(assets[ri].Source)
 		dirs[d] = true
 	}
 	for _, ni := range nonRM {
-		if d, _ := entryParts(assets[ni].Source); dirs[d] {
+		a := assets[ni]
+		if a.Ext != ext || a.Category != assetindex.CategoryAnimation {
+			continue
+		}
+		if d, _ := entryParts(a.Source); dirs[d] {
 			return true
 		}
 	}
 	return false
+}
+
+// dirAffinity counts the trailing path segments two directories share. It is what
+// separates candidates the same-directory filter cannot: a pack that mirrors its
+// per-character folders under one root-motion tree has no in-place asset in an RM's
+// own directory, so sameDirOnly is false and every candidate in the archive scores
+// alike — leaving scan order to decide which character's travel each card plays.
+// Anims/Goblin shares one segment with RootMotion/Goblin and none with RootMotion/Orc.
+func dirAffinity(a, b assetindex.Source) int {
+	ad, _ := entryParts(a)
+	bd, _ := entryParts(b)
+	as, bs := splitDir(a, ad), splitDir(b, bd)
+	n := 0
+	for n < len(as) && n < len(bs) && as[len(as)-1-n] == bs[len(bs)-1-n] {
+		n++
+	}
+	return n
+}
+
+// splitDir breaks a directory into its segments, by the separators that source's own
+// path uses. Empty segments are dropped so a leading or doubled separator cannot
+// register as a shared one.
+func splitDir(s assetindex.Source, dir string) []string {
+	seps := "/"
+	if s.Kind == assetindex.SourceLoose {
+		seps = osSeparators
+	}
+	var out []string
+	for _, p := range strings.FieldsFunc(dir, func(r rune) bool { return strings.ContainsRune(seps, r) }) {
+		out = append(out, p)
+	}
+	return out
 }
 
 // pickRM chooses the RM sibling for an in-place asset. The sibling has to be the same
@@ -163,6 +218,12 @@ func groupPairsByDirectory(assets []assetindex.Asset, nonRM, rm []int) bool {
 // RM — so the other archive's RM is never suppressed and shows up beside the card it
 // belongs to, while that card's toggle fetches a different archive than the one it is
 // displaying.
+//
+// Where the filter does not apply, how much of the path the two share outranks the
+// archive: a mirrored root-motion tree puts no RM in any card's own directory, and with
+// the archive alone every candidate ties and the first one found wins for every card in
+// the group. The score packs the two terms so affinity dominates and the archive breaks
+// its ties, rather than the two being summed into a tie again.
 func pickRM(assets []assetindex.Asset, rm []int, nonRM assetindex.Asset, sameDirOnly bool) string {
 	best, bestScore := "", -1
 	nonDir, _ := entryParts(nonRM.Source)
@@ -174,7 +235,7 @@ func pickRM(assets []assetindex.Asset, rm []int, nonRM assetindex.Asset, sameDir
 		if rDir, _ := entryParts(r.Source); sameDirOnly && rDir != nonDir {
 			continue
 		}
-		score := 0
+		score := dirAffinity(nonRM.Source, r.Source) << 1
 		if r.Source.ArchivePath == nonRM.Source.ArchivePath {
 			score++
 		}

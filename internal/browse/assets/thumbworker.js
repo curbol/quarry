@@ -200,6 +200,11 @@ function evictRigs() {
 // entries are cached across page loads, so a re-index leaves stale ids behind, and
 // remembering the failure instead would make every clip thumbnail for that vendor fail
 // for the rest of the session.
+//
+// The cancelled predicate is what keeps that recovery from turning on the registry
+// itself. This tryLoad answers falsy for an abandoned job as well as for an entry that
+// will not load, so without it a card scrolled off screen mid-load evicts every body
+// covering its skeleton and the pack's clips stop rendering for the session.
 async function rigFor(clip, asset, current) {
   return resolveRig(clipBones(clip), asset, async (m) => {
     // An abandoned job stops loading candidates rather than working through the
@@ -223,7 +228,7 @@ async function rigFor(clip, asset, current) {
     rigs.set(m.id, rig);
     evictRigs();
     return rig;
-  });
+  }, () => !current());
 }
 
 async function buildPosed(clip, asset, rootRest, current) {

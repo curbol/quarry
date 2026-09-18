@@ -365,3 +365,53 @@ func TestARaggedGroupLeavesTheOddCardUnpaired(t *testing.T) {
 		t.Error("goblinRM was not suppressed by the card that does play it")
 	}
 }
+
+// A pack that mirrors its per-character folders under one root-motion tree puts no RM
+// in any card's own directory, so the same-directory filter never engages and every
+// candidate in the archive scored alike — leaving the first one found to win for every
+// card in the group. Both characters then pointed at one file, the other RM was never
+// suppressed and showed as a stray card, and the toggle played the neighbour's travel.
+func TestAMirroredRootMotionTreePairsEachCharacterWithItsOwn(t *testing.T) {
+	sibling, suppressed := buildRootMotionPairs([]assetindex.Asset{
+		zipAnim("goblin", "acme", "Chars", "/p.zip", "Anims/Goblin/Walk.fbx"),
+		zipAnim("orc", "acme", "Chars", "/p.zip", "Anims/Orc/Walk.fbx"),
+		zipAnim("goblinRM", "acme", "Chars", "/p.zip", "RootMotion/Goblin/Walk_RM.fbx"),
+		zipAnim("orcRM", "acme", "Chars", "/p.zip", "RootMotion/Orc/Walk_RM.fbx"),
+	})
+	for card, want := range map[string]string{"goblin": "goblinRM", "orc": "orcRM"} {
+		if got := sibling[card]; got != want {
+			t.Errorf("%s paired with %q, want %q: the shared path segment is what tells them apart", card, got, want)
+		}
+	}
+	for _, rm := range []string{"goblinRM", "orcRM"} {
+		if !suppressed[rm] {
+			t.Errorf("%s was not suppressed, so it shows as a stray card beside the one that plays it", rm)
+		}
+	}
+}
+
+// One pack, two container formats laid out differently. The same-directory probe is
+// asked per format: read over the group as a whole, the FBX pair — which a GLB clip can
+// never select, since pickRM requires the same extension — answered for the GLB copies
+// too and left every clip of the library with no sibling at all.
+func TestOneFormatsLayoutDoesNotDecideAnothers(t *testing.T) {
+	assets := []assetindex.Asset{
+		looseAnim("fbx", "quaternius", "UAL", "/lib/UAL/FBX/UAL1.fbx", ""),
+		looseAnim("fbxRM", "quaternius", "UAL", "/lib/UAL/FBX/UAL1_RM.fbx", ""),
+		looseAnim("glbWalk", "quaternius", "UAL", "/lib/UAL/UAL1.glb", "Walk"),
+		looseAnim("glbRun", "quaternius", "UAL", "/lib/UAL/UAL1.glb", "Run"),
+		looseAnim("glbRM", "quaternius", "UAL", "/lib/UAL/RootMotion/UAL1_RM.glb", ""),
+	}
+	sibling, suppressed := buildRootMotionPairs(assets)
+	if got := sibling["fbx"]; got != "fbxRM" {
+		t.Errorf("the FBX copy paired with %q, want fbxRM", got)
+	}
+	for _, clip := range []string{"glbWalk", "glbRun"} {
+		if got := sibling[clip]; got != "glbRM" {
+			t.Errorf("%s paired with %q, want glbRM: its own format ships one RM, in another folder", clip, got)
+		}
+	}
+	if !suppressed["glbRM"] {
+		t.Error("glbRM was not suppressed, so the file the clips play also shows as its own card")
+	}
+}

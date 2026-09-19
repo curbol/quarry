@@ -219,7 +219,7 @@ class ModelThumbnails {
       },
     });
   }
-  onResult({ id, seq, blob }) {
+  onResult({ id, seq, blob, failed }) {
     // Claimed before any object URL exists, which is what keeps a displaced URL from
     // escaping the cache bound unrevoked when the result turns out to be stale.
     const holders = this.jobs.claim(id, seq);
@@ -233,13 +233,17 @@ class ModelThumbnails {
         if (holder.isConnected) this.swap(holder, url);
       }
     } else {
-      this.jobs.markNoRender(id);
+      // A failure is not an answer. The worker distinguishes a transient one — a 500
+      // from a lazy extraction, a 65MB model past the deadline — from a settled
+      // "nothing to draw", and only the settled one is worth remembering: memoizing the
+      // other leaves the card showing a category icon until a reload, since settling
+      // also stops observing it. Drop the spinner and leave it watched, so the next
+      // scroll into view asks again.
+      if (!failed) this.jobs.markNoRender(id);
       for (const holder of holders) {
         if (!holder.isConnected) continue;
-        holder.classList.remove('loading'); // no render (failed / mesh-less with no rig)
-        // Settled: there is nothing to draw for this asset, so stop watching rather than
-        // re-asking the worker every time the card scrolls back into view.
-        this.settle(holder);
+        holder.classList.remove('loading'); // no render (mesh-less with no rig, or failed)
+        if (!failed) this.settle(holder);
       }
     }
   }

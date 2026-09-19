@@ -33,8 +33,17 @@ func parseQuery(s string) *searchQuery {
 		// partial one into U+FFFD, which no asset name contains — so the last term
 		// matches nothing and the implicit AND makes the whole query return nothing.
 		// Truncation is meant to narrow the query, not answer it.
-		for len(s) > 0 && !utf8.ValidString(s) {
-			s = s[:len(s)-1]
+		//
+		// Only the trailing partial rune comes off. Testing the whole string for
+		// validity instead read one bad byte anywhere — and a query string need not be
+		// valid UTF-8, since url.ParseQuery does not check — as a reason to keep
+		// trimming, which walked the input away to nothing and returned the library.
+		for len(s) > 0 {
+			if r, n := utf8.DecodeLastRuneInString(s); r == utf8.RuneError && n <= 1 {
+				s = s[:len(s)-1]
+				continue
+			}
+			break
 		}
 	}
 	toks := dropUnmatchedClose(tokenize(s))
@@ -80,6 +89,12 @@ type andNode struct{ kids []searchNode }
 type orNode struct{ kids []searchNode }
 type notNode struct{ kid searchNode }
 
+// neverNode is what a group too deep to parse becomes. Discarding it instead returned
+// a query with no terms in it, which is the all-match — so nesting past the cap
+// answered the query with the whole library rather than declining to read it. Under
+// the implicit AND this narrows to nothing, the same direction truncation takes.
+type neverNode struct{}
+
 // termNode is one leaf: a case-insensitive substring test. An empty field scopes
 // the match to name, pack, and path; a set field scopes it to that asset field.
 type termNode struct {
@@ -106,6 +121,8 @@ func (n orNode) eval(a *assetindex.Asset) bool {
 }
 
 func (n notNode) eval(a *assetindex.Asset) bool { return !n.kid.eval(a) }
+
+func (neverNode) eval(*assetindex.Asset) bool { return false }
 
 func (n termNode) eval(a *assetindex.Asset) bool {
 	if n.field == "" {
@@ -309,6 +326,11 @@ type parser struct {
 	toks  []token
 	pos   int
 	depth int
+	// declined counts the groups the depth cap refused to read. It is a count rather
+	// than a flag so a negation can ask whether the cap was hit inside its own subtree
+	// — comparing the count across the recursive call — rather than anywhere in the
+	// query, which would decline a negation in an unrelated clause.
+	declined int
 }
 
 func (p *parser) peek() (token, bool) {
@@ -373,16 +395,29 @@ func (p *parser) parsePrimary() searchNode {
 		if p.depth >= maxQueryDepth {
 			// Past the depth cap the group is read but not built: skip to its close so
 			// the rest of the query still parses, rather than recursing without bound.
+			// It becomes a term that matches nothing rather than no term at all — a
+			// query that is entirely one over-deep group would otherwise parse to
+			// nothing and return every asset, which is the opposite of declining it.
 			p.skipGroup()
-			return nil
+			p.declined++
+			return neverNode{}
 		}
 		p.depth++
+		declinedBefore := p.declined
 		inner := p.parseOr()
 		p.depth--
 		if nt, ok := p.peek(); ok && nt.kind == tokRParen {
 			p.pos++
 		}
 		if t.neg && inner != nil {
+			// Negating something the parser declined to read is what turns narrowing
+			// back into widening: a group that matches nothing complements to one that
+			// matches everything, so "-((( … )))" past the cap would answer with the
+			// library. There is no set to take the complement of — the group was never
+			// read — so the negation is declined too, at whatever depth the cap was hit.
+			if p.declined > declinedBefore {
+				return neverNode{}
+			}
 			return notNode{kid: inner}
 		}
 		return inner // nil when the group held no terms

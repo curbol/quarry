@@ -99,7 +99,11 @@ async function loadModel(url, ext) {
 // which request happened to land first.
 async function loadSidekick(parts) {
   const loaded = await Promise.all((parts || []).map(
-    (pid) => loadModel(contentURL(pid), 'fbx').catch(() => null), // skip a bad part
+    // A part that will not load is skipped rather than failing the character, but it is
+    // named: the group is still non-empty, so the grid and the lightbox both draw a body
+    // missing a head or an arm with no placeholder and nothing in the console to tie it
+    // to the part that did not arrive.
+    (pid) => loadModel(contentURL(pid), 'fbx').catch((e) => { console.warn('sidekick part failed to load', pid, e); return null; }),
   ));
   const group = new THREE.Group();
   for (const part of loaded) {

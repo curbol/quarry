@@ -2,6 +2,7 @@ package assetindex
 
 import (
 	"archive/zip"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -10,6 +11,25 @@ import (
 	"strings"
 	"sync"
 )
+
+// openZip opens an archive for reading. archive/zip hands back a usable reader
+// alongside ErrInsecurePath — for an entry with a non-local name or a backslash in it,
+// which is what older Windows zip tooling emits — and the stdlib says outright that a
+// program willing to accept such names should ignore the error and use the reader.
+// safeEntry is that willingness, and it is the stronger rule: it drops the offending
+// entries and keeps the rest of the archive.
+//
+// Treating it as a failure instead dropped every safe entry in the archive too, and
+// leaked the returned reader's descriptor, once per archive per scan and once per
+// content request. It needs GODEBUG=zipinsecurepath=0 today; the stdlib documents that
+// a future Go may make it the default, at which point the whole library goes with it.
+func openZip(archivePath string) (*zip.ReadCloser, error) {
+	zr, err := zip.OpenReader(archivePath)
+	if err != nil && !errors.Is(err, zip.ErrInsecurePath) {
+		return nil, err
+	}
+	return zr, nil
+}
 
 // safeEntry rejects archive entry names that are absolute or escape their archive
 // via "..". Such names never enter the index, so the content API can never be
@@ -30,7 +50,7 @@ func safeEntry(name string) bool {
 // unsafe names are skipped. displayRel is the archive's path relative to the
 // library root (for RelPath); archivePath is absolute (for CopyPath and Open).
 func zipAssets(archivePath, displayRel, vendor, pack, variant string) ([]Asset, error) {
-	zr, err := zip.OpenReader(archivePath)
+	zr, err := openZip(archivePath)
 	if err != nil {
 		return nil, fmt.Errorf("open zip %s: %w", archivePath, err)
 	}
@@ -185,7 +205,7 @@ func (c *zipReaders) acquire(path string) (*zipRef, error) {
 	c.evictLocked()
 	c.mu.Unlock()
 
-	zr, openErr := zip.OpenReader(path)
+	zr, openErr := openZip(path)
 	err = openErr
 	if err == nil {
 		byName := make(map[string]*zip.File, len(zr.File))

@@ -330,10 +330,15 @@ self.onmessage = (e) => {
   // send is skipped, and every job that succeeded would sit in the map for the life of
   // the worker. Only a current job retires — a superseded one's id already belongs to
   // the newer request.
-  const settle = (blob) => {
+  // failed separates the two ways a job ends with no image. The worker already tells
+  // them apart to report them — reportFailure against reportNoRender — but they left
+  // here as the same message, so the page memoized a transient 500 or a model that blew
+  // the deadline as "nothing to draw" and never asked again. That is the rule the index
+  // keeps for the same reason: what failed to read is not cached as an answer.
+  const settle = (blob, failed) => {
     if (!current()) return;
     jobs.cancel(id);
-    self.postMessage({ id, seq, blob });
+    self.postMessage({ id, seq, blob, failed: !!failed });
   };
   // Images bypass the queue: they never touch the shared GL canvas the queue exists to
   // serialize, and making them wait behind a 65MB model parse is what a grid of
@@ -345,7 +350,7 @@ self.onmessage = (e) => {
     const ac = new AbortController();
     withTimeout(downscale(asset, ac.signal), () => ac.abort())
       .then((blob) => settle(blob))
-      .catch((e) => { reportFailure(asset, e); settle(null); });
+      .catch((e) => { reportFailure(asset, e); settle(null, true); });
     return;
   }
   queue = queue.then(async () => {
@@ -373,7 +378,7 @@ self.onmessage = (e) => {
       settle(ok || null);
     } catch (e) {
       reportFailure(asset, e);
-      settle(null);
+      settle(null, true);
     }
   });
 };

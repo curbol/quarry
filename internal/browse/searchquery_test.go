@@ -252,6 +252,34 @@ func TestPathologicalQueriesDoNotBlowTheStack(t *testing.T) {
 	}
 }
 
+// Being evaluable is not the whole of it: what these evaluate to is the part that was
+// wrong. A query the parser declines to read must narrow, never answer — degrading to
+// no terms at all is the all-match, so the user asking something unreadable got the
+// whole library back as though they had asked for nothing.
+func TestADeclinedQueryNarrowsRatherThanMatchingEverything(t *testing.T) {
+	unrelated := assetindex.Asset{Name: "Rock", Pack: "Nature", RelPath: "n/rock.fbx"}
+	for _, tc := range []struct{ name, q string }{
+		// Deeper than maxQueryDepth, so the whole query is one group nothing reads.
+		{"nested past the cap", strings.Repeat("(", maxQueryDepth+8) + "sword" + strings.Repeat(")", maxQueryDepth+8)},
+		{"negated and nested past the cap", "-" + strings.Repeat("(", maxQueryDepth+8) + "sword"},
+		// url.ParseQuery does not validate UTF-8, so %FF reaches here as a raw byte. It
+		// is the truncation that has to survive it: trimming the whole string back to
+		// validity walked every term away and left nothing.
+		{"overlong with a bad byte at the front", "\xff" + strings.Repeat("a", maxQueryBytes*2)},
+		{"overlong with a bad byte in the middle", strings.Repeat("a", 64) + "\xff" + strings.Repeat("a", maxQueryBytes*2)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			q := parseQuery(tc.q)
+			if q == nil {
+				t.Fatal("compiled to nil, which matches the whole library")
+			}
+			if q.match(&unrelated) {
+				t.Error("matched an unrelated asset")
+			}
+		})
+	}
+}
+
 // `q` arrives in a URL, so it is bounded only by the server's header limit — about a
 // megabyte — and everything downstream is sized from it. Past the cap the tail is cut,
 // which narrows the query rather than widening it: the terms that survive still apply,

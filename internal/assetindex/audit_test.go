@@ -25,6 +25,7 @@ import (
 	"path"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -2284,5 +2285,65 @@ func TestAFailedDiscardDoesNotSpendTheRebuildClaim(t *testing.T) {
 	ix.releaseRebuild(fp)
 	if _, won := ix.claimRebuild(fp); !won {
 		t.Error("a released claim must be grantable again, or a failed discard freezes the archive")
+	}
+}
+
+// archive/zip returns a usable reader *alongside* ErrInsecurePath, for an entry whose
+// name is non-local or holds a backslash — what older Windows zip tooling writes. Read
+// as an ordinary failure it costs the whole archive, safe entries and all, and leaks
+// the reader it was handed back. It takes GODEBUG=zipinsecurepath=0 today, which this
+// test cannot set for itself (the value is read once at package init), so it asserts
+// the property directly: the opener must keep the reader and drop only the bad names.
+func TestAnInsecureEntryNameCostsItselfNotTheArchive(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "pack.zip")
+	f, err := os.Create(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := zip.NewWriter(f)
+	// A backslash name is one of the two shapes archive/zip calls insecure. Written raw
+	// because zw.Create would sanitise it.
+	w, err := zw.CreateRaw(&zip.FileHeader{Name: `SourceFiles\Sword.fbx`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.Write([]byte("SWORD"))
+	w2, err := zw.Create("SourceFiles/Shield.fbx")
+	if err != nil {
+		t.Fatal(err)
+	}
+	w2.Write([]byte("SHIELD"))
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	// openZip is what both the scan and the reader cache go through; ErrInsecurePath
+	// must not reach either as a failure.
+	zr, err := openZip(p)
+	if err != nil {
+		t.Fatalf("openZip refused an archive holding an insecure entry name: %v", err)
+	}
+	zr.Close()
+
+	assets, err := zipAssets(p, "pack.zip", "v", "P", "")
+	if err != nil {
+		t.Fatalf("zipAssets: %v", err)
+	}
+	var names []string
+	for _, a := range assets {
+		names = append(names, a.Name)
+	}
+	if len(assets) == 0 {
+		t.Fatal("the archive contributed nothing; one insecure name took every safe entry with it")
+	}
+	for _, a := range assets {
+		if strings.Contains(a.Source.Entry, `\`) && !safeEntry(a.Source.Entry) {
+			t.Errorf("indexed an entry safeEntry rejects: %q", a.Source.Entry)
+		}
+	}
+	if !slices.Contains(names, "Shield.fbx") {
+		t.Errorf("the safe entry is missing; got %v", names)
 	}
 }

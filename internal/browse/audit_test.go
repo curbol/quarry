@@ -570,11 +570,35 @@ func TestGroupedCardKeepsTheRootMotionSiblingOfAnyCopy(t *testing.T) {
 	if got := out.Items[walk].Count; got != 2 {
 		t.Fatalf("Walk.fbx card has %d copies, want 2 (the fixture must group them)", got)
 	}
-	if out.Items[walk].RootMotionID == "" {
-		t.Error("the card carries no rootMotionId, so the lightbox shows no root-motion toggle")
-		if !visible["Walk_RM.fbx"] {
-			t.Error("and Walk_RM.fbx is suppressed from the grid, so the file is unreachable in browse")
-		}
+	// Pack A's copy is the only one with a sibling, so that is the one the card has to
+	// take. Asserting merely that the id is non-empty passes just as well when pairing
+	// hands the card some other pack's RM, which is the failure that matters: a whole
+	// FBX card carries no clip name, so the frontend plays every clip in whatever file
+	// it is pointed at.
+	rmID := out.Items[walk].RootMotionID
+	if rmID == "" {
+		t.Fatal("the card carries no rootMotionId, so the lightbox shows no root-motion toggle")
+	}
+	// The id is asked to serve, because that is what the toggle does with it and it is
+	// the only handle on which file was chosen: the RM is suppressed from every
+	// listing, so there is no card to compare ids against. Pack A's RM is the only copy
+	// in the fixture with these bytes.
+	resp := mustGet(t, srv.URL+"/api/content?id="+url.QueryEscape(rmID))
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("the card's rootMotionId does not serve: %d", resp.StatusCode)
+	}
+	got, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "WALKRMBYTE" {
+		t.Errorf("rootMotionId serves %q, want pack A's Walk_RM.fbx", got)
+	}
+	// Unnested, so it runs on a green build: the RM the card plays must not also stand
+	// as a card of its own beside it.
+	if visible["Walk_RM.fbx"] {
+		t.Error("Walk_RM.fbx is both played by the card and shown beside it")
 	}
 }
 

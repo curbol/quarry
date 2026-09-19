@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -353,4 +354,43 @@ func TestFollowSymlinksFromFile(t *testing.T) {
 	if !c.FollowSymlinks {
 		t.Error("follow_symlinks = true in config.toml was not read")
 	}
+}
+
+// config.example.toml is not documentation: README tells the user to copy it verbatim
+// to config.toml, and Load refuses a file holding any key this version does not know.
+// So a setting documented in the example but never added to fileConfig — or renamed on
+// fileConfig with only the example's comment updated — is a config that fails on first
+// use, on the one file the setup instructions hand out. Nothing else connects the two:
+// the build, vet, gofmt and every other test stay green.
+//
+// Both halves are checked, because the example keeps its optional settings commented
+// out and copying it is only the first of them.
+func TestTheExampleConfigIsOneLoadAccepts(t *testing.T) {
+	clearQuarryEnv(t)
+	example, err := os.ReadFile(filepath.Join("..", "..", "config.example.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	load := func(t *testing.T, body string) {
+		t.Helper()
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(dir); err != nil {
+			t.Errorf("Load refused a config.toml copied from config.example.toml: %v", err)
+		}
+	}
+
+	t.Run("as shipped", func(t *testing.T) { load(t, string(example)) })
+
+	// Uncommenting every commented-out setting. The pattern matches an assignment
+	// behind a "#", not prose, so the surrounding explanation stays a comment.
+	setting := regexp.MustCompile(`(?m)^#\s*([a-z_][a-z0-9_]* *= *.+)$`)
+	uncommented := setting.ReplaceAllString(string(example), "$1")
+	if uncommented == string(example) {
+		t.Fatal("no commented-out setting matched; this test has stopped checking half of what it exists for")
+	}
+	t.Run("with every setting on", func(t *testing.T) { load(t, uncommented) })
 }

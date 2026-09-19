@@ -142,6 +142,17 @@ func TestResolveTagsPath(t *testing.T) {
 		t.Errorf("explicit --tags = %q", got)
 	}
 
+	// A leading ~ is expanded here rather than left to a shell that was never there:
+	// --tags reaches quarry verbatim from a systemd unit or a wrapper script. Unexpanded
+	// it survives all the way to serve's MkdirAll, which makes a directory literally
+	// named "~" beside the working directory and writes the tag store — the one thing
+	// quarry keeps that it cannot regenerate — into it, with nothing reported.
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if got, want := mustResolve("~/tags.toml"), filepath.Join(home, "tags.toml"); got != want {
+		t.Errorf("--tags ~/tags.toml = %q, want %q", got, want)
+	}
+
 	// With no project store in sight, the user-wide store in the config dir is used
 	// rather than tagging being switched off.
 	chdirCleanTree(t)
@@ -198,6 +209,22 @@ func TestRootFlagBeatsEnvironment(t *testing.T) {
 	}
 	if got != envRoot {
 		t.Errorf("with no --root, resolved root = %q, want QUARRY_ROOT %q", got, envRoot)
+	}
+
+	// --root arrives verbatim from a unit file or a wrapper script, with no shell in
+	// between to have expanded it. Left alone, the ~ reaches the scan as a directory
+	// name and the run fails naming a path that does not exist.
+	home := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, "assets"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	got = ""
+	if err := run([]string{"--config", cfgDir, "--cache", cacheDir, "--root", "~/assets"}); err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(home, "assets"); got != want {
+		t.Errorf("--root ~/assets resolved to %q, want %q", got, want)
 	}
 }
 

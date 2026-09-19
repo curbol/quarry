@@ -2004,41 +2004,67 @@ func mustAbs(t *testing.T, p string) string {
 // field comes from the path the walk took to reach it. Renaming the link moves the
 // second and not the first, so a blind reuse kept the old drive's name in the grid, in
 // the vendor facet and in `path:` search until the file's own size or mtime moved.
+// Both reuse branches carry the same guard and both have to be exercised: refresh keys
+// the loose branch on LoosePrint and the archive branch on ArchivePrint, and each
+// consults describes separately. An archive fixture is the one that matters most, since
+// its extraction directory is keyed off the print that does not move either.
 func TestRenamingAFollowedLinkRederivesItsDisplayFields(t *testing.T) {
-	root := t.TempDir()
-	outside := t.TempDir()
-	pack := filepath.Join(outside, "Synty", "POLYGON_Nature")
-	if err := os.MkdirAll(pack, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(pack, "Tree.fbx"), []byte("FBXBYTES"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	link := filepath.Join(root, "drive2")
-	if err := os.Symlink(outside, link); err != nil {
-		t.Fatal(err)
-	}
-	opt := Options{Root: root, CacheDir: t.TempDir(), FollowSymlinks: true}
-	first, err := LoadOrBuild(opt, false, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(first.Assets) != 1 || first.Assets[0].Vendor != "drive2" {
-		t.Fatalf("first build = %+v, want one asset under vendor drive2", first.Assets)
-	}
-	if err := os.Rename(link, filepath.Join(root, "synty-drive")); err != nil {
-		t.Fatal(err)
-	}
-	again, err := LoadOrBuild(opt, false, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(again.Assets) != 1 {
-		t.Fatalf("second build indexed %d assets, want 1", len(again.Assets))
-	}
-	a := again.Assets[0]
-	if a.Vendor != "synty-drive" || !strings.HasPrefix(a.RelPath, "synty-drive/") {
-		t.Errorf("after the rename: vendor %q, relpath %q; want the path the walk now takes", a.Vendor, a.RelPath)
+	for _, tc := range []struct {
+		name  string
+		write func(t *testing.T, pack string)
+		want  string // the asset name the rebuilt index must carry
+	}{
+		{"loose file", func(t *testing.T, pack string) {
+			if err := os.WriteFile(filepath.Join(pack, "Tree.fbx"), []byte("FBXBYTES"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}, "Tree.fbx"},
+		{"unitypackage", func(t *testing.T, pack string) {
+			writeUnityPackage(t, filepath.Join(pack, "POLYGON_Nature_Unity_2022_3_v1.unitypackage"), []unityGUID{
+				{guid: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", pathname: "Assets/Nature/Tree.fbx", asset: "FBXBYTES"},
+			})
+		}, "Tree.fbx"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			outside := t.TempDir()
+			pack := filepath.Join(outside, "Synty", "POLYGON_Nature")
+			if err := os.MkdirAll(pack, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			tc.write(t, pack)
+			link := filepath.Join(root, "drive2")
+			if err := os.Symlink(outside, link); err != nil {
+				t.Fatal(err)
+			}
+			opt := Options{Root: root, CacheDir: t.TempDir(), FollowSymlinks: true}
+			first, err := LoadOrBuild(opt, false, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(first.Assets) != 1 || first.Assets[0].Vendor != "drive2" {
+				t.Fatalf("first build = %+v, want one asset under vendor drive2", first.Assets)
+			}
+			// Renaming the link moves every display field without moving the file's own
+			// stat print, which is what the reuse decision keys on.
+			if err := os.Rename(link, filepath.Join(root, "synty-drive")); err != nil {
+				t.Fatal(err)
+			}
+			again, err := LoadOrBuild(opt, false, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(again.Assets) != 1 {
+				t.Fatalf("second build indexed %d assets, want 1", len(again.Assets))
+			}
+			a := again.Assets[0]
+			if a.Name != tc.want {
+				t.Fatalf("second build has %q, want %q", a.Name, tc.want)
+			}
+			if a.Vendor != "synty-drive" || !strings.HasPrefix(a.RelPath, "synty-drive/") {
+				t.Errorf("after the rename: vendor %q, relpath %q; want the path the walk now takes", a.Vendor, a.RelPath)
+			}
+		})
 	}
 }
 
@@ -2345,5 +2371,85 @@ func TestAnInsecureEntryNameCostsItselfNotTheArchive(t *testing.T) {
 	}
 	if !slices.Contains(names, "Shield.fbx") {
 		t.Errorf("the safe entry is missing; got %v", names)
+	}
+}
+
+// A derivation that failed is deliberately left out of the print maps: the stat print
+// describes the file, not whether reading it worked, so caching one would freeze the
+// degraded result in until the file's own size or mtime moved. The mode change below
+// is what makes that observable — it fixes the cause without touching either.
+//
+// The loose half is the one that bites hardest. With the print cached, the second run
+// finds no cached assets for the path, and describes answers true for an empty list, so
+// the file is "reused" as nothing: the asset is gone from the index for good, and the
+// skip that explained it was only ever reported on the first run.
+func TestAFailedDerivationIsNotCachedAgainstTheFilesPrint(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads a 0000 file, so there is no failure to recover from")
+	}
+	for _, tc := range []struct {
+		name  string
+		write func(t *testing.T, pack string) string // returns the path to make unreadable
+		want  string
+	}{
+		{"loose file", func(t *testing.T, pack string) string {
+			p := filepath.Join(pack, "Tree.fbx")
+			if err := os.WriteFile(p, []byte("FBXBYTES"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			return p
+		}, "Tree.fbx"},
+		{"archive", func(t *testing.T, pack string) string {
+			p := filepath.Join(pack, "POLYGON_Nature_Unity_2022_3_v1.unitypackage")
+			writeUnityPackage(t, p, []unityGUID{
+				{guid: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", pathname: "Assets/Nature/Tree.fbx", asset: "FBXBYTES"},
+			})
+			return p
+		}, "Tree.fbx"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			pack := filepath.Join(root, "Synty", "POLYGON_Nature")
+			if err := os.MkdirAll(pack, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			target := tc.write(t, pack)
+			if err := os.Chmod(target, 0o000); err != nil {
+				t.Fatal(err)
+			}
+			opt := Options{Root: root, CacheDir: t.TempDir()}
+			first, err := LoadOrBuild(opt, false, nil)
+			if err != nil {
+				t.Fatalf("an unreadable file must cost itself, not the build: %v", err)
+			}
+			if len(first.Assets) != 0 {
+				t.Fatalf("first build indexed %d assets from an unreadable file", len(first.Assets))
+			}
+			if len(first.Skipped) != 1 {
+				t.Fatalf("first build recorded %d skips, want 1", len(first.Skipped))
+			}
+
+			// Mode only: size and mtime are untouched, so the stat print is the same one
+			// the failed run saw. Caching it would make this run reuse the failure.
+			if err := os.Chmod(target, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			again, err := LoadOrBuild(opt, false, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(again.Assets) != 1 {
+				t.Fatalf("after the cause was fixed the index holds %d assets, want 1: the failure was cached against a print that does not move", len(again.Assets))
+			}
+			if got := again.Assets[0].Name; got != tc.want {
+				t.Errorf("recovered asset is %q, want %q", got, tc.want)
+			}
+			if again.Assets[0].Fingerprint == "" {
+				t.Error("the recovered asset has no fingerprint, so it cannot be tagged")
+			}
+			if len(again.Skipped) != 0 {
+				t.Errorf("the skip survived the recovery: %+v", again.Skipped)
+			}
+		})
 	}
 }

@@ -56,6 +56,12 @@ func TestWalkReportsSymlinkOutOfRoot(t *testing.T) {
 		if !strings.Contains(s.Reason, "outside the library root") {
 			t.Errorf("skip reason for %s = %q, want it to name the cause", s.RelPath, s.Reason)
 		}
+		// Naming the cause is not enough: the user is looking at a library with a whole
+		// drive missing from it, and the flag that indexes it is the only thing that
+		// turns the message into something they can act on.
+		if !strings.Contains(s.Reason, "--follow-symlinks") {
+			t.Errorf("skip reason for %s = %q, want it to name the flag that would index it", s.RelPath, s.Reason)
+		}
 	}
 }
 

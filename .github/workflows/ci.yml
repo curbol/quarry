@@ -40,6 +40,14 @@ jobs:
 
       - run: go vet ./...
 
+      # install.sh is the only install path and the only recovery when `quarry update`
+      # refuses a dev build, and nothing else here reads it: the guard tests in
+      # selfupdate parse it as text for its platform labels, so a stray brace or a
+      # missing `fi` passes them and merges. This is a parse, not a run — the script
+      # downloads a release and writes to ~/.local/bin.
+      - name: install.sh parses
+        run: bash -n install.sh
+
       # The tag store is mutated under a mutex by concurrent requests, and scanning
       # fans out over the tree, so the suite is worth running under the detector.
       - run: go test -race ./...

@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadMissingIsEmpty(t *testing.T) {
@@ -287,11 +288,39 @@ func TestDiscoverWalksUp(t *testing.T) {
 	}
 }
 
+// The walk has to terminate at "/" rather than loop on the root's own parent, whose
+// Dir is itself. Asserting that a temp dir turns up nothing would test the machine
+// instead: Discover walks the real tree, so anyone with a store at or above $TMPDIR —
+// TMPDIR set inside a project, or one `quarry --tags /tmp/...` run once — gets a
+// failure naming a path nothing here wrote. What is actually quarry's to promise is
+// that the walk ends, and that whatever it returns is a real store above where it
+// started.
 func TestDiscoverStopsAtFilesystemRoot(t *testing.T) {
-	// A temp dir has no store above it up to /, so the walk must terminate rather
-	// than loop on the root's own parent.
-	if got, ok := Discover(t.TempDir()); ok {
-		t.Errorf("Discover found %q, want no hit", got)
+	dir := t.TempDir()
+	done := make(chan struct{})
+	var got string
+	var ok bool
+	go func() {
+		defer close(done)
+		got, ok = Discover(dir)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Discover did not terminate: the walk is looping at the filesystem root")
+	}
+	if !ok {
+		return // the ordinary case: nothing above the temp dir
+	}
+	// A hit is only legitimate if it is a store this machine really has above dir.
+	if filepath.Base(got) != FileName {
+		t.Errorf("Discover returned %q, which is not a %s", got, FileName)
+	}
+	if fi, err := os.Stat(got); err != nil || !fi.Mode().IsRegular() {
+		t.Errorf("Discover returned %q, which is not a readable file: %v", got, err)
+	}
+	if rel, err := filepath.Rel(filepath.Dir(got), dir); err != nil || strings.HasPrefix(rel, "..") {
+		t.Errorf("Discover returned %q, which is not above %q", got, dir)
 	}
 }
 

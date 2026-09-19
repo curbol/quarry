@@ -146,13 +146,21 @@ and one that animates in place — collapses to a single card in the `browse` la
 `assetindex`, which keeps both files as faithful assets). The in-place variant is the visible
 card carrying `rootMotionId`, the RM variant's asset id; the lightbox's root-motion toggle loads
 that file to show the travel, and the RM card is suppressed from the grid. Pairing groups assets
-by `(vendor, pack, canonical file base)` where the canonical base strips the `_RM` token — a
-trailing `_RM` (Quaternius/explosive GLBs) or a `_RM_` infix before a suffix (Synty FBX,
-`..._180L_RM_Masc`) — and pairs a group's in-place animations to its RM sibling, preferring one in the same
-directory, then the same archive. The directory
-is a preference rather than part of the key because a pack laid out per character holds
-several same-named clips with their own RM files, while another ships every RM in one
-folder; keying on it would mispair the first and stop pairing the second. Because a
+by `(vendor, pack, canonical file base)`, where the canonical base strips the `_RM` token.
+`assetindex.RootMotionVariant` is the one recognizer that decides what a token is, and its doc
+comment is the authority on the conventions it knows (currently four: a trailing `_RM`, a `_RM_`
+infix, a ` [RM]` bracket suffix, and a `_RootMotion_` infix); teaching it a fifth means bumping
+`indexVersion`, because the GLB-split gate reads it at scan time and browse pairing reads it live.
+
+The directory is not part of the key, but it is not merely a preference either. Asked per
+container format, since a sibling has to be the same one: if any in-place asset in the group has
+an RM in its own directory, the directory becomes a **filter** — a card whose own directory ships
+no RM gets no sibling rather than a neighbour's, because in a per-character layout the directory
+is the only thing telling one character's "Walk" from another's, and a wrong sibling is a
+plausible clip out of a file that loads, with nothing to signal it. Where no card has an RM beside
+it the filter does not engage, and candidates are ranked by how many trailing path segments they
+share with the card, then by being in the same archive — which is what separates a layout that
+mirrors per-character folders under one root-motion tree. Because a
 result card groups by name and size while pairing groups by pack, a card can span the
 copy that owns the sibling and one that does not, so the card takes the sibling of
 whichever of its copies has one. This is orthogonal to whether the clip has

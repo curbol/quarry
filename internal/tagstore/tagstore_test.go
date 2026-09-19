@@ -925,40 +925,6 @@ func TestAwkwardLabelsAndFingerprintsRoundTrip(t *testing.T) {
 	}
 }
 
-// The staleness check is what stands between an outside edit and a rewrite that
-// destroys it, and the file it checks has to stay the file the store reads. A save
-// elsewhere — a backup, an export — is not a change of home: if it were, the real
-// store would be unguarded from then on, and the very next tag click would overwrite
-// whatever an editor or a checkout had put there.
-func TestSaveElsewhereDoesNotMoveTheGuardedFile(t *testing.T) {
-	dir := t.TempDir()
-	real := filepath.Join(dir, FileName)
-	if err := os.WriteFile(real, []byte("[[tag]]\n  id = \"hero\"\n  color = \"#e11d48\"\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	s, err := Load(real)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := s.Save(filepath.Join(dir, "backup.toml")); err != nil {
-		t.Fatal(err)
-	}
-	// Someone else edits the store this one is actually for.
-	if err := os.WriteFile(real, []byte("[[tag]]\n  id = \"villain\"\n  color = \"#00ff00\"\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.Save(real); !errors.Is(err, ErrStale) {
-		t.Fatalf("Save after an outside edit = %v, want ErrStale; the export moved the guard", err)
-	}
-	b, err := os.ReadFile(real)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(b), "villain") {
-		t.Errorf("the outside edit was overwritten: %s", b)
-	}
-}
-
 func TestUnlinkSurvivesARoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), FileName)
 	s := New()
@@ -1034,9 +1000,23 @@ func TestSaveRefusesAFileThisStoreNeverRead(t *testing.T) {
 		t.Errorf("second export over the same backup = %v, want ErrStale", err)
 	}
 
-	// And the home never moved: the real store is still the guarded one.
+	// And the home never moved, in both directions. It still accepts the file this store
+	// read, and still guards it: if an export had moved the home, the real store would be
+	// unguarded from then on and the next tag click would overwrite whatever an editor or
+	// a checkout had put there.
 	if err := s.Save(real); err != nil {
 		t.Errorf("saving the file this store loaded = %v, want success", err)
+	}
+	if err := os.WriteFile(real, []byte("[[tag]]\n  id = \"villain\"\n  color = \"#00ff00\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Save(real); !errors.Is(err, ErrStale) {
+		t.Fatalf("Save after an outside edit = %v, want ErrStale; the export moved the guard", err)
+	}
+	if b, err := os.ReadFile(real); err != nil {
+		t.Fatal(err)
+	} else if !strings.Contains(string(b), "villain") {
+		t.Errorf("the outside edit was overwritten: %s", b)
 	}
 }
 func TestOverlappingGroupRowsMergeOnLoad(t *testing.T) {

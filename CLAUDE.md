@@ -74,7 +74,10 @@ packages, each with a package doc comment stating its contract:
   helpers the page shares with `thumbworker.js`, and `gridwindow.js` / `jobtracker.js` /
   `rigmatch.js` / `tagedit.js` / `cliptrim.js` / `thumbcache.js` / `charstore.js` the
   pure decisions the Node tests cover — all seven THREE-free precisely so they can be,
-  and the first five import nothing at all. `app.js`'s static import graph reaches none
+  and the first six import nothing at all, `charstore.js` only `./rigmatch.js`. That is
+  also why `resolveRig` lives in `charstore.js` rather than beside the loaders it drives:
+  it is control flow over the registry and two injected callbacks, and its eviction rule
+  is exactly the kind of thing that fails silently. `app.js`'s static import graph reaches none
   of the 3D stack: it takes `contentURL` / `thumbURL` and the character registry from
   `charstore.js`, and loads `viewer.js` with a dynamic `import()` when a lightbox first
   needs one, so the grid's first request does not wait on three.js. `includeRelated=1`

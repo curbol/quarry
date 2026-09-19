@@ -290,19 +290,30 @@ each package's doc comment restates its own share.
   one recognizer shared by the GLB-split gate and browse pairing, so a change here moves
   both. Tier 1.
 - Root-motion pairing (`pairing.go`): pairs within `(vendor, pack, canonical base)`.
-  `pickRM` weights two terms rather than ordering them, same directory above same
-  archive, so a same-directory RM in another archive beats a different-directory RM in
-  this one. Directory is a preference, not part of the key. Which clip inside the chosen
-  RM file plays is not decided here at all: an RM file is never split, so it arrives
+  Directory is not part of the key, and it is a filter rather than a weight:
+  `groupPairsByDirectory` asks — per container format, since `pickRM` only selects within
+  one — whether any in-place asset in the group has an RM in its own directory, and if so
+  a card whose directory ships none gets no sibling rather than a neighbour's. Where it
+  does not engage, `pickRM` ranks `dirAffinity` (shared trailing path segments) above
+  same-archive, which is what separates a layout mirroring per-character folders under one
+  root-motion tree from one that ships every RM in a single folder. Which clip inside the
+  chosen RM file plays is not decided here at all: an RM file is never split, so it arrives
   whole and the frontend matches the clip. Because a card groups by name and size while
   pairing groups by pack, a card takes the sibling of whichever copy has one. Verify the
-  weighting and the cross-copy fallback. Tier 1/2.
+  ranking, the per-format probe, and the cross-copy fallback. Tier 1/2.
 - The search query parser (`searchquery.go`): verify `OR` binds looser than implicit AND,
   plus negation, quoted phrases, grouping, and field scoping against the grammar in the
   file's doc comment. Confirm `maxQueryBytes` truncation cannot split a multi-byte rune
   into a term, that `maxQueryDepth` actually bounds `parsePrimary`'s recursion, and that
   `dropUnmatchedClose` plus the run-to-the-end loop discard no term the user typed.
-  Malformed input must degrade to a best effort, never error or panic. Tier 1/2.
+  Malformed input must degrade to a best effort, never error or panic. The direction of
+  that degrading is the part to check by evaluating, not just by parsing: a query the
+  parser declines must **narrow**, never answer, and a query with no terms in it is the
+  all-match. Truncation trims only a trailing partial rune (a whole-string validity test
+  walked one bad byte into an empty query, and `q` need not be valid UTF-8); an over-deep
+  group becomes `neverNode` rather than nothing, and a negation whose own subtree hit the
+  cap is declined too, since a group matching nothing complements to one matching
+  everything. Tier 1/2.
 - Card grouping and facets (`cards.go`, `server.go`): `groupKey` is the single notion of
   "one card", and `ungrouped()` the single reading of `group=`. `buildFacets` counts
   both ways in one pass over the library. Confirm the results and the facets in a
@@ -388,6 +399,13 @@ each package's doc comment restates its own share.
   `clipsMatching`, `hasNamedBody`, and `storedBindFits` against their doc comments.
   Getting one wrong does not break the page; it previews a plausible-looking but wrong
   animation, or poses a clip onto a rig it does not fit. Tier 1/2.
+- Rig search (`charstore.js` `resolveRig`): a falsy `tryLoad` evicts the registry entry,
+  so the `cancelled` check *after* the await is what separates "this entry does not load"
+  from "nobody is waiting any more". Its two callers disagree on the convention by design
+  — the viewer returns true when superseded, the worker returns null — which is why
+  `cancelled` is required rather than defaulted. Evicting on an abandoned search empties
+  the registry of every body covering the skeleton and leaves the already-searched memos
+  set, so the pack's clips draw the category icon until a reseed. Tier 1.
 - Clip trimming (`cliptrim.js`): `lastMotionTime` scores each track against its own peak
   per-keyframe change, so `MOTION_FLOOR` is relative and `STILL_TRACK` drops a merely
   noisy bone entirely; `trimmedDuration` cuts only when more than `DEAD_TAIL` of held

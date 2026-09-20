@@ -18,15 +18,15 @@ Scope: $ARGUMENTS
   (`main.go`, `main_test.go`), the embedded frontend in `internal/browse/assets/`
   (`app.js`, `viewer.js`, `scene.js`, `thumbs.js`, `thumbworker.js`, `gridwindow.js`,
   `jobtracker.js`, `rigmatch.js`, `tagedit.js`, `cliptrim.js`, `thumbcache.js`,
-  `charstore.js`, `icons.js`, `index.html`,
-  `style.css`), the Node tests in `internal/browse/jstest/`, `install.sh`,
+  `fontcache.js`, `charstore.js`, `icons.js`, `index.html`, `style.css`), the Node tests in `internal/browse/jstest/`, `install.sh`,
   `config.example.toml`, and `.github/workflows/ci.yml` and `release.yml`.
 - **With scope:** interpret the user's wording to identify which packages, frontend
   modules, or root-level files to review. When in doubt, include more rather than less.
 
 The two repo-config files are in scope because code depends on their contents, not
 merely on their existing. `release.yml`'s platform list has to agree with
-`selfupdate.releaseSuffix` and with the labels `install.sh` composes from `uname`, and
+`selfupdate.releaseSuffix`, with `ci.yml`'s cross-compile loop, and with the labels
+`install.sh` composes from `uname`, and
 `config.example.toml` is copied verbatim into a `config.toml` that `config.Load`
 rejects for any key it does not know, so a key here that `fileConfig` lacks is a config
 file that fails on first use.
@@ -55,8 +55,9 @@ node --test 'internal/browse/jstest/*.test.mjs'  # needs node on PATH; nothing i
 The whole suite runs in seconds and is fully offline: browse tests run against
 `net/http/httptest` servers over indexes built in temp dirs, selfupdate against a stub
 release server, and nothing touches the network or a real asset library. The Node tests
-cover only the seven THREE-free frontend modules (`gridwindow.js`, `jobtracker.js`,
-`rigmatch.js`, `tagedit.js`, `cliptrim.js`, `thumbcache.js`, `charstore.js`); every
+cover only the eight THREE-free frontend modules (`gridwindow.js`, `jobtracker.js`,
+`rigmatch.js`, `tagedit.js`, `cliptrim.js`, `thumbcache.js`, `fontcache.js`,
+`charstore.js`); every
 other frontend module (`app.js`,
 `viewer.js`, `scene.js`, `thumbs.js`, `thumbworker.js`) has no test at all, so a green
 run says nothing about them. There is no Makefile, task runner, or linter config in the
@@ -102,7 +103,8 @@ agents run in parallel:
   load, the stale-file guard, `Discover`.
 - **Frontend**: `internal/browse/assets/app.js`, `viewer.js`, `scene.js`, `thumbs.js`,
   `thumbworker.js`, `gridwindow.js`, `jobtracker.js`, `rigmatch.js`, `tagedit.js`,
-  `cliptrim.js`, `thumbcache.js`, `charstore.js`, `icons.js`, `index.html`, `style.css`, and
+  `cliptrim.js`, `thumbcache.js`, `fontcache.js`, `charstore.js`, `icons.js`,
+  `index.html`, `style.css`, and
   `internal/browse/jstest/*.test.mjs`. Grid recycling, bounded caches, the lightbox's
   shared WebGL context, worker job dispatch, rig matching, clip retargeting, and
   deciding where a padded clip actually stops. No build step and no bundler: modules
@@ -162,7 +164,7 @@ each package's doc comment restates its own share.
   embeds a machine-absolute path and a version-bearing archive name, so it is neither
   portable nor stable. *Violation:* any tag or link path that keys on `ID`; any change
   to how a fingerprint is derived, to an indexed field, or to what extraction writes
-  without bumping `assetindex.indexVersion` (`cache.go`, currently 22). *Check:* grep
+  without bumping `assetindex.indexVersion` (`cache.go`, currently 24). *Check:* grep
   `Fingerprint` and `\.ID` through `internal/tagstore/`, `browse/tags.go`,
   `browse/links.go`; confirm `indexVersion` is compared on cache load.
 - **The library is read-only.** The tag store is the only thing quarry may write inside
@@ -233,6 +235,37 @@ each package's doc comment restates its own share.
   folded in. *Violation:* a response pairing one grouping's results with the other's
   facets; a second, independent reading of `group=`; a count folding in fingerprints no
   filter can return.
+- **An archive entry is read as a path, not as a name.** Older Windows zip tooling writes
+  `\` as the separator, and taken literally such an entry is one long segment: the card is
+  named for its whole internal path, the classifier's `/`, `_`, `:` boundaries never fire,
+  a dot-directory inside it is not recognised, and no extracted twin can produce the same
+  dedup key. `zip.entryPath` normalizes once; `Source.EntryPath` is what everything
+  treating an entry as a path uses, and `Source.Entry` keeps the stored spelling because
+  that is the key the central directory resolves. *Violation:* a path rule applied to
+  `Source.Entry` directly, or `safeEntry` applied to an un-normalized name — a `..\..\x`
+  escapes exactly as `../../x` does.
+- **The scan root is absolute, and has no default.** An unset root is an error, never a
+  guess at cwd; a relative one from `config.toml` or `QUARRY_ROOT` is an error too, since
+  both follow the user into every directory and would mean a different library in each. A
+  relative `--root` is the deliberate exception, resolved against the working directory as
+  one invocation saying "here". *Violation:* the absolute check moved onto `--root`, or
+  dropped from either persistent source.
+- **A library's bytes are served under an inert content type, with `nosniff`.** A pack
+  ships whatever its author put in it, and a response the browser will run as a document
+  runs it in this server's origin — where the content-type guard and `guardHost` both step
+  aside by design, because the Host is genuinely quarry's and a same-origin fetch needs no
+  preflight. *Violation:* `image/svg+xml` or any other scriptable type in `contentType`; a
+  missing `X-Content-Type-Options: nosniff` on `/api/content` or `/api/thumb`. *Check:*
+  `TestNoContentTypeIsOneTheBrowserWouldRunAsADocument` derives the extension list from
+  `classify.go`.
+- **An assembled Sidekick character's byproducts go on both sides.** `applySidekick` drops
+  them inside the package it can read the `.sk` out of; `dedup` drops the loose copies a
+  pack unpacked beside itself leaves in the library, which are not archive entries and so
+  are invisible to the first rule. `Source.Complete` is indexed rather than recomputed
+  because the second pass has no archive to re-read the `.sk` from. *Violation:* the loose
+  drop keyed on anything a cache reuse does not carry; a partial character losing its
+  byproducts, which are the rows that still show the whole thing; one pack's scope
+  claiming another's files, since two Synty packages have identical internal trees.
 - **Vendor heuristics stay additive.** Synty / kevdev / Quaternius knowledge lives in
   named helpers (`sidekick.go`, `rootmotion.go`, `classify.go`, `pairing.go`). An
   unrecognized vendor's files must still index, serve, and preview. *Violation:* a
@@ -245,11 +278,13 @@ each package's doc comment restates its own share.
   index. Equally: a derivation that failed must not be cached, since the stat print
   describes the file, not whether reading it worked.
 - **The Node-tested frontend modules stay loadable with nothing installed.**
-  `gridwindow.js`, `jobtracker.js`, `rigmatch.js`, `tagedit.js`, `cliptrim.js` and
-  `thumbcache.js` are THREE-free and import nothing at all; `charstore.js` is THREE-free
-  and imports only `./rigmatch.js`, relatively, which is what lets `node --test` resolve
-  it. *Violation:* any `import` added to the six, or an absolute `/static/` import added
-  to `charstore.js`. *Check:* `grep -n '^import'` over the six returns nothing.
+  `gridwindow.js`, `jobtracker.js`, `rigmatch.js`, `tagedit.js`, `cliptrim.js`,
+  `thumbcache.js` and `fontcache.js` are THREE-free and import nothing at all;
+  `charstore.js` is THREE-free and imports only `./rigmatch.js`, relatively, which is
+  what lets `node --test` resolve it. *Violation:* any `import` added to the seven, or an
+  absolute `/static/` import added to `charstore.js`. *Check:*
+  `TestEveryNodeTestedModuleLoadsWithNothingInstalled` in `internal/browse/audit_test.go`
+  derives the set from `jstest/` and pins this.
 - **`app.js`'s static import graph reaches no three.js.** The grid's first paint waits on
   the whole graph, and it needs three for none of it: `contentURL` / `thumbURL` and the
   character registry come from `charstore.js`, and `viewer.js` is loaded with a dynamic
@@ -258,15 +293,19 @@ each package's doc comment restates its own share.
   `TestTheGridDoesNotLoadThreeToRenderItself` and
   `TestEveryFrontendImportResolvesToAnEmbeddedFile` in `internal/browse/audit_test.go`
   pin this and the import map alongside it.
-- **The release labels agree in three places.** `.github/workflows/release.yml` builds a
+- **The release labels agree in four places.** `.github/workflows/release.yml` builds a
   fixed list of `goos/goarch/label` triples and publishes `quarry-<version>-<label>.zip`;
   `selfupdate.releaseSuffix` names the asset `quarry update` asks for; `install.sh`
-  composes the same label from `uname`. A label added or renamed in one place and not
-  the others is an update or a first install that cannot find its asset, on a platform
-  the release does build. *Violation:* any of the three edited alone. *Check:*
-  `TestReleaseSuffixMatchesTheWorkflowLabels` and `TestInstallScriptComposesPublishedLabels`
-  in `internal/selfupdate/audit_test.go` parse the other two files and pin this; both
-  fail loudly if their regexes stop matching, so a green run is real evidence.
+  composes the same label from `uname`; `ci.yml` cross-compiles the same set on the PR,
+  so a platform-specific compile error is found before the tag rather than by a failed
+  release that needs a new one. A label added or renamed in one place and not the others
+  is an update or a first install that cannot find its asset, on a platform the release
+  does build. *Violation:* any of the four edited alone. *Check:*
+  `TestReleaseSuffixMatchesTheWorkflowLabels` parses `release.yml` and `ci.yml`, and
+  `TestInstallScriptComposesPublishedLabels` parses `install.sh`, both in
+  `internal/selfupdate/audit_test.go`; each fails loudly if its regex stops matching, so
+  a green run is real evidence. `TestEveryFatalPathInTheInstallScriptExits` covers the
+  other way install.sh fails silently.
 - **No machine-specific paths or personal data in the repo.** A hard-coded absolute
   path, home directory, or personal library location in code or committed files is a
   violation. Paths resolve via XDG with the documented precedence, and every resolved
@@ -291,12 +330,15 @@ each package's doc comment restates its own share.
   both. Tier 1.
 - Root-motion pairing (`pairing.go`): pairs within `(vendor, pack, canonical base)`.
   Directory is not part of the key, and it is a filter rather than a weight:
-  `groupPairsByDirectory` asks — per container format, since `pickRM` only selects within
-  one — whether any in-place asset in the group has an RM in its own directory, and if so
-  a card whose directory ships none gets no sibling rather than a neighbour's. Where it
-  does not engage, `pickRM` ranks `dirAffinity` (shared trailing path segments) above
-  same-archive, which is what separates a layout mirroring per-character folders under one
-  root-motion tree from one that ships every RM in a single folder. Which clip inside the
+  `groupPairsByDirectory` asks — per `probeKey`, one container format inside one archive,
+  since that is the narrowest set `pickRM` selects within — whether any in-place asset in
+  the group has an RM in its own directory, and if so a card whose directory ships none
+  gets no sibling rather than a neighbour's. Where it does not engage, `pickRM` ranks
+  `dirAffinity` (shared trailing path segments) above same-archive, which is what
+  separates a layout mirroring per-character folders under one root-motion tree from one
+  that ships every RM in a single folder — and `bestClaim` holds a candidate to the best
+  affinity any card in the group reaches with it, since ranking alone still hands the
+  last remaining candidate to a card it does not belong to. Which clip inside the
   chosen RM file plays is not decided here at all: an RM file is never split, so it arrives
   whole and the frontend matches the clip. Because a card groups by name and size while
   pairing groups by pack, a card takes the sibling of whichever copy has one. Verify the
@@ -309,8 +351,10 @@ each package's doc comment restates its own share.
   Malformed input must degrade to a best effort, never error or panic. The direction of
   that degrading is the part to check by evaluating, not just by parsing: a query the
   parser declines must **narrow**, never answer, and a query with no terms in it is the
-  all-match. Truncation trims only a trailing partial rune (a whole-string validity test
-  walked one bad byte into an empty query, and `q` need not be valid UTF-8); an over-deep
+  all-match. Truncation trims only a trailing partial rune, and is bounded to
+  `utf8.UTFMax-1` bytes (a whole-string validity test walked one bad byte into an empty
+  query, and an unbounded trim did the same to input holding no byte that can begin a
+  rune at all; `q` need not be valid UTF-8); an over-deep
   group becomes `neverNode` rather than nothing, and a negation whose own subtree hit the
   cap is declined too, since a group matching nothing complements to one matching
   everything. Tier 1/2.
@@ -354,9 +398,12 @@ each package's doc comment restates its own share.
 - Torn versus re-shipped (`content.go`, `zip.go`): a size disagreement has two causes and
   only one is repairable. An archive replaced in place since the scan extracts correctly
   under its new print, so rebuilding reproduces the disagreement forever; that case is
-  detected by comparing `ix.ArchivePrint` against a fresh fingerprint and reported as a
-  miss wrapping `fs.ErrNotExist`, the same way `openZipEntry` reports an entry the
-  archive stopped carrying, so browse answers 404 rather than 500. An archive with no
+  detected by comparing `ix.ArchivePrint` against a fresh fingerprint (`reshipped`) and
+  reported as a miss wrapping `fs.ErrNotExist` (`reshipError`), the same way
+  `openZipEntry` reports an entry the archive stopped carrying, so browse answers 404
+  rather than 500. `ensureExtracted` asks the same question before it decompresses, so an
+  archive the index no longer describes costs a stat rather than a full extraction whose
+  bytes are then never served from. An archive with no
   recorded print took a degraded enumeration and keeps the repair. `claimRebuild` makes
   the repair once per extraction, because a second disagreement means the tree was never
   the cause and each discard deletes the tree healthy siblings are being served from.
@@ -445,10 +492,13 @@ each package's doc comment restates its own share.
 - Pruning removes only extractions the current index no longer references, plus trees
   from another `indexVersion`, and never reaches outside `<cache>/roots/<hash>/`. A prune
   that could delete a live extraction, or one another root or a concurrent instance is
-  serving, is Tier 1. `PruneUnpacked` reads its keep-set off the index it is called on,
-  so calling it on anything narrowed, filtered, truncated or half-populated deletes the
-  extractions of everything missing, which are live for whoever is still serving them:
-  confirm every caller passes an index a full `Build` or `LoadOrBuild` just produced.
+  serving, is Tier 1. `PruneUnpacked`'s keep-set is the snapshot `refresh` took of what
+  the walk reached (`Index.liveUnpacked`), not a re-derivation from `Assets` — which is
+  exported, so a caller that filtered or truncated it would otherwise sweep the
+  extractions of everything it removed, live for whoever is still serving them. An index
+  no refresh produced has no snapshot and the sweep refuses with
+  `ErrPruneWithoutRefresh`, because an empty keep-set reads as "nothing is live" and
+  deletes the lot. *Check:* `TestPruneRefusesAnIndexNoWalkProduced`.
 - `safewrite.Atomic` and `safewrite.Stream` must remove the temp file on every failure
   path, preserve the target's permissions, and resolve a symlinked destination before
   choosing the temp directory. Tier 1.
@@ -578,7 +628,7 @@ each package's doc comment restates its own share.
 **Test quality (assess each suite as a whole, not test by test)**
 
 Go tests use the standard library `testing` package with table-driven cases and
-`httptest` servers, with no testify. Frontend tests use Node's own runner over the seven
+`httptest` servers, with no testify. Frontend tests use Node's own runner over the eight
 THREE-free modules, with no `package.json` and nothing installed; do not propose growing
 that into a general frontend harness. Each of `assetindex`, `browse`, and `selfupdate`
 also carries an `audit_test.go` of guard tests from earlier audits; a new invariant
@@ -627,10 +677,10 @@ No linter runs over the frontend, so nothing else decides these.
 - Module boundaries: `app.js` owns the page, `viewer.js` is the only three.js consumer on
   the main thread, `scene.js` is what the worker and the viewer share, and
   `gridwindow.js` / `jobtracker.js` / `rigmatch.js` / `tagedit.js` / `cliptrim.js` /
-  `thumbcache.js` / `charstore.js` are the pure decisions below all of it. A three.js
-  import appearing outside `viewer.js`, `scene.js`, and `thumbworker.js` is a boundary
-  erosion; any import at all in one of the six import-free modules breaks `node --test`,
-  as does an absolute `/static/` one in `charstore.js`. Tier 2.
+  `thumbcache.js` / `fontcache.js` / `charstore.js` are the pure decisions below all of
+  it. A three.js import appearing outside `viewer.js`, `scene.js`, and `thumbworker.js`
+  is a boundary erosion; any import at all in one of the seven import-free modules breaks
+  `node --test`, as does an absolute `/static/` one in `charstore.js`. Tier 2.
 
 **Cross-boundary consistency (flag here, synthesized in Step 4)**
 

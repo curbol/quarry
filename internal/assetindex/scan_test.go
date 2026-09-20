@@ -233,6 +233,12 @@ func TestScanImageDimensions(t *testing.T) {
 	if m[0].Width != 0 || m[0].Height != 0 {
 		t.Errorf("Model.fbx dims = %dx%d, want 0x0", m[0].Width, m[0].Height)
 	}
+	// The five named above and nothing else. Asserted by name alone, an asset the scan
+	// *invents* is invisible: a zip directory entry read as a file passed this test and
+	// every other one in the package for as long as nobody counted the total.
+	if len(assets) != 5 {
+		t.Errorf("indexed %d assets, want the 5 written here: %v", len(assets), names(assets))
+	}
 }
 
 func TestScanFixtureLibrary(t *testing.T) {
@@ -317,5 +323,14 @@ func TestScanFixtureLibrary(t *testing.T) {
 	}
 	if !sawALoose || !sawBZip {
 		t.Errorf("dedup wrong: sawALoose=%v sawBZip=%v", sawALoose, sawBZip)
+	}
+
+	// Exactly what the fixture writes, minus what the rules above drop: the two zip
+	// entries, the Unity prefab, the loose glb, pack A's loose Idle.fbx, and pack B's
+	// zipped one. Every other assertion here is a presence test, which says nothing
+	// about a row the scan added on its own — the directory entry written above went
+	// unnoticed that way.
+	if len(assets) != 6 {
+		t.Errorf("indexed %d assets, want 6: %v", len(assets), names(assets))
 	}
 }

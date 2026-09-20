@@ -128,13 +128,19 @@ func resolveXDG(flag, ownEnv, xdgEnv, homeSub, what, hint string) (string, error
 	return filepath.Join(home, homeSub, "quarry"), nil
 }
 
-// Load reads an optional config.toml in dir, then applies the QUARRY_ROOT override. A
-// missing config.toml is fine: every setting has a flag. Anything else about the file
-// is reported rather than absorbed — a config that cannot be read is not a config that
-// is absent, and a key this version does not know is a setting the user believes is in
-// effect. A silently ignored `follow_symlink` typo is a whole drive missing from the
-// index with nothing said.
-func Load(dir string) (Config, error) {
+// Load reads an optional config.toml in dir, then applies the QUARRY_ROOT override and
+// finally rootFlag. A missing config.toml is fine: every setting has a flag. Anything
+// else about the file is reported rather than absorbed — a config that cannot be read
+// is not a config that is absent, and a key this version does not know is a setting the
+// user believes is in effect. A silently ignored `follow_symlink` typo is a whole drive
+// missing from the index with nothing said.
+//
+// rootFlag is resolved here rather than by the caller so that the whole precedence
+// chain settles in one place. Applied afterwards, the absolute-path rule below ran
+// against a value the flag was about to discard: a relative QUARRY_ROOT in a shell rc
+// refused the run whatever --root said, and the refusal's own advice — pass --root —
+// reproduced it, leaving no flag that could start quarry at all.
+func Load(dir, rootFlag string) (Config, error) {
 	var c Config
 	p := filepath.Join(dir, "config.toml")
 	var fc fileConfig
@@ -153,12 +159,36 @@ func Load(dir string) (Config, error) {
 		}
 		c.Root, c.FollowSymlinks = fc.Root, fc.FollowSymlinks
 	}
+	// Named, so the error can say which of the two the user has to go and change. They
+	// live in different files and only one of them is in dir.
+	source := p
 	if v := os.Getenv("QUARRY_ROOT"); v != "" {
-		c.Root = v
+		c.Root, source = v, "QUARRY_ROOT"
+	}
+	// The flag wins outright, and the absolute-path rule below does not apply to it:
+	// one invocation saying "here" means this directory, and that is the whole of what
+	// distinguishes it from the two sources that follow the user everywhere. Returning
+	// before the rule rather than exempting the value inside it is what keeps a bad
+	// persistent setting from refusing a run the flag has already corrected.
+	if rootFlag != "" {
+		p, err := ExpandHome(rootFlag)
+		if err != nil {
+			return Config{}, err
+		}
+		c.Root = p
+		return c, nil
 	}
 	root, err := ExpandHome(c.Root)
 	if err != nil {
 		return Config{}, err
+	}
+	// The same rule resolveXDG applies to a relative QUARRY_CACHE_DIR, for the same
+	// reason: both of these persist across invocations, so a relative one means a
+	// different library per working directory, and "." reintroduces from a shell rc
+	// exactly the accident the no-default rule exists to prevent — quarry is most
+	// naturally run from inside the library it indexes.
+	if root != "" && !filepath.IsAbs(root) {
+		return Config{}, fmt.Errorf("scan root %q from %s is not an absolute path: it would mean a different library for every directory quarry is run from. Use an absolute path (a leading ~ is expanded), or pass --root %s for this run", root, source, root)
 	}
 	c.Root = root
 	return c, nil

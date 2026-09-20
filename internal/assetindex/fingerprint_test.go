@@ -43,6 +43,53 @@ func TestFingerprintPerSourceKind(t *testing.T) {
 	}
 }
 
+// A split clip's print is the file's, the disambiguated label appended. The other two
+// schemes are pinned by construction above; this one was pinned by nothing — the clip
+// tests count distinct prints and compare one run against the next, all of which stay
+// green if the label is swapped for Source.ClipIndex. That swap looks like a
+// simplification once ClipIndex exists, and it silently detaches every clip tag and
+// link in the library, on a change bumping indexVersion cannot rescue: tags key on
+// content, not on the cache.
+//
+// Built from Source.Clip rather than a literal so the label-versus-index half is pinned
+// too: a print derived from the position fails this, and so does one derived from the
+// raw glTF name, since the duplicate here is disambiguated before it is used.
+func TestASplitClipsFingerprintIsTheFilesPlusItsLabel(t *testing.T) {
+	root, mk := libRoot(t)
+	p := mk("quaternius", "Anims", "Library.glb")
+	writeGLB(t, p, "Idle", "Idle", "Walk")
+	body, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fileFP := wantCRC(string(body))
+
+	var clips int
+	for _, a := range mustScan(t, root) {
+		if a.Source.Clip == "" {
+			continue
+		}
+		clips++
+		if want := fileFP + "#" + a.Source.Clip; a.Fingerprint != want {
+			t.Errorf("clip %q fingerprint = %q, want %q", a.Source.Clip, a.Fingerprint, want)
+		}
+	}
+	if clips != 3 {
+		t.Fatalf("split into %d clips, want 3; this test is not reading the split path", clips)
+	}
+	// The duplicate name must actually have been disambiguated, or "the label" and "the
+	// raw glTF name" are the same string and the assertion above cannot tell them apart.
+	labels := map[string]bool{}
+	for _, a := range mustScan(t, root) {
+		if a.Source.Clip != "" {
+			labels[a.Source.Clip] = true
+		}
+	}
+	if len(labels) != 3 {
+		t.Errorf("clip labels = %v, want three distinct ones from two same-named animations", labels)
+	}
+}
+
 // Byte-identical content shares one fingerprint across packs and across the
 // zip/loose boundary, so a tag set on one copy applies to every copy.
 func TestFingerprintSharedForIdenticalBytes(t *testing.T) {

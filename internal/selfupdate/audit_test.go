@@ -271,19 +271,28 @@ func TestReplaceBinaryLeavesNoResidue(t *testing.T) {
 }
 
 // A leftover .old from an interrupted update must not block the next one.
+// The aside is only reached when the single rename cannot do the job — on Windows
+// always, and elsewhere on a cross-device staging dir. Without forcing that, this test
+// returned at the first rename on the platform CI runs, asserted the new bytes landed,
+// and passed identically with the os.Remove(aside) it is named for deleted.
 func TestReplaceBinaryClearsAStaleAside(t *testing.T) {
 	dir := t.TempDir()
 	exe := filepath.Join(dir, "quarry")
 	if err := os.WriteFile(exe, fakeBinary("OLD"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(exe+".old", fakeBinary("ANCIENT"), 0o755); err != nil {
+	aside := exe + ".old"
+	// A leftover from an update interrupted between the move aside and the install. It
+	// must not block this one: os.Rename onto an existing file replaces it on POSIX but
+	// fails on Windows, which is the platform that takes this path every time.
+	if err := os.WriteFile(aside, fakeBinary("ANCIENT"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	staged := filepath.Join(dir, "staged")
 	if err := os.WriteFile(staged, fakeBinary("NEW"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	forceInstallRenameFailure(t)
 
 	if err := replaceBinary(staged, exe); err != nil {
 		t.Fatalf("replaceBinary with a stale .old: %v", err)
@@ -291,6 +300,18 @@ func TestReplaceBinaryClearsAStaleAside(t *testing.T) {
 	got, _ := os.ReadFile(exe)
 	if !bytes.Equal(got, fakeBinary("NEW")) {
 		t.Errorf("binary content = %q, want the new one", got)
+	}
+	// No aside survives a successful install, stale or fresh. This is the removal at the
+	// end of replaceBinary; the pre-clear before the move aside is Windows-only and not
+	// reachable from here, because POSIX rename replaces an existing destination and so
+	// clears the stale file on its own. Asserting the end state covers what this
+	// platform can actually decide.
+	if _, err := os.Stat(aside); err == nil {
+		t.Error("a .old survived a successful update; the next one restores a two-updates-old binary over it")
+	}
+	// And the copy fallback this took cleans up after itself.
+	if _, err := os.Stat(exe + ".new"); err == nil {
+		t.Error("the copy fallback left its staging file beside the binary")
 	}
 }
 
@@ -773,6 +794,116 @@ func TestReleaseSuffixMatchesTheWorkflowLabels(t *testing.T) {
 			t.Errorf("%s asks for %q, which release.yml does not publish", platform, suffix)
 		}
 	}
+	// The regex above is the only thing deciding what counts as a triple, and a label
+	// outside its character class is skipped rather than reported — the remaining four
+	// keep every assertion green while the fifth platform ships an asset `quarry
+	// update` cannot name. Counting closes that: every triple in the file is one of
+	// these entries, and windows/arm64 is the single documented alias with no triple of
+	// its own.
+	if len(found) != len(releaseSuffix)-1 {
+		t.Errorf("parsed %d platform triples from release.yml but releaseSuffix holds %d entries (one alias expected): %v vs %v",
+			len(found), len(releaseSuffix), found, releaseSuffix)
+	}
+	// The stamp check reads one published artifact by name. A label renamed in the
+	// build loop leaves that step unzipping a file the release does not contain, which
+	// fails the release rather than passing it — but only after the tag is pushed.
+	stamp := regexp.MustCompile(`unzip [^\n]*"dist/quarry-\$\{VERSION\}-([a-z0-9-]+)\.zip"`).FindStringSubmatch(string(b))
+	if stamp == nil {
+		t.Fatal("no version-stamp unzip found in release.yml; the stamp check is not reading a published artifact")
+	}
+	if !published[stamp[1]+".zip"] {
+		t.Errorf("the stamp check reads %q, which the build loop does not publish", stamp[1]+".zip")
+	}
+
+	// ci.yml keeps a fourth copy of the same list: it cross-compiles every release
+	// platform on the PR, so a platform-specific compile error is found before the tag
+	// rather than by a failed release that needs a new one. Nothing read it, and its own
+	// comment claimed these tests did — so a platform added to release.yml and to
+	// releaseSuffix passed here, failed in install.sh (which points the author at that
+	// file), and left the cross-compile loop still building the original set.
+	ci, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", "ci.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	loop := regexp.MustCompile(`for p in ([^;]+);`).FindStringSubmatch(string(ci))
+	if loop == nil {
+		t.Fatal("no cross-compile loop found in ci.yml; this test has stopped checking it")
+	}
+	built := map[string]bool{}
+	for _, p := range strings.Fields(loop[1]) {
+		built[p] = true
+	}
+	if len(built) == 0 {
+		t.Fatal("ci.yml's cross-compile loop parsed to nothing")
+	}
+	for platform := range found {
+		if !built[platform] {
+			t.Errorf("release.yml publishes %s but ci.yml does not cross-compile it: a compile error there is found by a failed release, after the tag is pushed", platform)
+		}
+	}
+	for platform := range built {
+		if _, ok := found[platform]; !ok {
+			t.Errorf("ci.yml cross-compiles %s, which release.yml does not publish", platform)
+		}
+	}
+}
+
+// install.sh is the only install path, and the only recovery when `quarry update`
+// refuses a dev build. It documents its own rule — `err "..."` alone exits 0, because
+// the status is printf's, and the documented invocation pipes this into bash where a
+// caller chaining on `&&` reads that as a clean install — and nothing enforced it.
+// CI runs `bash -n`, which is a parse and blind to exit status.
+func TestEveryFatalPathInTheInstallScriptExits(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("..", "..", "install.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(string(b), "\n")
+	// A call, whatever quoting it uses. Matching the literal `err "` counted only
+	// double-quoted ones, so `err 'unsupported arch'` or `err $msg` was a fatal path the
+	// guard never saw. The leading class keeps it from firing on a word ending in "err".
+	call := regexp.MustCompile(`(^|[;&|{(\s])err[ \t]`)
+	// The exit has to be this err's own next statement, not merely somewhere nearby:
+	// either on the same line after a separator, or as the whole of the next one.
+	// Accepting an `exit 1` anywhere on the following line let an unrelated
+	// `bar || exit 1` vouch for an err that falls through to it and carries on.
+	sameLine := regexp.MustCompile(`(;|&&|\|\|)\s*(exit|return)\s+[1-9]`)
+	ownLine := regexp.MustCompile(`^(exit|return)\s+[1-9]\b`)
+	var calls int
+	for i, ln := range lines {
+		trimmed := strings.TrimSpace(ln)
+		// A comment, or the helper's own definition. The script explains this very rule
+		// in prose, quoting `|| err ...`, so a guard that reads comments reports it.
+		if strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, "err()") {
+			continue
+		}
+		if !call.MatchString(ln) {
+			continue
+		}
+		calls++
+		if sameLine.MatchString(ln) {
+			continue
+		}
+		var next string
+		for j := i + 1; j < len(lines); j++ {
+			if t := strings.TrimSpace(lines[j]); t != "" && !strings.HasPrefix(t, "#") {
+				next = t
+				break
+			}
+		}
+		if ownLine.MatchString(next) {
+			continue
+		}
+		t.Errorf("install.sh:%d reports an error and its next statement is not a non-zero exit, so `curl | bash && ...` reads a failed install as a clean one:\n  %s\n  next: %s", i+1, trimmed, next)
+	}
+	if calls == 0 {
+		t.Fatal("no err call sites found in install.sh; this guard has stopped checking anything")
+	}
+	// The script is almost all fatal paths; far fewer than this and the call regexp has
+	// stopped matching the style install.sh is actually written in.
+	if calls < 8 {
+		t.Errorf("matched only %d err call sites in install.sh; the call regexp has drifted from the script", calls)
+	}
 }
 
 // install.sh composes the same label from uname, so it drifts the same way and breaks
@@ -1040,5 +1171,186 @@ func TestAnAbandonedStagingDirectoryIsSweptByAge(t *testing.T) {
 	// The sweep is over one glob in a directory the user owns — often ~/.local/bin.
 	if _, err := os.Stat(mine); err != nil {
 		t.Errorf("the sweep removed something that is not quarry's: %v", err)
+	}
+}
+
+// The repository is private, so for most first-time users a missing token is *the*
+// failure, and this hint is the only thing that tells them so: a bare 404 reads as "no
+// releases exist" for a repo they cannot see. It is the message most likely to be the
+// one a real user meets, and nothing asserted it — the token-leak test above covers the
+// 401 path only, which is what a *wrong* token gets.
+func TestMissingTokenIsNamedOnANotFound(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+	old := releasesAPIURL
+	releasesAPIURL = srv.URL
+	defer func() { releasesAPIURL = old }()
+
+	for _, tc := range []struct{ name, target, want string }{
+		{"latest", "", "no releases found"},
+		{"a specific version", "1.2.3", "version 1.2.3 not found"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := fetchRelease("", tc.target)
+			if err == nil {
+				t.Fatal("expected an error")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error %q does not say %q", err, tc.want)
+			}
+			if !strings.Contains(err.Error(), "GITHUB_TOKEN") || !strings.Contains(err.Error(), "gh auth login") {
+				t.Errorf("error %q does not name what is missing; a private repo answers 404 and reads as having no releases", err)
+			}
+			// With a token, the same 404 is a real miss and the hint would be wrong.
+			if _, err := fetchRelease("a-token", tc.target); err == nil {
+				t.Fatal("expected an error")
+			} else if strings.Contains(err.Error(), "GITHUB_TOKEN") {
+				t.Errorf("the missing-token hint is given to a caller that had one: %q", err)
+			}
+		})
+	}
+}
+
+// An empty asset takes a different branch of checkExecutable than a wrong-content one,
+// with its own message, and only the wrong-content branch was covered. Empty is the
+// shape a truncated download or a zero-length release asset arrives in, and "downloaded
+// binary is empty" is what tells the user that rather than sending them looking at
+// their platform.
+func TestInstallRejectsAnEmptyAsset(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "quarry")
+	if err := os.WriteFile(exe, fakeBinary("OLD"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	srv, _ := assetServer(t, http.StatusOK, zipWith(t, installedBinaryName(), nil))
+
+	err := installTo("tok", srv.URL, exe)
+	if err == nil {
+		t.Fatal("an empty asset replaced the working binary")
+	}
+	if !strings.Contains(err.Error(), "empty") {
+		t.Errorf("error %q does not say the asset was empty", err)
+	}
+	got, _ := os.ReadFile(exe)
+	if !bytes.Equal(got, fakeBinary("OLD")) {
+		t.Error("the working binary was replaced anyway")
+	}
+}
+
+// The asset URL is the second request, and a token that can read a private repo's
+// metadata but not its release assets fails there rather than at the listing. The hint
+// is worded for exactly that, and only fetchRelease's copy of it had a test — so the
+// one a real first-time user is most likely to meet was the untested one.
+func TestMissingTokenIsNamedOnANotFoundAsset(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte(`{"message":"Not Found"}`))
+	}))
+	defer srv.Close()
+	dst := filepath.Join(t.TempDir(), "out.zip")
+
+	err := download("", srv.URL+"/assets/1", dst)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !strings.Contains(err.Error(), "GITHUB_TOKEN") || !strings.Contains(err.Error(), "gh auth login") {
+		t.Errorf("error %q does not name what is missing", err)
+	}
+	// With a token in hand the same 404 is a real miss, and the hint would send the
+	// user to fix something that is not broken.
+	if err := download("a-token", srv.URL+"/assets/1", dst); err == nil {
+		t.Fatal("expected an error")
+	} else if strings.Contains(err.Error(), "GITHUB_TOKEN") {
+		t.Errorf("the missing-token hint is given to a caller that had one: %q", err)
+	}
+	// And nothing is left behind under the name the caller asked for, or the next step
+	// would unzip a saved error page.
+	if _, err := os.Stat(dst); !os.IsNotExist(err) {
+		t.Errorf("a failed download left a file at %s (%v)", dst, err)
+	}
+}
+
+// download bounds what it writes beside the running binary, because a response that
+// never ends would otherwise fill the user's disk. Truncating is safe here and not in
+// extractBinary, and the reason is load-bearing: what lands here is a zip, and one cut
+// short has no end-of-central-directory record, so zip.OpenReader refuses it and
+// nothing reaches the binary. extractBinary's own bound is tested; this one was not,
+// and neither was the claim the difference rests on.
+func TestAnOversizeDownloadIsCutAndRefusedAsAnArchive(t *testing.T) {
+	old := maxBinaryBytes
+	maxBinaryBytes = 64
+	defer func() { maxBinaryBytes = old }()
+
+	var zipped bytes.Buffer
+	zw := zip.NewWriter(&zipped)
+	w, err := zw.Create("quarry")
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.Write(fakeBinary(strings.Repeat("PADDING", 200)))
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if zipped.Len() <= int(maxBinaryBytes) {
+		t.Fatal("the fixture archive fits inside the bound; this test is asserting nothing")
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(zipped.Bytes())
+	}))
+	defer srv.Close()
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "download.zip")
+	if err := download("", srv.URL, dst); err != nil {
+		t.Fatalf("download of an oversize body should truncate, not fail: %v", err)
+	}
+	fi, err := os.Stat(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Size() != maxBinaryBytes {
+		t.Errorf("wrote %d bytes, want the bound %d", fi.Size(), maxBinaryBytes)
+	}
+	// The part that matters: the truncated archive is unusable, so no binary comes out
+	// of it and no working install is replaced by a short one.
+	if _, err := extractBinary(dst, dir); err == nil {
+		t.Error("a truncated archive yielded a binary; the whole reason truncating is safe here is that it cannot")
+	}
+}
+
+// The likeliest real `quarry update` failure is a binary in a directory the invoking
+// user cannot write — /usr/local/bin, a system package dir, a read-only mount. A bare
+// mkdir error says nothing about quarry needing to stage an update there, and this is
+// the one message that does.
+func TestAnUnwritableInstallDirIsNamed(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: directory modes are not enforced")
+	}
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "quarry")
+	if err := os.WriteFile(exe, fakeBinary("OLD"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(dir, 0o700)
+
+	err := installTo("", "http://127.0.0.1:1/never-reached", exe)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !strings.Contains(err.Error(), exe) || !strings.Contains(err.Error(), "writable") {
+		t.Errorf("error %q neither names the binary nor says the directory has to be writable", err)
+	}
+	// And the binary that is there still runs.
+	got, readErr := os.ReadFile(exe)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !bytes.Equal(got, fakeBinary("OLD")) {
+		t.Error("the old binary was disturbed by an update that never started")
 	}
 }

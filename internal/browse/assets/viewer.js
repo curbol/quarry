@@ -11,7 +11,7 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import {
   contentURL, thumbURL, loadModel, loadSidekick, clipBones, clipsForAsset,
-  loadRMClips, isSynty, coversBones, resolveRig, frameBox, isRenderable, captureRootRest,
+  loadRMClips, isSynty, coversBones, pairClipsByName, clipAcross, togglePairable, resolveRig, frameBox, isRenderable, captureRootRest,
   prepareClipRig, retargetedFor, stripRootMotion, dispose, CharRegistry,
   rigEntry, rigCandidates, rootBoneName, oneCharacter, alignBindToRest, hideAlternates, _posedV,
 } from '/static/scene.js';
@@ -127,6 +127,10 @@ export function startViewer(container, asset, panels) {
   let mixer = null, action = null, clips = [], soloClips = null, soloRootRest = null, clipDur = 0, playing = true, ctrls = null, curTrimmedFrom = 0;
   let rawClips = [], playUpAxis = null, motionOn = false, curClip = 0;
   let playInPlace = [], playMotion = []; // the two clip sets the root-motion toggle swaps between
+  // Where each set's clips sit in the other, by animation rather than by position: the
+  // two come out of two different files and share neither length nor order. -1 is a
+  // clip the other file has no counterpart for, and the toggle is not offered for it.
+  let motionOf = [], inPlaceOf = [];
 
   // View controls overlaid on the canvas: three view modes (isometric default / flat
   // eye-level / free rotation), and — for a root-motion clip — show the travel or in place.
@@ -155,11 +159,18 @@ export function startViewer(container, asset, panels) {
     motionOn = !motionOn;
     moveBtn.classList.toggle('on', motionOn);
     moveBtn.title = motionOn ? 'Showing root motion — click to play in place' : 'Playing in place — click to show root motion';
+    // Follow the animation across, not the index. The two sets come out of two
+    // different files, so the same position is a different clip: with fewer clips on
+    // the other side the viewer fell back to the first one and lost the user's place,
+    // and with the same count in a different order it played one animation and
+    // presented it as another's travel variant.
+    const next = clipAcross(motionOn ? motionOf : inPlaceOf, curClip);
     clips = motionOn ? playMotion : playInPlace;
     // The picker lists whichever set is live; the two can differ in both length and
     // names, so leaving it alone would label these clips with the other set's.
     if (ctrls) ctrls.setClips(clips);
-    playClip(curClip);
+    playClip(next);
+    syncMoveBtn();
   });
   moveBtn.hidden = true;
   container.appendChild(toolbar);
@@ -220,23 +231,46 @@ export function startViewer(container, asset, panels) {
     curTrimmedFrom = (clip.userData && clip.userData.trimmedFrom) || 0;
     playing = true;
     if (ctrls) ctrls.setClip(curClip);
+    syncMoveBtn();
+  };
+
+  // syncMoveBtn offers the toggle only for a clip the other set actually holds. A
+  // sibling file need not carry every animation of the file it pairs with, and a button
+  // that swaps to a clip chosen by position is how the wrong animation gets presented
+  // as this one's travel variant. Disabled rather than hidden while some other clip of
+  // the same card can toggle, so the control does not appear and vanish down the picker.
+  const syncMoveBtn = () => {
+    if (moveBtn.hidden) return;
+    const pairs = motionOn ? inPlaceOf : motionOf;
+    const ok = togglePairable(pairs, curClip);
+    moveBtn.disabled = !ok;
+    if (!ok) moveBtn.title = 'This clip has no root-motion counterpart';
+    else moveBtn.title = motionOn ? 'Showing root motion — click to play in place' : 'Playing in place — click to show root motion';
   };
 
   // offerRootMotion swaps in the travel sibling once it has arrived behind the first
-  // frame. Until then the toggle offers the algorithmically stripped clips — the same
-  // fallback an animation with no sibling gets — so nothing is ever dead, and with the
-  // real sibling in hand the in-place side becomes the native clips, which need no
-  // stripping. Only a change the viewer is currently showing restarts playback: the
-  // point of loading this in the background is not to interrupt what the user is
-  // already watching.
+  // frame, and is what reveals the toggle for a paired card: buildPlayback runs before
+  // the sibling is fetched, so there is nothing to offer yet and the button stays
+  // hidden until there is. With the real sibling in hand the in-place side becomes the
+  // native clips, which need no stripping — the algorithmic strip is the fallback for a
+  // baked-motion animation that has no sibling at all. Only a change the viewer is
+  // currently showing restarts playback: the point of loading this in the background is
+  // not to interrupt what the user is already watching.
   const offerRootMotion = (rmCs) => {
     playInPlace = rawClips;
     playMotion = rmCs;
+    motionOf = pairClipsByName(playInPlace, playMotion);
+    inPlaceOf = pairClipsByName(playMotion, playInPlace);
     moveBtn.hidden = false;
     clips = motionOn ? playMotion : playInPlace;
-    if (!motionOn) return;
+    if (!motionOn) { syncMoveBtn(); return; }
     if (ctrls) ctrls.setClips(clips);
-    playClip(curClip);
+    // curClip indexes the set being replaced — the algorithmically stripped clips, which
+    // run parallel to the native ones — so it has to be carried across by name like any
+    // other swap. Held as an index it lands wherever that position is in a file the
+    // viewer has only just loaded.
+    const next = motionOf[curClip];
+    playClip(next);
   };
 
   const buildPlayback = (mixerRoot, cs, charInfo, rootRest, rmCs) => {
@@ -254,6 +288,10 @@ export function startViewer(container, asset, panels) {
     // baked-motion clip in place algorithmically.
     playInPlace = rmClips.length ? cs : cs.map((c) => stripRootMotion(c, rootName, playUpAxis));
     playMotion = rmClips.length ? rmClips : cs;
+    // Without a sibling the travel view is the same clips unstripped, so the two sets
+    // are the same animations in the same order and pair trivially.
+    motionOf = pairClipsByName(playInPlace, playMotion);
+    inPlaceOf = pairClipsByName(playMotion, playInPlace);
     clips = motionOn ? playMotion : playInPlace;
     moveBtn.hidden = !(rmClips.length || asset.bakedMotion);
     mixer = new THREE.AnimationMixer(mixerRoot);
@@ -358,7 +396,10 @@ export function startViewer(container, asset, panels) {
       for (const e of CharRegistry.list()) {
         if ((current && e.id === current.id) || seen.has(e.name)) continue;
         if (forBones && !coversBones(e.bones, forBones)) continue;
-        seen.add(e.name); out.push({ id: e.id, name: e.name, ext: e.ext, sub: 'fits this animation' });
+        // vendor travels with the row: choosing one re-registers the body through
+        // rigEntry, and an entry saved without it is a wildcard the vendor scope no
+        // longer skips — one pack's body auto-matching every other pack's clips.
+        seen.add(e.name); out.push({ id: e.id, name: e.name, ext: e.ext, vendor: e.vendor, sub: 'fits this animation' });
         if (out.length >= 6) break;
       }
       return out;

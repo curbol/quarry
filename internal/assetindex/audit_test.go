@@ -25,6 +25,7 @@ import (
 	"path"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -131,10 +132,30 @@ func TestSaveLoadPreservesIndexedFields(t *testing.T) {
 		{guid: "hd1", pathname: "Assets/S/Resources/SK_HEAD.fbx", asset: "HEADFBX", preview: true},
 	})
 	os.WriteFile(mk("v", "p", "Pic.png"), encodePNG(t, 7, 11), 0o644)
+	// A multi-clip GLB, with a duplicate name so the disambiguated label is exercised
+	// too. Source.Clip and Source.ClipIndex are the two indexed fields whose loss is
+	// invisible: every run after the first serves clips out of this cache, and a clip
+	// that comes back without its index falls through to matching the *disambiguated*
+	// label against the file's real animation names — which "Walk (2)" is not one of —
+	// so the lightbox plays an arbitrary animation and nothing errors. Without a GLB in
+	// this fixture the whole-asset comparison below had no clip to compare.
+	writeGLB(t, mk("quaternius", "UAL", "UAL1.glb"), "Walk", "Walk", "Idle")
 
 	ix, err := Build(Options{Root: root, CacheDir: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
+	}
+	var clips int
+	for _, a := range ix.Assets {
+		if a.Source.Clip != "" {
+			clips++
+			if a.Source.ClipIndex == nil {
+				t.Fatalf("%s was built with no clip index; the round trip below cannot check one", a.RelPath)
+			}
+		}
+	}
+	if clips != 3 {
+		t.Fatalf("built %d clip assets, want 3; this fixture is no longer exercising the clip fields", clips)
 	}
 	cachePath := filepath.Join(t.TempDir(), "browse-index.json")
 	if err := ix.save(cachePath); err != nil {
@@ -151,6 +172,21 @@ func TestSaveLoadPreservesIndexedFields(t *testing.T) {
 		}
 		if !sameAsset(got, want) {
 			t.Errorf("asset changed across the cache round trip:\n got %+v\nwant %+v", got, want)
+		}
+		// Checked outside sameAsset, which compares the two marshalled: a field tagged
+		// json:"-" vanishes from both sides and compares equal, so the one regression
+		// that matters here — a clip field that stops being serialized — is exactly the
+		// one that comparison cannot see.
+		if want.Source.Clip == "" {
+			continue
+		}
+		if got.Source.Clip != want.Source.Clip {
+			t.Errorf("%s: clip label %q after the round trip, want %q", want.RelPath, got.Source.Clip, want.Source.Clip)
+		}
+		if got.Source.ClipIndex == nil {
+			t.Errorf("%s: clip index is gone after the round trip; the preview falls back to matching a disambiguated label no animation carries", want.RelPath)
+		} else if *got.Source.ClipIndex != *want.Source.ClipIndex {
+			t.Errorf("%s: clip index %d after the round trip, want %d", want.RelPath, *got.Source.ClipIndex, *want.Source.ClipIndex)
 		}
 	}
 }
@@ -1710,6 +1746,27 @@ func TestAMissingZipEntryReportsAMiss(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "Gone.fbx") {
 		t.Errorf("Open error %v does not name the entry", err)
 	}
+	// And the reference taken to look is given back. Nothing else notices if it is not:
+	// eviction only closes a reader at refs == 0, so a release dropped on this path
+	// pins the archive's descriptor and its parsed central directory for the life of
+	// the process — one per archive that ever answers a miss, which over a library of
+	// re-shipped packs is every one of them.
+	ix.zips.mu.Lock()
+	ref, cached := ix.zips.open[archive]
+	refs := 0
+	if cached {
+		refs = ref.refs
+	}
+	ix.zips.mu.Unlock()
+	// The `cached` half is asserted, not merely guarded on: with no reader published at
+	// all the reference check below has nothing to look at and passes over an empty
+	// cache, which is exactly what a refactor that dropped the cache would leave.
+	if !cached {
+		t.Fatalf("no reader is published for %s after a miss; this guard is checking an empty cache", archive)
+	}
+	if refs != 0 {
+		t.Errorf("the cached reader for %s still holds %d references after a miss; its descriptor is pinned for the process lifetime", archive, refs)
+	}
 }
 
 // The reader cache holds an archive's parsed central directory, which maps an entry
@@ -1806,22 +1863,37 @@ func TestReshippedUnityPackageIsAMissNotAnEndlessRebuild(t *testing.T) {
 		t.Fatalf("read after the reship = %v; want fs.ErrNotExist so browse answers 404 like the zip path", err)
 	}
 
-	// And the extraction is left alone, rather than discarded and rebuilt per request.
-	fp, err := fingerprint(archive)
-	if err != nil {
-		t.Fatal(err)
+	// The original extraction is left alone, and — the part the cost lives in — no
+	// extraction is built for the new archive either. The tree is named for the
+	// archive's print, so a re-shipped one always misses the fast path; extracting it
+	// produces a tree correct under its new print that every size in this index still
+	// disagrees with, so the whole decompress is written and then never served from.
+	// Counting the trees is what says that, where marking one only said the old tree
+	// survived.
+	trees := func() []string {
+		t.Helper()
+		ents, err := os.ReadDir(ix.unpackedDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		var names []string
+		for _, e := range ents {
+			names = append(names, e.Name())
+		}
+		slices.Sort(names)
+		return names
 	}
-	sentinel := filepath.Join(ix.unpackedDir(), fp, "SENTINEL")
-	if err := os.WriteFile(sentinel, []byte("x"), 0o644); err != nil {
-		t.Fatalf("no extraction to mark: %v", err)
+	before := trees()
+	if len(before) != 1 {
+		t.Fatalf("extractions before the rereads = %v, want the one the first read built", before)
 	}
 	for i := 0; i < 3; i++ {
 		if err := read(); !errors.Is(err, fs.ErrNotExist) {
 			t.Fatalf("read %d = %v; want a stable fs.ErrNotExist", i, err)
 		}
 	}
-	if _, err := os.Stat(sentinel); err != nil {
-		t.Errorf("the extraction was rebuilt for a mismatch the archive itself explains: %v", err)
+	if after := trees(); !slices.Equal(before, after) {
+		t.Errorf("extractions went %v -> %v: a mismatch the archive itself explains was paid for with a decompress", before, after)
 	}
 }
 
@@ -2364,13 +2436,108 @@ func TestAnInsecureEntryNameCostsItselfNotTheArchive(t *testing.T) {
 	if len(assets) == 0 {
 		t.Fatal("the archive contributed nothing; one insecure name took every safe entry with it")
 	}
-	for _, a := range assets {
-		if strings.Contains(a.Source.Entry, `\`) && !safeEntry(a.Source.Entry) {
-			t.Errorf("indexed an entry safeEntry rejects: %q", a.Source.Entry)
-		}
-	}
 	if !slices.Contains(names, "Shield.fbx") {
 		t.Errorf("the safe entry is missing; got %v", names)
+	}
+	// The backslash entry is kept, and kept as the path it means. Asserting that it is
+	// merely *present* is what the earlier version of this test did, through a condition
+	// safeEntry can never satisfy — it does not look at backslashes, so the guard was
+	// unreachable and every consequence below went unchecked.
+	var back *Asset
+	for i := range assets {
+		if strings.Contains(assets[i].Source.Entry, `\`) {
+			back = &assets[i]
+		}
+	}
+	if back == nil {
+		t.Fatal("the backslash entry was dropped; it is a member of the archive, not an escape")
+	}
+	if back.Name != "Sword.fbx" {
+		t.Errorf("Name = %q, want Sword.fbx: the card is named for its whole internal path", back.Name)
+	}
+	if back.Source.EntryPath() != "SourceFiles/Sword.fbx" {
+		t.Errorf("EntryPath = %q, want SourceFiles/Sword.fbx", back.Source.EntryPath())
+	}
+	if want := "pack.zip::SourceFiles/Sword.fbx"; back.RelPath != want {
+		t.Errorf("RelPath = %q, want %q: no extracted twin can produce the other spelling", back.RelPath, want)
+	}
+	// Source.Entry keeps the stored spelling, because that is the key the central
+	// directory resolves. Normalizing it would make the entry unservable.
+	if back.Source.Entry != `SourceFiles\Sword.fbx` {
+		t.Errorf("Source.Entry = %q, want the stored spelling", back.Source.Entry)
+	}
+}
+
+// The dedup key is built from the entry read as a path, so a pack shipped both packed
+// and extracted collapses to one card however the archive spelled its separators.
+// Keyed on the stored spelling instead, the two never met: two cards for one file,
+// differing only by a separator neither side displays.
+func TestABackslashEntryDedupsAgainstItsExtractedTwin(t *testing.T) {
+	root, mk := libRoot(t)
+	archive := mk("v", "Pack", "Pack_A_v1.zip")
+	f, err := os.Create(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := zip.NewWriter(f)
+	// CreateRaw, because Create sanitises the separator away — which leaves the sizes
+	// and the CRC to fill in here, and those are what dedup keys on alongside the path.
+	data := []byte("STONE")
+	w, err := zw.CreateRaw(&zip.FileHeader{
+		Name: `Textures\Stone01.png`, Method: zip.Store,
+		CRC32: crc32.ChecksumIEEE(data), CompressedSize64: uint64(len(data)), UncompressedSize64: uint64(len(data)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.Write(data)
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	writeFile(t, mk("v", "Pack", "Textures", "Stone01.png"), "STONE")
+
+	ix, err := Build(Options{Root: root, CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rels []string
+	for i := range ix.Assets {
+		rels = append(rels, ix.Assets[i].RelPath)
+	}
+	if len(ix.Assets) != 1 {
+		t.Fatalf("indexed %d assets, want 1: the archive entry and its extracted twin are one file; got %v", len(ix.Assets), rels)
+	}
+	if ix.Assets[0].Source.Kind != SourceLoose {
+		t.Errorf("the surviving asset is %v, want the loose twin", ix.Assets[0].Source.Kind)
+	}
+}
+
+// The same reading applied to the rules that take an entry as a path. Each of these
+// answered differently for the two spellings of one path, so an archive written by
+// older Windows tooling indexed differently from the same tree shipped extracted.
+func TestABackslashEntryIsReadAsThePathItMeans(t *testing.T) {
+	if skipEntry(entryPath(`SourceFiles\.vscode\settings.json`)) != skipEntry("SourceFiles/.vscode/settings.json") {
+		t.Error("a dot-directory is only recognised in one spelling: the packed tree keeps what the extracted one drops")
+	}
+	// An escape is an escape in either spelling.
+	if safeEntry(entryPath(`a\..\..\b`)) {
+		t.Error(`a\..\..\b was accepted; it escapes the archive just as ../../b does`)
+	}
+	if !safeEntry(entryPath(`Textures\Stone01.png`)) {
+		t.Error("an ordinary Windows-spelled entry was rejected; it is a member, not an escape")
+	}
+	// Classification anchors on "/", "_" and ":", so the whole-path reading put every
+	// texture and UI file in the plain image facet.
+	for _, tc := range []struct{ entry, want string }{
+		{`Textures\Stone01.png`, "texture"},
+		{`UI\button.png`, "ui"},
+	} {
+		src := Source{Kind: SourceZip, ArchivePath: "/lib/v/P/pack.zip", Entry: tc.entry}
+		a := newAsset(src, path.Base(entryPath(tc.entry)), archiveRel("v/P/pack.zip", entryPath(tc.entry)), "v", "P", "", 10, "crc32:1:10")
+		if string(a.Category) != tc.want {
+			t.Errorf("%s classified as %s, want %s", tc.entry, a.Category, tc.want)
+		}
 	}
 }
 
@@ -2451,5 +2618,814 @@ func TestAFailedDerivationIsNotCachedAgainstTheFilesPrint(t *testing.T) {
 				t.Errorf("the skip survived the recovery: %+v", again.Skipped)
 			}
 		})
+	}
+}
+
+// archiveMu is what stops a reader from passing ensureExtracted's stat of a published
+// tree and then opening a path a concurrent discard has already removed. Every test
+// that touches discardExtraction is otherwise sequential, so the property is only
+// asserted through the torn-rebuild test's fallout: a reader that lost that race would
+// report a miss for a sibling whose own bytes were never torn, and over a package with
+// tens of thousands of members that is 404 after 404 for files that are right there.
+//
+// Read as: whatever a reader gets back, it is never a wrong answer. A discard removes
+// the tree and the next reader rebuilds it, so a read either returns the real bytes or
+// fails outright — it must never return short or empty content as though it were the
+// file.
+func TestReadersRacingADiscardNeverSeeAPartialFile(t *testing.T) {
+	root, mk := libRoot(t)
+	archive := mk("v", "Pack", "Pack_A_v1.unitypackage")
+	members := make([]unityGUID, 0, 24)
+	want := map[string]string{}
+	for i := 0; i < 24; i++ {
+		guid := fmt.Sprintf("%032x", i)
+		body := strings.Repeat(fmt.Sprintf("m%02d", i), 400)
+		members = append(members, unityGUID{guid: guid, pathname: fmt.Sprintf("Assets/M%02d.fbx", i), asset: body})
+		want[guid] = body
+	}
+	writeUnityPackage(t, archive, members)
+	ix, err := Build(Options{Root: root, CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ix.Assets) != len(members) {
+		t.Fatalf("indexed %d assets, want %d", len(ix.Assets), len(members))
+	}
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	// The discards run against the readers rather than after them, so a reader that
+	// slipped between the stat and the open is what this is trying to produce.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			ix.discardExtraction(archive)
+		}
+	}()
+	for i := range ix.Assets {
+		wg.Add(1)
+		go func(a Asset) {
+			defer wg.Done()
+			for n := 0; n < 20; n++ {
+				rc, _, err := ix.Open(a)
+				if err != nil {
+					// Not tolerated. A discard that has finished leaves nothing to find,
+					// and the next Open rebuilds before reading — so every read here has
+					// a tree to read from. The one way to miss is to pass the stat of a
+					// published tree and then open a path the discard has since removed,
+					// which is the window archiveMu closes.
+					t.Errorf("%s: %v — a reader passed the extraction check and then found the tree gone", a.RelPath, err)
+					return
+				}
+				b, readErr := io.ReadAll(rc)
+				rc.Close()
+				if readErr != nil {
+					t.Errorf("%s: read failed: %v", a.RelPath, readErr)
+					return
+				}
+				if string(b) != want[a.Source.Guid] {
+					t.Errorf("%s came back as %d bytes, want %d: a reader was served a tree a discard had already taken",
+						a.RelPath, len(b), len(want[a.Source.Guid]))
+					return
+				}
+			}
+		}(ix.Assets[i])
+	}
+	// Stop the discards first, then let the readers finish, so the run ends with the
+	// extraction in whatever state the last one left rather than mid-removal.
+	time.Sleep(50 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+
+	// And the tree is usable afterwards: a discard racing readers must leave something
+	// a later request can rebuild from, not a half-removed directory the stat fast path
+	// would read as complete.
+	for i := range ix.Assets {
+		rc, _, err := ix.Open(ix.Assets[i])
+		if err != nil {
+			t.Fatalf("%s is unreadable after the race: %v", ix.Assets[i].RelPath, err)
+		}
+		b, err := io.ReadAll(rc)
+		rc.Close()
+		if err != nil || string(b) != want[ix.Assets[i].Source.Guid] {
+			t.Fatalf("%s reads back wrong after the race: %d bytes, %v", ix.Assets[i].RelPath, len(b), err)
+		}
+	}
+}
+
+// The loser of the rebuild claim waits for the winner's repair and then answers from
+// the repaired tree, rather than reporting on the read that sent it there. Only the
+// winner's path is pinned directly: TestATornExtractionIsRebuiltOnceNotPerRequest is
+// sequential, and the concurrent torn-rebuild test covers the losers only by whichever
+// goroutines happen to lose. Reported instead of waited on, the failure is a 500 for a
+// member whose bytes the repair had already restored — and there is one of those per
+// reader that arrived while the decompress was running, which over a package of tens of
+// thousands of members is most of a grid page.
+func TestALoserOfTheRebuildClaimAnswersFromTheRepairedTree(t *testing.T) {
+	root, mk := libRoot(t)
+	archive := mk("v", "Pack", "Pack_A_v1.unitypackage")
+	members := make([]unityGUID, 0, 8)
+	for i := 0; i < 8; i++ {
+		members = append(members, unityGUID{
+			guid:     fmt.Sprintf("%032x", i),
+			pathname: fmt.Sprintf("Assets/M%02d.fbx", i),
+			asset:    strings.Repeat(fmt.Sprintf("m%02d", i), 300),
+		})
+	}
+	writeUnityPackage(t, archive, members)
+	ix, err := Build(Options{Root: root, CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{}
+	for _, m := range members {
+		want[m.guid] = m.asset
+	}
+	// Publish the extraction, then tear every member, so whoever wins the claim has a
+	// real repair to make and everyone else is a loser with a torn read in hand.
+	rc, _, err := ix.Open(ix.Assets[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc.Close()
+	fp, err := fingerprint(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range members {
+		if err := os.WriteFile(filepath.Join(ix.unpackedDir(), fp, m.guid, "asset"), []byte("SHORT"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := range ix.Assets {
+		wg.Add(1)
+		go func(a Asset) {
+			defer wg.Done()
+			<-start
+			rc, _, err := ix.Open(a)
+			if err != nil {
+				t.Errorf("%s: %v — a caller that did not win the claim reported on its own torn read instead of waiting for the repair", a.RelPath, err)
+				return
+			}
+			b, err := io.ReadAll(rc)
+			rc.Close()
+			if err != nil {
+				t.Errorf("%s: read failed: %v", a.RelPath, err)
+				return
+			}
+			if string(b) != want[a.Source.Guid] {
+				t.Errorf("%s came back as %d bytes, want %d: the repaired bytes were not what was served", a.RelPath, len(b), len(want[a.Source.Guid]))
+			}
+		}(ix.Assets[i])
+	}
+	close(start)
+	wg.Wait()
+}
+
+// A Sidekick package unpacked beside itself is an ordinary layout, and the loose copies
+// of a character's byproducts are not archive entries — so the rule that drops them
+// inside the package never sees them, and ordinary dedup only ever drops the archive
+// side. The grid then showed every assembled character alongside the prefab, material
+// and combined mesh it exists instead of.
+//
+// The partial half is the point of the flag: a character missing a part is a torso and
+// a hand, and those rows are what still show the whole thing.
+func TestSidekickByproductsGoOnBothSidesOfAnExtractedPack(t *testing.T) {
+	build := func(t *testing.T, sk string) []Asset {
+		t.Helper()
+		root, mk := libRoot(t)
+		writeUnityPackage(t, mk("synty", "SIDEKICK_D", "SIDEKICK_D_Unity_v1.unitypackage"), []unityGUID{
+			{guid: "sk1", pathname: "Assets/S/Characters/Hero.sk", asset: sk},
+			{guid: "p1", pathname: "Assets/S/Characters/Hero.prefab", asset: "PREFAB"},
+			{guid: "m1", pathname: "Assets/S/Characters/Hero.mat", asset: "MAT"},
+			{guid: "c1", pathname: "Assets/S/Characters/Hero_CombinedMesh.asset", asset: "COMBINED"},
+			{guid: "hd1", pathname: "Assets/S/Resources/SK_HEAD.fbx", asset: "HEADFBX"},
+		})
+		// The same package, extracted where it shipped.
+		writeFile(t, mk("synty", "SIDEKICK_D", "Assets", "S", "Characters", "Hero.sk"), sk)
+		writeFile(t, mk("synty", "SIDEKICK_D", "Assets", "S", "Characters", "Hero.prefab"), "PREFAB")
+		writeFile(t, mk("synty", "SIDEKICK_D", "Assets", "S", "Characters", "Hero.mat"), "MAT")
+		writeFile(t, mk("synty", "SIDEKICK_D", "Assets", "S", "Characters", "Hero_CombinedMesh.asset"), "COMBINED")
+		writeFile(t, mk("synty", "SIDEKICK_D", "Assets", "S", "Resources", "SK_HEAD.fbx"), "HEADFBX")
+
+		// Built twice through the cache, because the loose drop is re-decided on every
+		// refresh while the .sk's bytes are only read on the pass that enumerates the
+		// archive. Source.Complete is what carries the answer to the second run; without
+		// it the byproducts come back the moment the archive's enumeration is reused.
+		cache := t.TempDir()
+		opt := Options{Root: root, CacheDir: cache}
+		if _, err := LoadOrBuild(opt, false, func(string) {}); err != nil {
+			t.Fatal(err)
+		}
+		ix, err := LoadOrBuild(opt, false, func(string) {})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ix.Assets
+	}
+	names := func(assets []Asset) []string {
+		var out []string
+		for i := range assets {
+			out = append(out, string(assets[i].Source.Kind)+":"+assets[i].Name)
+		}
+		slices.Sort(out)
+		return out
+	}
+
+	whole := build(t, "Name: Hero\nParts:\n- Name: SK_HEAD\n")
+	got := names(whole)
+	// The .sk's own loose twin stays — it is a plain data row, not a byproduct — and so
+	// does the part mesh, which the character reaches by id.
+	want := []string{"loose:Hero.sk", "loose:SK_HEAD.fbx", "unitypackage:Hero", "unitypackage:SK_HEAD.fbx"}
+	if !slices.Equal(got, want) {
+		t.Errorf("assembled character:\n got  %v\n want %v", got, want)
+	}
+
+	partial := build(t, "Name: Hero\nParts:\n- Name: SK_HEAD\n- Name: SK_ABSENT\n")
+	for _, n := range []string{"loose:Hero.prefab", "loose:Hero.mat", "loose:Hero_CombinedMesh.asset"} {
+		if !slices.Contains(names(partial), n) {
+			t.Errorf("%s was dropped for a character missing a part; it is the row that still shows the whole one", n)
+		}
+	}
+}
+
+// Two Synty packages have identical internal trees, so a character's scope is only its
+// own pack's. Without that the first pack's Hero.sk claims the second's loose
+// Hero.prefab, and a pack with no Sidekick content at all loses files to one that has.
+func TestOneSidekickPackDoesNotClaimAnothersFiles(t *testing.T) {
+	root, mk := libRoot(t)
+	sk := "Name: Hero\nParts:\n- Name: SK_HEAD\n"
+	writeUnityPackage(t, mk("synty", "SIDEKICK_D", "SIDEKICK_D_Unity_v1.unitypackage"), []unityGUID{
+		{guid: "sk1", pathname: "Assets/S/Characters/Hero.sk", asset: sk},
+		{guid: "hd1", pathname: "Assets/S/Resources/SK_HEAD.fbx", asset: "HEADFBX"},
+	})
+	// A different pack, same internal tree, no .sk anywhere in it.
+	writeFile(t, mk("synty", "POLYGON_W", "Assets", "S", "Characters", "Hero.prefab"), "OTHERPREFAB")
+
+	ix, err := Build(Options{Root: root, CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for i := range ix.Assets {
+		if ix.Assets[i].Pack == "POLYGON_W" && ix.Assets[i].Name == "Hero.prefab" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("another pack's Hero.prefab was claimed as a Sidekick byproduct")
+	}
+}
+
+// The sweep deletes everything in the version's tree that is not in the keep-set, and
+// a second quarry sharing this cache dir can be serving from any of it. Read off
+// Assets — which is exported — a caller that filtered the slice first would sweep the
+// extractions of everything it removed; read off a nil snapshot, it sweeps the lot.
+func TestPruneRefusesAnIndexNoWalkProduced(t *testing.T) {
+	cache := t.TempDir()
+	// A real extraction, so a sweep that went ahead would have something to destroy.
+	root, mk := libRoot(t)
+	writeUnityPackage(t, mk("v", "Pack", "Pack_Unity_v1.unitypackage"), []unityGUID{
+		{guid: "g1", pathname: "Assets/Rock.fbx", asset: "ROCKBYTES"},
+	})
+	real, err := Build(Options{Root: root, CacheDir: cache})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := real.Open(real.Assets[0]); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadDir(real.unpackedDir())
+	if err != nil || len(before) == 0 {
+		t.Fatalf("the fixture extracted nothing to protect: %v", err)
+	}
+
+	// An index assembled by hand over the same cache dir: the shape a library caller
+	// reaching past Build produces, and the shape a future in-place filter would leave.
+	hand := &Index{Root: real.Root, Version: indexVersion, cacheDir: cache}
+	if err := hand.PruneUnpacked(); !errors.Is(err, ErrPruneWithoutRefresh) {
+		t.Errorf("PruneUnpacked = %v, want ErrPruneWithoutRefresh", err)
+	}
+	after, err := os.ReadDir(real.unpackedDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != len(before) {
+		t.Errorf("the refused sweep still deleted: %d extractions became %d", len(before), len(after))
+	}
+	// And the index that did walk the library still prunes.
+	if err := real.PruneUnpacked(); err != nil {
+		t.Errorf("PruneUnpacked on a built index = %v", err)
+	}
+	if kept, _ := os.ReadDir(real.unpackedDir()); len(kept) != len(before) {
+		t.Errorf("a real prune deleted a live extraction: %d became %d", len(before), len(kept))
+	}
+}
+
+// Two readings of one file's stat print. refresh derives it from the stat the walk
+// already took; everything serving derives it from a stat of its own. Disagreeing,
+// every cached enumeration misses on every run and the whole library is re-derived
+// each startup — with nothing reporting it but the clock.
+func TestTheWalkAndTheServerAgreeOnAFilesPrint(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "pack.zip")
+	if err := os.WriteFile(p, []byte("BYTES"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stated, err := fingerprint(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fingerprintOf(p, fi.Size(), fi.ModTime()); got != stated {
+		t.Errorf("fingerprintOf = %q, fingerprint = %q", got, stated)
+	}
+}
+
+// The reader cache holds an archive's parsed central directory, and a Synty pack zip
+// holds tens of thousands of entries while a grid page issues one content request per
+// card — so re-parsing it per request is the dominant cost of serving from a zip. That
+// is the whole reason the type exists, and nothing asserted it: replacing acquire with
+// an unconditional openZip per request, and release with a Close, left every test in
+// the repo green. TestAMissingZipEntryReportsAMiss is the only one that touches
+// ix.zips at all, and its assertion is guarded by `cached`, so with no cache it never
+// runs either.
+//
+// Reuse is made observable the way TestRefreshReusesCachedArchiveEnumeration makes
+// enumeration reuse observable: the archive becomes unreadable while its size and mtime
+// stay put, so acquire's print still matches and a hit serves from the descriptor it
+// already holds, while a miss fails in zip.OpenReader.
+func TestTheZipReaderCacheActuallyCaches(t *testing.T) {
+	root, mk := libRoot(t)
+	held := mk("v", "Pack", "Pack_A_v1.zip")
+	writeZip(t, held, map[string]string{"Heart.fbx": "FBXHEART"})
+	// Straddling the bound rather than restating it: one short of it the held reader is
+	// still in the window, one past it the reader is gone.
+	others := make([]string, 2*zipCacheSize)
+	for i := range others {
+		others[i] = mk("v", "Pack", fmt.Sprintf("Other_%02d_v1.zip", i))
+		writeZip(t, others[i], map[string]string{"X.fbx": "XBYTES"})
+	}
+	ix, err := Build(Options{Root: root, CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	read := func(archive string) error {
+		for i := range ix.Assets {
+			a := ix.Assets[i]
+			if a.Source.ArchivePath != archive {
+				continue
+			}
+			rc, _, err := ix.Open(a)
+			if err != nil {
+				return err
+			}
+			io.Copy(io.Discard, rc)
+			return rc.Close()
+		}
+		t.Fatalf("no asset for %s", archive)
+		return nil
+	}
+
+	if err := read(held); err != nil {
+		t.Fatalf("first read: %v", err)
+	}
+	unreadable(t, held)
+
+	// Still inside the window: served from the reader already open, with the file on
+	// disk unopenable.
+	for i := 0; i < zipCacheSize-1; i++ {
+		if err := read(others[i]); err != nil {
+			t.Fatalf("touching %s: %v", others[i], err)
+		}
+	}
+	if err := read(held); err != nil {
+		t.Fatalf("an archive read once and still inside the cache had to be reopened: %v", err)
+	}
+	// That hit made it the newest, so a further window's worth of distinct archives is
+	// what pushes it out. Then the next read goes to the file — which is exactly what
+	// every read would do if the cache were gone.
+	for i := zipCacheSize - 1; i < 2*zipCacheSize-1; i++ {
+		if err := read(others[i]); err != nil {
+			t.Fatalf("touching %s: %v", others[i], err)
+		}
+	}
+	if err := read(held); err == nil {
+		t.Error("an evicted archive still served; the cache is not bounded by zipCacheSize")
+	}
+}
+
+// acquire retires rather than closes a reader whose archive moved, because a stream
+// over the bytes it describes may still be in flight. The refs guard inside
+// retireLocked is covered through eviction; nothing reached it through the
+// print-mismatch branch with a reader outstanding, so replacing that call with a delete
+// plus a direct Close — a plausible simplification, since the cached directory is known
+// to be wrong by then — passed the whole suite while killing in-flight responses.
+func TestARewrittenArchiveDoesNotCloseAStreamOverTheOldBytes(t *testing.T) {
+	root, mk := libRoot(t)
+	archive := mk("v", "Pack", "Pack_A_v1.zip")
+	writeZip(t, archive, map[string]string{"Heart.fbx": "ORIGINAL-BYTES-LONG-ENOUGH-TO-READ-IN-TWO-GOES"})
+	ix, err := Build(Options{Root: root, CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc, _, err := ix.Open(ix.Assets[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.Close()
+	head := make([]byte, 8)
+	if _, err := io.ReadFull(rc, head); err != nil {
+		t.Fatal(err)
+	}
+
+	// Re-shipped in place, the way a pack update arrives: written beside and renamed
+	// over, so the reader in flight keeps the inode it opened.
+	next := mk("v", "Pack", "next.tmp")
+	writeZip(t, next, map[string]string{"Heart.fbx": "REPLACED"})
+	if err := os.Rename(next, archive); err != nil {
+		t.Fatal(err)
+	}
+	// Any request for the same archive now: the print no longer matches, so acquire
+	// retires the cached reader and opens the file again. Reading the new bytes is what
+	// proves the retire branch ran rather than the cached directory being reused.
+	fresh, _, err := ix.Open(ix.Assets[0])
+	if err != nil {
+		t.Fatalf("re-opening the re-shipped archive: %v", err)
+	}
+	newBytes, _ := io.ReadAll(fresh)
+	fresh.Close()
+	if string(newBytes) != "REPLACED" {
+		t.Fatalf("the second read returned %q; the print check did not retire the stale reader", newBytes)
+	}
+
+	rest, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("the in-flight stream died when the archive was re-shipped: %v", err)
+	}
+	if got := string(head) + string(rest); got != "ORIGINAL-BYTES-LONG-ENOUGH-TO-READ-IN-TWO-GOES" {
+		t.Errorf("the stream returned %q; it must finish over the bytes it started on", got)
+	}
+}
+
+// archiveMu serialises an archive's readers against its rebuild: a reader holds it
+// shared from the extraction check through the open, and discardExtraction takes it
+// exclusively. What makes that airtight is that there is exactly one way in.
+// openUnpackedMember takes the lock and then calls unpackedEntry, which is the only
+// caller of ensureExtracted; a second call site — a prefetch, a warm-up, a debug
+// endpoint — reopens the window between the check and the open, and the only test on
+// the invariant is a 50ms spin-loop race that can pass without ever producing the
+// interleaving. The structure is what can be asserted outright.
+func TestNothingReachesAnExtractionOutsideTheArchiveLock(t *testing.T) {
+	src, err := os.ReadFile("content.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Split into top-level funcs so a call can be attributed to the one it sits in.
+	funcs := regexp.MustCompile(`(?m)^func (?:\([^)]*\) )?(\w+)`).FindAllStringSubmatchIndex(string(src), -1)
+	if len(funcs) < 10 {
+		t.Fatalf("parsed %d functions out of content.go; this guard has stopped reading it", len(funcs))
+	}
+	callers := func(callee string) []string {
+		var out []string
+		for i, m := range funcs {
+			end := len(src)
+			if i+1 < len(funcs) {
+				end = funcs[i+1][0]
+			}
+			name := string(src[m[2]:m[3]])
+			body := string(src[m[1]:end])
+			if name != callee && strings.Contains(body, callee+"(") {
+				out = append(out, name)
+			}
+		}
+		return out
+	}
+	for callee, allowed := range map[string][]string{
+		"ensureExtracted": {"unpackedEntry"},
+		"unpackedEntry":   {"openUnpackedMember"},
+	} {
+		got := callers(callee)
+		if len(got) == 0 {
+			t.Errorf("no caller of %s found; this guard has stopped checking anything", callee)
+		}
+		for _, c := range got {
+			if !slices.Contains(allowed, c) {
+				t.Errorf("%s calls %s, outside the one path that holds archiveMu (%v). A reader that "+
+					"skips the lock races discardExtraction and opens a member from a tree being deleted",
+					c, callee, allowed)
+			}
+		}
+	}
+	// And the one way in does take the lock.
+	body := string(src[strings.Index(string(src), "func (ix *Index) openUnpackedMember"):])
+	body = body[:strings.Index(body, "\n}\n")]
+	if !strings.Contains(body, "archiveMu(") || !strings.Contains(body, "RLock()") {
+		t.Error("openUnpackedMember no longer takes archiveMu for reading")
+	}
+}
+
+// claimRebuild hands out one repair per extraction, and releaseRebuild gives the claim
+// back when the discard that repair depends on could not happen. Driving those two
+// directly asserts the helper rather than the outcome: it would keep passing with the
+// releaseRebuild call removed from openUnpacked, which is the behaviour it protects.
+// The outcome is that a transient reason the discard failed, once fixed, still repairs.
+func TestARebuildBlockedByTheCacheDirStillRepairsOnceItIsWritable(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: directory modes are not enforced")
+	}
+	root, mk := libRoot(t)
+	archive := mk("v", "Pack", "Pack_Unity_v1.unitypackage")
+	writeUnityPackage(t, archive, []unityGUID{
+		{guid: "g1", pathname: "Assets/Rock.fbx", asset: "ROCKBYTES"},
+	})
+	cache := t.TempDir()
+	ix, err := Build(Options{Root: root, CacheDir: cache})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := ix.Assets[0]
+	rc, _, err := ix.Open(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc.Close()
+
+	// Tear the extraction the way an unclean shutdown does: the member is there and
+	// short, which is what openUnpacked's size re-check is for.
+	member := filepath.Join(ix.unpackedDir(), ix.ArchivePrint[archive], "g1", "asset")
+	if err := os.WriteFile(member, []byte("TORN"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Now make the discard itself impossible: it moves the condemned tree into a temp
+	// dir under stagingDir, which it cannot create one in.
+	staging := ix.stagingDir()
+	if err := os.MkdirAll(staging, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(staging, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := ix.Open(a); err == nil {
+		os.Chmod(staging, 0o755)
+		t.Fatal("a torn member read as fine while the repair could not run")
+	}
+	// The cause is fixed. The claim must not have been spent on the attempt that could
+	// not happen, or this asset serves torn bytes for the life of the process.
+	if err := os.Chmod(staging, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rc, _, err = ix.Open(a)
+	if err != nil {
+		t.Fatalf("the repair never ran after the reason it could not was fixed: %v", err)
+	}
+	got, _ := io.ReadAll(rc)
+	rc.Close()
+	if string(got) != "ROCKBYTES" {
+		t.Errorf("served %q after the repair, want the archive's bytes", got)
+	}
+}
+
+// RootMotionVariant's doc comment is the stated authority on the conventions it knows,
+// and design.md defers to it by name and by count. Both drifted: the table listed
+// "_RootMotion" only as an infix while stripToken has accepted it as a suffix all
+// along, and design.md said four. A reader who trusts either concludes a file that
+// pairs correctly is a bug — and "fixing" it changes what the GLB-split gate does to
+// every such file, silently, because the fingerprints do not move with it.
+//
+// Derived from the comment rather than restated: each bullet carries its own worked
+// example, so the table is executable.
+func TestTheRootMotionDocTableIsTrue(t *testing.T) {
+	src, err := os.ReadFile("rootmotion.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc := string(src[:strings.Index(string(src), "func RootMotionVariant")])
+	// //   - "<token>" <kind>   <vendor...>   "<in>" -> "<out>"
+	row := regexp.MustCompile(`(?m)^//\s+- .*"([^"]+)"\s*->\s*"([^"]+)"`)
+	rows := row.FindAllStringSubmatch(doc, -1)
+	if len(rows) < 4 {
+		t.Fatalf("parsed %d worked examples out of the doc comment; this guard has stopped reading it", len(rows))
+	}
+	for _, m := range rows {
+		in, want := m[1], m[2]
+		got, isRM := RootMotionVariant(in)
+		if !isRM || got != want {
+			t.Errorf("the doc says %q -> %q, but RootMotionVariant returns (%q, %v)", in, want, got, isRM)
+		}
+	}
+	// design.md names the count in words, and it is the file the version-bump rule is
+	// written in. Spelled out rather than digits, so it is matched that way.
+	words := map[int]string{3: "three", 4: "four", 5: "five", 6: "six", 7: "seven"}
+	md, err := os.ReadFile(filepath.Join("..", "..", "docs", "design.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := regexp.MustCompile(`conventions it knows \(currently (\w+):`).FindStringSubmatch(string(md))
+	if claim == nil {
+		t.Fatal("design.md no longer states how many conventions RootMotionVariant knows; this guard has stopped reading it")
+	}
+	if want := words[len(rows)]; claim[1] != want {
+		t.Errorf("design.md says %q conventions, the doc comment lists %d (%q)", claim[1], len(rows), want)
+	}
+}
+
+// An archive entry and an extracted tree are read as paths, not as names, and the
+// spellings a real library ships are not canonical: older Windows zip tooling writes
+// "\" separators, some writers prefix every entry with "./", and a pack is commonly
+// unpacked into a src/ subdirectory. Every rule downstream — the classifier's
+// separators, the dot-directory skip, the dedup key, a Sidekick character's suppression
+// scope — is written against one normalised reading, and each of those normalisations
+// lives at a different call site.
+//
+// Two audits found the same shape twice: zipAssets asked archive/zip whether an entry
+// was a directory, which reads the *stored* name and so missed "SourceFiles\Models\"
+// entirely, and withinPackPath compared a raw pathname against a path.Dir-cleaned tree,
+// so a src/ extraction kept every byproduct the assembled character exists instead of.
+// Neither was visible to a suite that spells its fixtures canonically.
+//
+// So this indexes one library three ways and demands the same answer. It is deliberately
+// a whole-index comparison rather than a rule-by-rule one: what matters is that no
+// spelling reaches the grid differently, and a new rule is covered without being named
+// here.
+func TestEverySpellingOfOnePackIndexesTheSame(t *testing.T) {
+	const sk = "Name: Hero\nParts:\n- Name: SK_HEAD\n"
+	// The unitypackage is the same in all three; only the extracted tree beside it and
+	// the zip's entry spellings move.
+	pkg := func(prefix string) []unityGUID {
+		return []unityGUID{
+			{guid: "sk1", pathname: prefix + "Assets/S/Characters/Hero.sk", asset: sk},
+			{guid: "p1", pathname: prefix + "Assets/S/Characters/Hero.prefab", asset: "PREFAB"},
+			{guid: "m1", pathname: prefix + "Assets/S/Characters/Hero.mat", asset: "MAT"},
+			{guid: "c1", pathname: prefix + "Assets/S/Characters/Hero_CombinedMesh.asset", asset: "COMBINED"},
+			{guid: "hd1", pathname: prefix + "Assets/S/Resources/SK_HEAD.fbx", asset: "HEADFBX"},
+		}
+	}
+	// A card is compared by what the grid shows and what a tag keys on. The id is left
+	// out on purpose: it embeds an absolute path and each case builds its own temp root.
+	//
+	// The one difference that is not a defect is src/ in a loose RelPath: the file
+	// genuinely sits there and the grid should say so. normSubpath exists for the dedup
+	// key, not for display, so the segment is taken out here rather than in the scan.
+	describe := func(assets []Asset) []string {
+		out := make([]string, 0, len(assets))
+		for i := range assets {
+			a := &assets[i]
+			rel := strings.Replace(a.RelPath, "/src/", "/", 1)
+			out = append(out, fmt.Sprintf("%s|%s|%s|%s|%s|%s|%d|%s",
+				a.Source.Kind, a.Name, rel, a.Category, a.Vendor, a.Variant, a.Size, a.Fingerprint))
+		}
+		slices.Sort(out)
+		return out
+	}
+	build := func(t *testing.T, unityPrefix, extractUnder string, zipEntry func(string) string) []string {
+		t.Helper()
+		root, mk := libRoot(t)
+		writeUnityPackage(t, mk("synty", "PACK", "PACK_Unity_v1.unitypackage"), pkg(unityPrefix))
+		// A zip of an ordinary (non-Sidekick) tree, carrying a directory entry. The
+		// directory is what the stored-name reading missed.
+		writeZip(t, mk("synty", "PACK", "PACK_SourceFiles_v1.zip"), map[string]string{
+			zipEntry("SourceFiles/Models/"):          "",
+			zipEntry("SourceFiles/Models/Sword.fbx"): "SWORDBYTES",
+			zipEntry("SourceFiles/Textures/T_A.png"): "PNGBYTES",
+		})
+		// The unitypackage extracted beside itself, which is where the loose half of
+		// the Sidekick suppression applies.
+		for _, f := range []struct{ rel, body string }{
+			{"Assets/S/Characters/Hero.sk", sk},
+			{"Assets/S/Characters/Hero.prefab", "PREFAB"},
+			{"Assets/S/Characters/Hero.mat", "MAT"},
+			{"Assets/S/Characters/Hero_CombinedMesh.asset", "COMBINED"},
+			{"Assets/S/Resources/SK_HEAD.fbx", "HEADFBX"},
+		} {
+			parts := append([]string{"synty", "PACK"}, strings.Split(extractUnder+f.rel, "/")...)
+			writeFile(t, mk(parts...), f.body)
+		}
+		// Twice through the cache: the loose Sidekick drop is re-decided on every
+		// refresh while the .sk's bytes are read only on the pass that enumerates the
+		// archive, so a spelling that breaks Source.Complete shows on the second run.
+		cache := t.TempDir()
+		opt := Options{Root: root, CacheDir: cache}
+		if _, err := LoadOrBuild(opt, false, func(string) {}); err != nil {
+			t.Fatal(err)
+		}
+		ix, err := LoadOrBuild(opt, false, func(string) {})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return describe(ix.Assets)
+	}
+
+	canonical := build(t, "", "", func(s string) string { return s })
+	if len(canonical) == 0 {
+		t.Fatal("the canonical fixture indexed nothing; this guard is comparing two empty sets")
+	}
+	// The assembled character must actually be there, or every case agrees on a library
+	// in which assembly never ran and the comparison proves nothing.
+	if !slices.ContainsFunc(canonical, func(s string) bool { return strings.Contains(s, "|Hero|") }) {
+		t.Fatalf("no assembled character in the canonical fixture; the byproduct rules are not being exercised:\n%v", canonical)
+	}
+	for _, s := range canonical {
+		if strings.Contains(s, "|Hero.prefab|") || strings.Contains(s, "|Models|") {
+			t.Fatalf("the canonical fixture itself keeps a byproduct or a directory entry: %q", s)
+		}
+	}
+
+	for _, tc := range []struct {
+		name         string
+		unityPrefix  string
+		extractUnder string
+		zipEntry     func(string) string
+	}{
+		{"backslash-separated zip entries", "", "", func(s string) string { return strings.ReplaceAll(s, "/", `\`) }},
+		{"./-prefixed unity pathnames", "./", "", func(s string) string { return s }},
+		{"the pack extracted under src/", "", "src/", func(s string) string { return s }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := build(t, tc.unityPrefix, tc.extractUnder, tc.zipEntry)
+			if !slices.Equal(got, canonical) {
+				t.Errorf("this spelling indexes differently from the canonical one:\n got  %v\n want %v", got, canonical)
+			}
+		})
+	}
+}
+
+// A prune that cannot remove one tree must still sweep the rest and report. Early-return
+// is the natural refactor of the firstErr accumulation, and it is invisible: nothing
+// else clears a stale extraction, so a single undeletable directory would strand every
+// later one — hundreds of MB per Synty pack — behind a warning naming only the first.
+// No existing prune test makes a remove fail, so that refactor passed the whole suite.
+func TestPruneKeepsSweepingPastATreeItCannotRemove(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("a read-only directory does not stop root")
+	}
+	root, mk := libRoot(t)
+	cache := t.TempDir()
+	writeUnityPackage(t, mk("v", "Pack", "Pack_Unity_v1.unitypackage"), []unityGUID{
+		{guid: "g1", pathname: "Assets/Rock.fbx", asset: "ROCKBYTES"},
+	})
+	ix, err := Build(Options{Root: root, CacheDir: cache})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := ix.Open(ix.Assets[0]); err != nil {
+		t.Fatal(err)
+	}
+
+	// Three extractions no current walk reached, so all three are the sweep's to take.
+	// The first by sort order is made undeletable; the other two prove the sweep did
+	// not stop there. Named so the failing one sorts first whatever ReadDir returns.
+	dir := ix.unpackedDir()
+	stuck := filepath.Join(dir, "0-stuck")
+	for _, name := range []string{"0-stuck", "1-stale", "2-stale"} {
+		p := filepath.Join(dir, name)
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		// A non-empty directory: RemoveAll on an empty one succeeds even under a
+		// read-only parent on some filesystems, and an unlink it cannot do is the point.
+		if err := os.WriteFile(filepath.Join(p, "asset"), []byte("X"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Chmod(stuck, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(stuck, 0o755) })
+
+	err = ix.PruneUnpacked()
+	if err == nil {
+		t.Fatal("a prune that could not remove a tree reported success")
+	}
+	for _, name := range []string{"1-stale", "2-stale"} {
+		if _, statErr := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(statErr) {
+			t.Errorf("%s survived: the sweep stopped at the tree it could not remove", name)
+		}
+	}
+	// And the live extraction is untouched, which is the whole point of the keep-set.
+	live, readErr := os.ReadDir(dir)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	var kept int
+	for _, e := range live {
+		if ix.liveUnpacked[e.Name()] {
+			kept++
+		}
+	}
+	if kept != 1 {
+		t.Errorf("live extractions surviving = %d, want 1", kept)
 	}
 }

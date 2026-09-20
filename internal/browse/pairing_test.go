@@ -110,19 +110,14 @@ func TestSplitEntry(t *testing.T) {
 	}
 }
 
-func TestSeparatorsForFollowsThePlatform(t *testing.T) {
-	if got := separatorsFor('\\'); got != `/\` {
-		t.Errorf("windows separators = %q, want %q", got, `/\`)
-	}
-	if got := separatorsFor('/'); got != "/" {
-		t.Errorf("unix separators = %q, want %q", got, "/")
-	}
-}
-
 // windowsPaths installs the Windows separator set for one test. A loose file's path
 // is whatever the filesystem handed the scan, so on Windows it holds backslashes
 // while a zip entry and a unity pathname never do; a Unix host cannot produce that
 // input on its own, and this is the behaviour that has to be pinned.
+//
+// It swaps a package-level variable, so a test using it must not run in parallel with
+// another that reads osSeparators — which is every pairing test. Nothing in this
+// package calls t.Parallel, and this is the reason to keep it that way.
 func windowsPaths(t *testing.T) {
 	t.Helper()
 	prev := osSeparators
@@ -413,5 +408,59 @@ func TestOneFormatsLayoutDoesNotDecideAnothers(t *testing.T) {
 	}
 	if !suppressed["glbRM"] {
 		t.Error("glbRM was not suppressed, so the file the clips play also shows as its own card")
+	}
+}
+
+// The mirrored layout above, ragged. Root-motion variants usually exist for locomotion
+// and not much else, so a group where one character ships no RM for a clip is the
+// ordinary case rather than an exotic one — and there no RM is in any card's own
+// directory, so the same-directory filter never engages and every remaining candidate
+// is equally distant. Ranked on the archive term alone the unmatched card took the
+// neighbouring character's travel animation: a whole-file RM card carries no clip name,
+// so clipsMatching hands the viewer every clip in it and one of them plays, on the
+// wrong body, with nothing anywhere to say so.
+func TestARaggedMirroredTreeLeavesTheUnmatchedCardUnpaired(t *testing.T) {
+	sibling, suppressed := buildRootMotionPairs([]assetindex.Asset{
+		zipAnim("goblinIdle", "acme", "Chars", "/p.zip", "Anims/Goblin/Idle.fbx"),
+		zipAnim("orcIdle", "acme", "Chars", "/p.zip", "Anims/Orc/Idle.fbx"),
+		zipAnim("orcIdleRM", "acme", "Chars", "/p.zip", "RootMotion/Orc/Idle_RM.fbx"),
+	})
+	if got := sibling["goblinIdle"]; got != "" {
+		t.Errorf("goblinIdle paired with %q, another character's root motion", got)
+	}
+	if got := sibling["orcIdle"]; got != "orcIdleRM" {
+		t.Errorf("orcIdle paired with %q, want the RM that mirrors its own folder", got)
+	}
+	if !suppressed["orcIdleRM"] {
+		t.Error("orcIdleRM was not suppressed, so it shows as a stray card beside the one that plays it")
+	}
+}
+
+// One pack, two archives laid out differently. The same-directory probe is asked per
+// archive for the reason it is asked per format: pickRM chooses within an archive, so
+// an answer read across both lets the archive that keeps its RM beside the clip decide
+// that the archive that does not has no sibling at all — leaving that archive's RM
+// unsuppressed, as a stray card beside the one it belongs to.
+func TestOneArchivesLayoutDoesNotDecideAnothers(t *testing.T) {
+	const zipPath, uniPath = "/lib/synty/P/P_SourceFiles_v3.zip", "/lib/synty/P/P_Unity_2022_3_v1.unitypackage"
+	uniAnim := func(id, pathname string) assetindex.Asset {
+		return assetindex.Asset{ID: id, Ext: "fbx", Vendor: "synty", Pack: "P", Category: assetindex.CategoryAnimation,
+			Source: assetindex.Source{Kind: assetindex.SourceUnityPackage, ArchivePath: uniPath, Guid: id, Pathname: pathname}}
+	}
+	sibling, suppressed := buildRootMotionPairs([]assetindex.Asset{
+		uniAnim("uni-walk", "Assets/Anim/A_Walk_Masc.fbx"),
+		uniAnim("uni-walk-rm", "Assets/Anim/A_Walk_RM_Masc.fbx"),
+		zipAnim("zip-walk", "synty", "P", zipPath, "SF/A_Walk_Masc.fbx"),
+		zipAnim("zip-walk-rm", "synty", "P", zipPath, "SF/RM/A_Walk_RM_Masc.fbx"),
+	})
+	for card, want := range map[string]string{"uni-walk": "uni-walk-rm", "zip-walk": "zip-walk-rm"} {
+		if got := sibling[card]; got != want {
+			t.Errorf("%s paired with %q, want %q: each archive answers the directory question for itself", card, got, want)
+		}
+	}
+	for _, rm := range []string{"uni-walk-rm", "zip-walk-rm"} {
+		if !suppressed[rm] {
+			t.Errorf("%s was not suppressed, so it shows as a stray card beside the one that plays it", rm)
+		}
 	}
 }

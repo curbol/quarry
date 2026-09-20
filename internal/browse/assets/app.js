@@ -89,7 +89,7 @@ async function loadPage() {
     const mode = grouping();
     if (state.facetsMode !== mode && data.facets) { populateFacets(data.facets); state.facetsMode = mode; }
     state.total = data.total;
-    for (const a of data.items) state.items.push(a);
+    for (const a of data.items) { state.items.push(a); holdTags(a); }
     if (!gridWindow.appended()) {
       for (const a of data.items) els.grid.appendChild(card(a));
     }
@@ -129,6 +129,11 @@ function reset() {
   state.offset = 0; state.total = 0; state.done = false; state.loading = false;
   state.failed = false;
   state.items = [];
+  // lb.index points into the list just emptied. Left standing it survives until the
+  // replacement page lands, and an arrow pressed in that window steps from a position
+  // in the old set into the new one. Clearing it here is what makes navLightbox's
+  // negative-index guard cover the gap as well as the landing.
+  reanchorLightbox();
   // Let go of the outgoing cards before dropping them: what is observing them, what is
   // still being rendered for them, and what would repaint them on a tag edit all
   // outlive the DOM otherwise.
@@ -141,6 +146,7 @@ function reset() {
   // for a render nothing would ask for again.
   for (const el of els.grid.querySelectorAll('.card')) forgetCard(el);
   tagWatchers.clear();
+  tagHolders.clear();
   gridWindow.reset();
   els.grid.replaceChildren();
   // Cards appended straight into a fresh result set animate in; cards the window
@@ -485,6 +491,27 @@ async function loadPalette(attempt = 0) {
 // left the grid showing tags that were no longer true.
 const tagWatchers = new Map(); // fingerprint -> Set<{ asset, repaint }>
 
+// tagHolders is the same index over the result set itself rather than over the cards
+// currently in the DOM. A card recycled out of the live window unregisters its watcher,
+// which is what keeps the map from growing without bound — but the watcher entry was
+// also the only thing writing a tag edit back into state.items. Two cards sharing a
+// fingerprint (byte-identical files under different names) more than LIVE apart, edit
+// one, and the other's object kept the tags the server sent with its page, so scrolling
+// back repainted it wrong until a filter change re-ran the query.
+//
+// Keyed on fingerprint like tagWatchers, cleared by reset() with state.items.
+const tagHolders = new Map(); // fingerprint -> Set<asset>
+
+// holdTags indexes one result-set entry so an edit anywhere reaches its model, whether
+// or not it currently has a card.
+function holdTags(asset) {
+  for (const fp of asset.fingerprints || []) {
+    let set = tagHolders.get(fp);
+    if (!set) tagHolders.set(fp, (set = new Set()));
+    set.add(asset);
+  }
+}
+
 function watchTags(asset, repaint) {
   const entry = { asset, repaint };
   for (const fp of asset.fingerprints || []) {
@@ -511,18 +538,40 @@ function unwatchTags(entry) {
 // applyTagChange folds one edit into every card that shares a fingerprint with it.
 // What the edit does to a card is nextTags; this is which cards it reaches.
 function applyTagChange(fingerprints, tag, on) {
+  // The model first, over every entry in the result set. Folding the edit in here
+  // rather than inside the repaint loop is what reaches an entry whose card the grid
+  // window has recycled out, or never built.
+  const seen = new Set();
+  for (const fp of fingerprints) {
+    for (const a of tagHolders.get(fp) || []) {
+      if (seen.has(a)) continue;
+      seen.add(a);
+      a.tags = nextTags({
+        cardFingerprints: a.fingerprints,
+        cardTags: a.tags,
+        edited: fingerprints,
+        tag,
+        on,
+      });
+    }
+  }
+  // Then the repaints. A card's asset is an entry the loop above already folded into,
+  // except for one the lightbox's related strip built from its own fetch — those are
+  // not in the result set, so they still need the edit applied here.
   const done = new Set();
   for (const fp of fingerprints) {
     for (const e of tagWatchers.get(fp) || []) {
       if (done.has(e)) continue;
       done.add(e);
-      e.asset.tags = nextTags({
-        cardFingerprints: e.asset.fingerprints,
-        cardTags: e.asset.tags,
-        edited: fingerprints,
-        tag,
-        on,
-      });
+      if (!seen.has(e.asset)) {
+        e.asset.tags = nextTags({
+          cardFingerprints: e.asset.fingerprints,
+          cardTags: e.asset.tags,
+          edited: fingerprints,
+          tag,
+          on,
+        });
+      }
       e.repaint();
     }
   }
@@ -538,8 +587,13 @@ async function apiAssign(fingerprints, tag, on) {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ fingerprints, tag, on }),
     });
-  } catch {
-    reportTagError(null);
+  } catch (e) {
+    // The request never reached the server, so there is no rejection to report and no
+    // body to read one out of. Said as "the server rejected the change" it sends the
+    // user looking for what was wrong with their edit instead of at a quarry that is no
+    // longer running.
+    console.error('assign request failed before reaching the server', e);
+    reportTagError({ error: 'Could not reach quarry. Is it still running?' });
     return null;
   }
   const data = await res.json().catch(() => null);
@@ -576,8 +630,8 @@ async function apiTag(method, body) {
     // that did not land has to say so: returning false alone left a delete or a rename
     // that never reached the server indistinguishable from a click the UI ignored,
     // while the same request failing with a 500 raised an alert.
-    console.error('tag palette edit failed', e);
-    reportTagError(null);
+    console.error('tag palette edit failed before reaching the server', e);
+    reportTagError({ error: 'Could not reach quarry. Is it still running?' });
     return false;
   }
   const data = await res.json().catch(() => null);
@@ -822,8 +876,18 @@ const tagFilter = {
     const commit = async () => {
       const v = name.value.trim();
       if (!v || v === id) return;
-      if (await apiTag('PATCH', { id, newId: v })) reset();
-      else name.value = id;
+      // A rename retires the old id from the palette, and setOptions drops any
+      // selection it no longer finds — so renaming the tag you are filtering by
+      // cleared the filter and returned the whole library with nothing said. The
+      // filter intent survives the rename (the assignments move with it), so the
+      // selection has to move with it too. Read before the PATCH, because applyPalette
+      // runs inside it and is what does the dropping.
+      const wasSelected = tagFilter.selected.has(id);
+      if (await apiTag('PATCH', { id, newId: v })) {
+        if (wasSelected) tagFilter.selected.add(v);
+        tagFilter.setOptions();
+        reset();
+      } else name.value = id;
     };
     name.addEventListener('keydown', (e) => { if (e.key === 'Enter') { name.blur(); } });
     name.addEventListener('blur', commit);
@@ -1025,7 +1089,7 @@ function flashCopy(btn, text, { label = false } = {}) {
       btn.classList.remove('done', 'failed');
     }, COPY_FEEDBACK_MS);
   };
-  writeClipboard(text).then(flash, () => flash(false));
+  writeClipboard(text).then(flash, (e) => { console.warn('copy to clipboard failed', e); flash(false); });
 }
 
 // writeClipboard falls back to a selection copy where the async clipboard API is
@@ -1165,7 +1229,13 @@ async function navLightbox(delta) {
   if (i >= state.items.length) {
     if (state.done) return;
     await fetchPage();
-    if (i >= state.items.length) return;
+    // Recomputed, not reused: the page that lands may be a different result set — a
+    // tag edit under an active filter re-runs the query with the lightbox open — and
+    // loadPage reanchors lb.index into it. Stepping with the offset read before the
+    // await lands on whatever now sits at the old position.
+    if (lb.index < 0) return;
+    i = lb.index + delta;
+    if (i < 0 || i >= state.items.length) return;
   }
   openLightbox(state.items[i]);
 }

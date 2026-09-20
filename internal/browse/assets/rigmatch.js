@@ -41,6 +41,76 @@ export function clipsMatching(all, asset) {
   return all.length === 1 ? all : [];
 }
 
+// clipBaseName strips the FBX take prefix, so "Take 001|Walk" and "Walk" are the same
+// animation under two exporters. clipsForAsset and clipsMatching compare the same way.
+function clipBaseName(c) {
+  const n = (c && c.name) || '';
+  const bar = n.lastIndexOf('|');
+  return bar < 0 ? n : n.slice(bar + 1);
+}
+
+// pairClipsByName aligns a file's animations with the same animations in its
+// root-motion sibling, returning for each clip of `a` the index of its counterpart in
+// `b`, or -1 where there is none.
+//
+// The toggle needs this because the two lists come out of two different files. A card
+// for a whole animation file carries no clip name, so clipsMatching hands back every
+// clip the sibling holds, and the lists then share neither length nor order. Swapping
+// between them by position picked whatever sat at that index: with fewer clips on the
+// other side the viewer silently fell back to the first one and lost the user's place,
+// and with the same count in a different order it played one animation while presenting
+// it as another's travel variant — a clip that loads, on the right body, wrong.
+//
+// Position is the fallback only when the two hold the same number of clips and no name
+// matched at all, which is what a pair exported with unnamed or mechanically renamed
+// takes looks like. A partial match keeps its -1s: a clip with no counterpart has no
+// travel variant to offer, and offering one anyway is the failure this exists to stop.
+//
+// A name is consumed once it is taken, so a file holding two clips under one name — or
+// two unnamed ones, which is the same thing here — pairs them off in order rather than
+// sending both to the first. Handing every duplicate the same counterpart is the
+// position bug again, wearing a name.
+export function pairClipsByName(a, b) {
+  a = a || [];
+  b = b || [];
+  const free = new Map();
+  b.forEach((c, i) => {
+    const k = clipBaseName(c);
+    const q = free.get(k);
+    if (q) q.push(i);
+    else free.set(k, [i]);
+  });
+  const out = a.map((c) => {
+    const q = free.get(clipBaseName(c));
+    return q && q.length ? q.shift() : -1;
+  });
+  if (a.length === b.length && out.every((i) => i < 0)) return a.map((_, i) => i);
+  return out;
+}
+
+// clipAcross is where the toggle lands: the counterpart pairClipsByName found, or the
+// current index when there is none. It sits here rather than at the call site because
+// it is the last step between a correct pairing and the wrong animation being shown as
+// this one's travel variant, and it is the same arithmetic the pairing itself exists to
+// get right — read the pairs the wrong way round and the sibling list's own index is
+// used against the in-place list.
+//
+// pairs is always the mapping *from* the side being left. The caller flips which list
+// that is before asking, so the two are never the same array on two consecutive calls.
+export function clipAcross(pairs, curClip) {
+  const next = (pairs || [])[curClip];
+  return next >= 0 ? next : curClip;
+}
+
+// togglePairable reports whether the toggle has anywhere to go for this clip. An empty
+// mapping means the other side was never split into clips at all — a whole animation
+// file, where every clip is reachable — so the toggle stands; otherwise it needs a
+// counterpart, because offering one that does not exist is how a clip gets presented as
+// another's travel variant.
+export function togglePairable(pairs, curClip) {
+  return !(pairs || []).length || (pairs || [])[curClip] >= 0;
+}
+
 // coversBones reports how many bone names a rig and a clip share when the rig can
 // actually play the clip, and 0 when it cannot: the clip must drive most of the rig
 // (≥60% of the rig's bones — so nearly the whole body animates) AND cover a good part

@@ -41,9 +41,16 @@ error rather than silently swallowing the flags after it.
 
 `config.toml` in the XDG config dir carries `root`, the only setting with no default:
 indexing whatever directory the user happened to be standing in would be a slow, surprising
-accident, so an unset root is an error. `QUARRY_ROOT` then `--root` override it. The config
-holds no account identity and no credentials, because quarry has no session and talks to
-nothing.
+accident, so an unset root is an error. It must also be absolute, and so must `QUARRY_ROOT`
+— both follow the user into every directory, so a relative one means a different library in
+each, and `root = "."` is the same accident arriving from a file. `--root` is the exception,
+resolved against the working directory because one invocation saying "here" is a different
+thing from a setting. `QUARRY_ROOT` then `--root` override the file, and the whole chain
+resolves in one place so the absolute rule only ever applies to the source that wins:
+checked before the flag was folded in, a relative `QUARRY_ROOT` in a shell rc refused the
+run whatever `--root` said, and the refusal's own advice — pass `--root` — hit the same
+refusal, leaving no flag that could start quarry at all. The config holds no
+account identity and no credentials, because quarry has no session and talks to nothing.
 
 ## Index cache
 
@@ -148,19 +155,27 @@ card carrying `rootMotionId`, the RM variant's asset id; the lightbox's root-mot
 that file to show the travel, and the RM card is suppressed from the grid. Pairing groups assets
 by `(vendor, pack, canonical file base)`, where the canonical base strips the `_RM` token.
 `assetindex.RootMotionVariant` is the one recognizer that decides what a token is, and its doc
-comment is the authority on the conventions it knows (currently four: a trailing `_RM`, a `_RM_`
-infix, a ` [RM]` bracket suffix, and a `_RootMotion_` infix); teaching it a fifth means bumping
+comment is the authority on the conventions it knows (currently five: a trailing `_RM`, a `_RM_`
+infix, a trailing `_RootMotion`, a `_RootMotion_` infix, and a ` [RM]` bracket suffix); teaching it another means bumping
 `indexVersion`, because the GLB-split gate reads it at scan time and browse pairing reads it live.
 
 The directory is not part of the key, but it is not merely a preference either. Asked per
-container format, since a sibling has to be the same one: if any in-place asset in the group has
-an RM in its own directory, the directory becomes a **filter** — a card whose own directory ships
-no RM gets no sibling rather than a neighbour's, because in a per-character layout the directory
-is the only thing telling one character's "Walk" from another's, and a wrong sibling is a
-plausible clip out of a file that loads, with nothing to signal it. Where no card has an RM beside
-it the filter does not engage, and candidates are ranked by how many trailing path segments they
-share with the card, then by being in the same archive — which is what separates a layout that
-mirrors per-character folders under one root-motion tree. Because a
+container format and per archive — the format because a sibling has to share it, the archive
+because the layout being asked about is a property of one archive's own tree, not because
+pairing is confined to it (a better-placed RM in another archive still wins): if any in-place asset in that
+scope has an RM in its own directory, the directory becomes a **filter** — a card whose own
+directory ships no RM gets no sibling rather than a neighbour's, because in a per-character layout
+the directory is the only thing telling one character's "Walk" from another's, and a wrong sibling
+is a plausible clip out of a file that loads, with nothing to signal it. Where no card has an RM
+beside it the filter does not engage, and candidates are ranked by how many trailing path segments
+they share with the card, then by being in the same archive — which is what separates a layout that
+mirrors per-character folders under one root-motion tree.
+
+Ranking alone is not enough there, because it only orders the candidates one card can see: with a
+single candidate left a card takes it however distant, which is the ordinary case once a character
+ships no RM for some clip. So a candidate is also held to the best directory affinity *any* card in
+the group reaches with it — the same "it belongs to someone else" rule the directory filter
+applies, one rung down and reachable where that filter is not. Because a
 result card groups by name and size while pairing groups by pack, a card can span the
 copy that owns the sibling and one that does not, so the card takes the sibling of
 whichever of its copies has one. This is orthogonal to whether the clip has
@@ -186,8 +201,11 @@ outside the current view are preserved, so tags and links survive a disabled pac
 back rather than dropping it: a key it does not recognize (the store travels between
 machines that need not run the same quarry, and that is exactly when a newer version's
 field would otherwise be destroyed by an older version's next edit), a color it cannot
-parse, and a tag id defined twice, where the second row would silently win. The one thing
-a save cannot preserve is comments, so it writes a header line saying so. quarry is otherwise read-only over the library; this is its
+parse, a tag id defined twice, where the second row would silently win, and a row half
+written by hand — a `[[tag]]` with no id, an assignment with an empty fingerprint or tag —
+which is not a row a save keeps either. A group of fewer than two members is the one
+documented drop, because that is not a partial row but a group that means nothing. The one
+thing a save cannot preserve is comments, so it writes a header line saying so. quarry is otherwise read-only over the library; this is its
 one write surface, guarded by a mutex and written atomically. Because there is no session,
 the write endpoints require an `application/json` content-type, which forces a CORS
 preflight the server does not answer and so keeps a page the user happens to have open from
@@ -200,6 +218,14 @@ That content-type only stops a *cross-origin* page, so a loopback listener also 
 no preflight, and can read every response — but the browser still sends the attacker's domain
 in `Host`. A listener bound to a routable interface is a deliberate choice to serve other
 machines, which have their own names for this one, so the check does not apply there.
+
+Both guards step aside for a *same-origin* page, which is why the library's own bytes are
+never served under a type the browser will run as a document. A pack ships whatever its
+author put in it, and an `.svg` served as `image/svg+xml` and then opened as a document is
+script in quarry's origin: the `Host` is genuinely quarry's, and a same-origin `fetch` may
+set `application/json` with no preflight. So `contentType` maps every non-bitmap to
+`application/octet-stream`, and `/api/content` and `/api/thumb` send
+`X-Content-Type-Options: nosniff` to keep the declared type binding.
 
 A save rewrites the whole file, so it first checks the file is still the one it loaded and
 returns `ErrStale` if not. The file it guards is the one it read: a save elsewhere is an

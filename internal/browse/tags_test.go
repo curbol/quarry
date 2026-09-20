@@ -15,10 +15,17 @@ import (
 
 type paletteResp struct {
 	Enabled bool
-	Tags    []struct {
-		ID, Color string
-		Count     int
-	}
+	Tags    []paletteTag
+}
+
+// The three numbers the client renders beside a tag, decoded together because they are
+// read together: Count is cards, Assets is rows-when-ungrouped, and OffIndex is content
+// this library does not hold.
+type paletteTag struct {
+	ID, Color string
+	Count     int
+	Assets    int
+	OffIndex  int
 }
 
 type assignResp struct {

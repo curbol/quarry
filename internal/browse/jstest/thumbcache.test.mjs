@@ -49,6 +49,21 @@ test('every displaced URL is handed back to be revoked', () => {
   assert.equal(c.cache.size, 3);
 });
 
+// Insertion order is eviction order, and Map.set on a key already present leaves that
+// order alone — so a re-rendered thumbnail would keep the slot of the render it
+// replaced and age out on a position the scroll has since come back past, losing the
+// visible card its image to a render the cache had just made. route() currently answers
+// `cached` before it can dispatch for an id the cache holds, so nothing in the browser
+// reaches this today; it is one "re-render this card" feature away from doing so.
+test('re-remembering an id moves it to newest rather than keeping its old slot', () => {
+  const c = new ThumbCache({ cacheMax: 2 });
+  c.remember('x', 'blob:x1');
+  c.remember('y', 'blob:y');
+  assert.deepEqual(c.remember('x', 'blob:x2'), ['blob:x1'], 'the displaced URL still comes back');
+  assert.deepEqual(c.remember('z', 'blob:z'), ['blob:y'], 'y is the oldest now, not the re-rendered x');
+  assert.deepEqual(c.route('x', holder('h')), { kind: 'cached', url: 'blob:x2' });
+});
+
 test('the cache holds no more than its bound over a long scroll', () => {
   const c = new ThumbCache();
   let released = 0;

@@ -97,6 +97,12 @@ install() {
   # copy-then-unlink, which writes the destination in place — so an interrupt leaves
   # a truncated binary on PATH, there is a window where it exists but is not yet
   # executable, and re-running while quarry is up fails with ETXTBSY.
+  # A run killed outright — SIGKILL, a closed terminal mid-download — never reaches the
+  # EXIT trap, and the staging dir is inside INSTALL_DIR because the final step has to
+  # be a same-filesystem rename. So one is left behind, with the release zip in it, in
+  # the directory the binary lives in, and re-running makes another. `quarry update`
+  # already sweeps its own staging dirs here by age; nothing swept these.
+  find "$INSTALL_DIR" -maxdepth 1 -name '.quarry-install-*' -type d -mmin +1440 -exec rm -rf {} + 2>/dev/null || true
   INSTALL_TMP=$(mktemp -d "${INSTALL_DIR}/.quarry-install-XXXXXX")
   local tmp="$INSTALL_TMP"
 

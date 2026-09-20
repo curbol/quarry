@@ -53,7 +53,11 @@ func Discover(startDir string) (string, bool) {
 	}
 	for {
 		p := filepath.Join(dir, FileName)
-		if _, err := os.Stat(p); err == nil {
+		// A regular file, not merely something of that name. A directory called
+		// quarry.tags.toml at or above the working directory answered here, and Load
+		// then failed on it with "is a directory" — so quarry refused to start rather
+		// than walking past it to a real store or to the user-wide one.
+		if fi, err := os.Stat(p); err == nil && fi.Mode().IsRegular() {
 			return p, true
 		}
 		parent := filepath.Dir(dir)
@@ -419,10 +423,18 @@ func Load(path string) (*Store, error) {
 	// and the next save would rewrite the file without the color the user typed on the
 	// other. Duplicate assignments and overlapping groups both merge losslessly, so
 	// this is the one duplicate that destroys something.
+	//
+	// A row with no id at all is refused on the same ground rather than skipped. It is
+	// not a tag, but the next save does not keep it either, so accepting it means a
+	// hand-typed row disappearing on the user's first tag click with nothing said —
+	// which is the whole of what the two refusals above exist to prevent. Three shapes
+	// loud and two silent left no rule a reader could apply to a new case.
 	var badColors, dupes []string
+	var nameless int
 	seenTag := map[string]bool{}
 	for _, t := range f.Tags {
 		if t.ID == "" {
+			nameless++
 			continue
 		}
 		if seenTag[t.ID] {
@@ -447,13 +459,30 @@ func Load(path string) (*Store, error) {
 		return nil, fmt.Errorf("%s holds colors quarry cannot read (%s); use #rrggbb, or remove the color to get a generated one",
 			path, strings.Join(badColors, ", "))
 	}
+	if nameless > 0 {
+		return nil, fmt.Errorf("%s holds %d [[tag]] row(s) with no id; give each one an id, or remove it, rather than let the next edit drop it",
+			path, nameless)
+	}
+	// The same rule over the assignment table: an empty fingerprint names no content and
+	// an empty tag id is not a tag, and neither survives a save. Counted together because
+	// they are one mistake from the user's side — a row half-written by hand.
+	var emptyAssign int
 	for _, a := range f.Assignments {
 		if a.Fingerprint == "" {
+			emptyAssign++
 			continue
 		}
 		for _, id := range a.Tags {
+			if id == "" {
+				emptyAssign++
+				continue
+			}
 			s.Assign(a.Fingerprint, id)
 		}
+	}
+	if emptyAssign > 0 {
+		return nil, fmt.Errorf("%s holds %d assignment entr(ies) with an empty fingerprint or tag; fill them in, or remove them, rather than let the next edit drop them",
+			path, emptyAssign)
 	}
 	for _, g := range f.Groups {
 		s.Link(g.Fingerprints)

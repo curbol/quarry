@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"net"
 	"os"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/curbol/quarry/internal/assetindex"
 	"github.com/curbol/quarry/internal/tagstore"
 )
 
@@ -80,16 +82,35 @@ func TestLeadingFlagIsNotASubcommand(t *testing.T) {
 		"--root", filepath.Join(t.TempDir(), "nope"),
 		"--config", t.TempDir(),
 		"--cache", t.TempDir(),
+		// Bounded too, for the same reason as the three above: without it
+		// resolveTagsPath walks up from the working directory looking for a project
+		// store, and serve() then creates the directory it settles on. Harmless only
+		// because LoadOrBuild fails on the nonexistent root first, which is one
+		// reordering away from not being true.
+		"--tags", filepath.Join(t.TempDir(), "quarry.tags.toml"),
 	})
 	if err != nil && strings.Contains(err.Error(), "unknown subcommand") {
 		t.Errorf("leading flag parsed as a subcommand: %v", err)
 	}
 }
 
+// clearQuarryEnv isolates run() from the machine it is running on. A test that passes
+// --config but not --cache still resolves the cache dir from the environment, so a
+// maintainer with a relative QUARRY_CACHE_DIR exported gets "must be an absolute path"
+// where the test asserts something else entirely — a failure about their shell, in a
+// test about flags. config_test.go has had this for the same reason.
+func clearQuarryEnv(t *testing.T) {
+	t.Helper()
+	for _, k := range []string{"QUARRY_ROOT", "QUARRY_CONFIG_DIR", "QUARRY_CACHE_DIR", "XDG_CONFIG_HOME", "XDG_CACHE_HOME"} {
+		t.Setenv(k, "")
+	}
+	t.Setenv("HOME", t.TempDir())
+}
+
 // Indexing whatever directory the user happened to be standing in would be a slow,
 // surprising accident, so an unset root has to fail loudly instead.
 func TestRunWithoutRootFails(t *testing.T) {
-	t.Setenv("QUARRY_ROOT", "")
+	clearQuarryEnv(t)
 	t.Chdir(t.TempDir())
 	err := run([]string{"--config", t.TempDir()})
 	if err == nil || !strings.Contains(err.Error(), "no scan root") {
@@ -98,6 +119,7 @@ func TestRunWithoutRootFails(t *testing.T) {
 }
 
 func TestStrayPositionalIsRejected(t *testing.T) {
+	clearQuarryEnv(t)
 	err := run([]string{"--config", t.TempDir(), "/some/dir"})
 	if err == nil || !strings.Contains(err.Error(), "positional") {
 		t.Errorf("got %v, want a positional-argument error", err)
@@ -329,6 +351,57 @@ func TestServeIndexesAndPreparesTheTagStore(t *testing.T) {
 	}
 }
 
+// A relative --root is the one deliberate exception to the absolute-root rule, and two
+// separate pieces of code have to keep it working: config.Load must not apply the rule
+// to the flag, and assetindex must resolve it against the working directory before
+// anything is keyed on it. Neither was covered — every --root in this file was a
+// t.TempDir() and every Options.Root in assetindex was pre-absolute — so an IsAbs check
+// added here for symmetry, or the filepath.Abs dropped there, passed the whole suite.
+//
+// The second half is what makes it worth a run through the CLI rather than a unit test:
+// stateDir hashes the root, so a relative one gives every working directory its own
+// cache entry, and PruneUnpacked run from elsewhere sweeps extractions another instance
+// is serving.
+func TestARelativeRootFlagResolvesAgainstTheWorkingDirectory(t *testing.T) {
+	parent := t.TempDir()
+	// Resolved, because macOS hands out /var/... temp dirs behind a /private symlink
+	// and stateDir hashes the path assetindex resolved, not the one typed here.
+	realParent, err := filepath.EvalSymlinks(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(parent, "lib", "synty", "Pack"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(parent, "lib", "synty", "Pack", "Sword.glb"), []byte("GLBBYTES"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(parent)
+	clearQuarryEnv(t)
+	cacheDir := t.TempDir()
+
+	var got string
+	served = func(s settings) error { got = s.Root; return nil }
+	t.Cleanup(func() { served = serve })
+
+	if err := run([]string{"--config", t.TempDir(), "--cache", cacheDir, "--root", "lib"}); err != nil {
+		t.Fatalf("a relative --root was refused: %v", err)
+	}
+	if got != "lib" {
+		t.Errorf("settings.Root = %q, want the flag verbatim; resolving it is assetindex's job", got)
+	}
+
+	// And the run it drives keys its state on the absolute path. served is stubbed
+	// above, so this asks assetindex directly, the way serve would.
+	ix, err := assetindex.Build(assetindex.Options{Root: "lib", CacheDir: cacheDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(realParent, "lib"); ix.Root != want {
+		t.Errorf("index root = %q, want the working directory resolution %q", ix.Root, want)
+	}
+}
+
 // The cache holds the index and every unpacked archive. Under the scan root it would be
 // written into a tree quarry promises to leave alone, and indexed as library content on
 // the next run.
@@ -343,5 +416,24 @@ func TestServeRefusesACacheDirInsideTheScanRoot(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "inside the scan root") {
 		t.Errorf("got %v, want a refusal naming the scan root", err)
+	}
+}
+
+// usage() is hand-written prose describing a flag set it has no connection to, and the
+// two had already drifted: -version was registered for a release and never mentioned.
+// An undocumented flag is one nobody finds; the help text is the only place they are
+// listed, since the flag package's own dump is silenced.
+func TestHelpDocumentsEveryFlag(t *testing.T) {
+	var help strings.Builder
+	usageTo(&help)
+	var names []string
+	newFlagSet().set.VisitAll(func(f *flag.Flag) { names = append(names, f.Name) })
+	if len(names) == 0 {
+		t.Fatal("no flags found on the flag set; this guard has stopped checking anything")
+	}
+	for _, n := range names {
+		if !strings.Contains(help.String(), "-"+n+" ") && !strings.Contains(help.String(), "-"+n+"\n") {
+			t.Errorf("help text does not document -%s", n)
+		}
 	}
 }

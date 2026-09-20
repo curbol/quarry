@@ -341,8 +341,28 @@ func noCache(h http.Handler) http.Handler {
 // one function because the results and the facet counts have to agree on the answer.
 func ungrouped(query url.Values) bool { return query.Get("group") == "0" }
 
+// requestQuery reads a request's query string, refusing one it cannot parse rather
+// than answering with whatever survived.
+//
+// url.URL.Query() throws the parse error away and drops only the pair it could not
+// read, so a bad percent-escape or a bare semicolon in `q` leaves every other filter
+// standing and the text search empty — which is the all-match. That is the same
+// failure direction parseQuery's truncation is written to avoid, one layer up: a
+// query the server could not read has to narrow, not answer.
+func requestQuery(w http.ResponseWriter, r *http.Request) (url.Values, bool) {
+	v, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "the query string could not be read")
+		return nil, false
+	}
+	return v, true
+}
+
 func (s *server) handleAssets(w http.ResponseWriter, r *http.Request) {
-	query := r.URL.Query()
+	query, ok := requestQuery(w, r)
+	if !ok {
+		return
+	}
 	offset := atoiDefault(query.Get("offset"), 0)
 	limit := atoiDefault(query.Get("limit"), defaultLimit)
 	if limit <= 0 || limit > maxLimit {
@@ -526,7 +546,11 @@ func (s *server) decorate(cards []assetDTO) {
 }
 
 func (s *server) handleContent(w http.ResponseWriter, r *http.Request) {
-	a, ok := s.ix.Lookup(r.URL.Query().Get("id"))
+	query, ok := requestQuery(w, r)
+	if !ok {
+		return
+	}
+	a, ok := s.ix.Lookup(query.Get("id"))
 	if !ok {
 		http.NotFound(w, r)
 		return
@@ -547,13 +571,21 @@ func (s *server) handleContent(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rc.Close()
 	w.Header().Set("Content-Type", contentType(a.Ext))
+	// These are a stranger's files: a pack ships whatever its author put in it. nosniff
+	// is what keeps the declared type binding, so nothing here can be re-read as a
+	// document and run in this server's origin.
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
 	n, err := io.Copy(w, rc)
 	logShortBody(r, a, n, err)
 }
 
 func (s *server) handleThumb(w http.ResponseWriter, r *http.Request) {
-	a, ok := s.ix.Lookup(r.URL.Query().Get("id"))
+	query, ok := requestQuery(w, r)
+	if !ok {
+		return
+	}
+	a, ok := s.ix.Lookup(query.Get("id"))
 	if !ok {
 		http.NotFound(w, r)
 		return
@@ -573,6 +605,8 @@ func (s *server) handleThumb(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rc.Close()
 	w.Header().Set("Content-Type", "image/png")
+	// A pack's own preview.png, declared png and read as png: see handleContent.
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
 	n, err := io.Copy(w, rc)
 	logShortBody(r, a, n, err)
@@ -593,6 +627,17 @@ func logShortBody(r *http.Request, a assetindex.Asset, n int64, err error) {
 // contentType maps an extension to a response type. Model formats are served as
 // application/octet-stream so nothing mangles the binary the three.js loaders read
 // as an ArrayBuffer; browser-native images get their real image type.
+//
+// Every type here is inert, and .svg is the one the list must not grow back. An SVG is
+// a document with script in it, so served as image/svg+xml and then opened as a
+// document it runs in this server's origin — where both write guards step aside by
+// design: the Host header is genuinely this server's, and a same-origin fetch may set
+// application/json with no preflight. It would read every file under the scan root and
+// rewrite the tag store. The grid has never rendered one (the lightbox's bitmap test
+// does not list svg, and its thumb kind is none), so octet-stream costs nothing.
+// Putting it back means putting `Content-Security-Policy: sandbox` on this response
+// with it — ignored for a subresource fetch, and applied exactly when the response is
+// loaded as the document that is the hazard.
 func contentType(ext string) string {
 	switch ext {
 	case "png":
@@ -603,8 +648,6 @@ func contentType(ext string) string {
 		return "image/gif"
 	case "webp":
 		return "image/webp"
-	case "svg":
-		return "image/svg+xml"
 	case "bmp":
 		return "image/bmp"
 	}

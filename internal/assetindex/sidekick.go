@@ -144,8 +144,10 @@ func applySidekick(archivePath string, assets []Asset) ([]Asset, *SkippedFile) {
 		}
 		p := a.Source.Pathname
 		chars = append(chars, sidekickChar{
-			tree: path.Dir(p) + "/",
-			base: strings.TrimSuffix(path.Base(p), path.Ext(p)),
+			tree:   path.Dir(p) + "/",
+			base:   strings.TrimSuffix(path.Base(p), path.Ext(p)),
+			vendor: a.Vendor,
+			pack:   a.Pack,
 		})
 		// The claim is appended before the upgrade is attempted, and stands whether or
 		// not it succeeds: an unassembled character still has to hold its own name, or
@@ -180,6 +182,10 @@ func applySidekick(archivePath string, assets []Asset) ([]Asset, *SkippedFile) {
 		// refuses a truncated read to avoid.
 		if len(partIDs) == len(partNames) {
 			chars[claim].assembled = true
+			// Recorded on the asset as well, because the same question is asked again
+			// by dedup over the whole library — where a copy of this pack extracted
+			// beside itself is reachable and the .sk's bytes are not.
+			a.Source.Complete = true
 		}
 	}
 	kept := assets[:0]
@@ -199,6 +205,11 @@ func applySidekick(archivePath string, assets []Asset) ([]Asset, *SkippedFile) {
 type sidekickChar struct {
 	tree, base string
 	assembled  bool
+	// The pack the character belongs to. Within one archive every character shares it
+	// and it decides nothing; across the library it is what stops one pack's "Hero.sk"
+	// claiming another pack's "Assets/S/Characters/Hero.prefab", since the trees inside
+	// two Synty packages are routinely identical.
+	vendor, pack string
 }
 
 // sidekickByproduct reports a per-character byproduct that its assembled .sk
@@ -227,10 +238,17 @@ func sidekickByproduct(a Asset, chars []sidekickChar) bool {
 	// from "Hero" matching "Hero_CombinedMesh.asset" on separators alone. What tells
 	// them apart is that "Hero_Alt" is itself a character in the package: it is the
 	// longer claim on that file, so the file is its byproduct, not Hero's.
+	within := withinPackPath(a)
+	if within == "" {
+		return false
+	}
 	stem := strings.TrimSuffix(a.Name, path.Ext(a.Name))
 	best := -1
 	for i, c := range chars {
-		if !strings.HasPrefix(a.Source.Pathname, c.tree) || !namedFor(stem, c.base) {
+		if a.Vendor != c.vendor || a.Pack != c.pack {
+			continue
+		}
+		if !strings.HasPrefix(within, c.tree) || !namedFor(stem, c.base) {
 			continue
 		}
 		if best < 0 || c.claimsOver(chars[best]) {
@@ -238,6 +256,61 @@ func sidekickByproduct(a Asset, chars []sidekickChar) bool {
 		}
 	}
 	return best >= 0 && chars[best].assembled
+}
+
+// withinPackPath is where an asset sits inside its pack, written the way a character's
+// suppression scope is: a unitypackage member's own pathname, and for a loose file the
+// same path with the vendor/pack prefix taken off. A Sidekick package unpacked beside
+// itself — an ordinary layout — produces both spellings of one file, and the scope has
+// to reach both or the suppression accomplishes nothing there: the archive loses its
+// byproducts to assembly, the loose copies are not archive entries so ordinary dedup
+// never looks at them, and the grid shows the assembled character plus the prefab,
+// material and combined mesh it exists instead of, for every character in the pack.
+//
+// A zip is not one of the two. A Sidekick pack ships as a .unitypackage, and a zip of
+// the same tree has its own internal shape rather than the pack-relative one.
+//
+// Both spellings are normalised the way the scope they are compared against already is:
+// sidekickChar.tree is path.Dir of a pathname, which cleans, and a pack extracted under
+// src/ reaches dedup through normSubpath. Left raw, the two sides disagreed under
+// exactly the two spellings the rest of this package normalises for — a src/ extraction
+// kept every loose byproduct, and a "./"-prefixed pathname kept every archive one.
+func withinPackPath(a Asset) string {
+	switch a.Source.Kind {
+	case SourceUnityPackage:
+		return path.Clean(a.Source.Pathname)
+	case SourceLoose:
+		return normSubpath(packSubpath(a.RelPath, a.Vendor, a.Pack))
+	}
+	return ""
+}
+
+// sidekickChars rebuilds every character's suppression scope from the assets an
+// enumeration left behind, so a pass over the whole library can apply the same rule
+// applySidekick applied inside one archive. The .sk entries survive assembly — the
+// upgrade renames and re-categorises them, it does not replace them — and Source
+// carries what the scope is made of: the pathname the .sk sits at, and whether every
+// part it named resolved.
+//
+// The base is the .sk's own file name, never Asset.Name, which assembly overwrites
+// with the character name the file declares. Byproducts are named after the file.
+func sidekickChars(assets []Asset) []sidekickChar {
+	var chars []sidekickChar
+	for i := range assets {
+		a := &assets[i]
+		if a.Source.Kind != SourceUnityPackage || a.Ext != "sk" {
+			continue
+		}
+		p := a.Source.Pathname
+		chars = append(chars, sidekickChar{
+			tree:      path.Dir(p) + "/",
+			base:      strings.TrimSuffix(path.Base(p), path.Ext(p)),
+			assembled: a.Source.Complete,
+			vendor:    a.Vendor,
+			pack:      a.Pack,
+		})
+	}
+	return chars
 }
 
 // claimsOver reports whether c is the closer claim on a byproduct both characters

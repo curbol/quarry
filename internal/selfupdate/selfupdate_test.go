@@ -5,17 +5,25 @@ import (
 	"testing"
 )
 
-// releaseAssets are the labels the release workflow builds (see
-// .github/workflows/release.yml). Every one has to be reachable: CI runs on a single
-// platform, so a mapping that drifts from these labels is only caught here.
+// releaseAssets is a release publishing exactly the assets quarry knows how to ask
+// for, named the way the workflow names them. Built from releaseSuffix rather than
+// typed out: that the map agrees with what the workflow actually publishes is
+// TestReleaseSuffixMatchesTheWorkflowLabels's job, and a hand-written fourth copy of
+// the label list here would need editing every time one is renamed. The URL is the
+// label, so the assertions below can name which asset they expect without a table of
+// their own.
 func releaseAssets() *release {
-	return &release{Assets: []releaseAsset{
-		{Name: "quarry-1.0.0-mac-intel.zip", URL: "u/mac-intel"},
-		{Name: "quarry-1.0.0-mac-apple.zip", URL: "u/mac-apple"},
-		{Name: "quarry-1.0.0-linux-intel.zip", URL: "u/linux-intel"},
-		{Name: "quarry-1.0.0-linux-arm64.zip", URL: "u/linux-arm64"},
-		{Name: "quarry-1.0.0-win.zip", URL: "u/win"},
-	}}
+	seen := map[string]bool{}
+	r := &release{}
+	for _, suffix := range releaseSuffix {
+		if seen[suffix] {
+			continue // windows/arm64 deliberately aliases the win build
+		}
+		seen[suffix] = true
+		label := strings.TrimSuffix(suffix, ".zip")
+		r.Assets = append(r.Assets, releaseAsset{Name: "quarry-1.0.0-" + suffix, URL: "u/" + label})
+	}
+	return r
 }
 
 func TestPlatformAssetPerPlatform(t *testing.T) {

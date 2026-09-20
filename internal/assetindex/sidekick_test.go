@@ -434,3 +434,33 @@ func TestAnOversizeSidekickDefinitionIsRefusedNotTruncated(t *testing.T) {
 		t.Error("nothing assembled, so the prefab is the only row showing this character and must survive")
 	}
 }
+
+// A .sk written on Windows ends every line with CRLF, and a blank line between part
+// entries is then a lone "\r". TrimRight and the empty-line skip are what keep that
+// from reading as a top-level key — and a top-level key closes the Parts block, so the
+// parts after the blank line are never collected.
+//
+// The damage is not a missing part but a character that claims to be whole: with a
+// shorter parts list every name still resolves, len(partIDs) == len(partNames) holds,
+// the character is marked assembled, and its prefab, material and combined-mesh rows
+// are dropped as byproducts. The grid then shows a headless character with no fallback
+// row anywhere — the same outcome the oversize-definition refusal exists to prevent,
+// arriving by a different route.
+func TestSidekickDefinitionSurvivesCRLFAndBlankLines(t *testing.T) {
+	for _, tc := range []struct{ name, sk string }{
+		{"CRLF with a blank line inside Parts", "Name: Hero\r\nParts:\r\n- Name: SK_HEAD\r\n\r\n- Name: SK_TORS\r\n"},
+		{"LF with a blank line inside Parts", "Name: Hero\nParts:\n- Name: SK_HEAD\n\n- Name: SK_TORS\n"},
+		{"CRLF throughout", "Name: Hero\r\nParts:\r\n- Name: SK_HEAD\r\n- Name: SK_TORS\r\n"},
+		{"a blank line of spaces", "Name: Hero\nParts:\n- Name: SK_HEAD\n   \n- Name: SK_TORS\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			name, parts := parseSidekick([]byte(tc.sk))
+			if name != "Hero" {
+				t.Errorf("name = %q, want Hero", name)
+			}
+			if len(parts) != 2 || parts[0] != "SK_HEAD" || parts[1] != "SK_TORS" {
+				t.Errorf("parts = %v, want both: a character short a part is still marked assembled, so its fallback rows are dropped too", parts)
+			}
+		})
+	}
+}

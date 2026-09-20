@@ -27,7 +27,8 @@ const maxQueryDepth = 32
 // parseQuery compiles a raw query string, or returns nil when it holds no terms
 // (an all-match). A nil *searchQuery matches every asset.
 func parseQuery(s string) *searchQuery {
-	if len(s) > maxQueryBytes {
+	truncated := len(s) > maxQueryBytes
+	if truncated {
 		s = s[:maxQueryBytes]
 		// Back to a rune boundary. The cut is by byte, and []rune turns a trailing
 		// partial one into U+FFFD, which no asset name contains — so the last term
@@ -38,17 +39,24 @@ func parseQuery(s string) *searchQuery {
 		// validity instead read one bad byte anywhere — and a query string need not be
 		// valid UTF-8, since url.ParseQuery does not check — as a reason to keep
 		// trimming, which walked the input away to nothing and returned the library.
-		for len(s) > 0 {
-			if r, n := utf8.DecodeLastRuneInString(s); r == utf8.RuneError && n <= 1 {
-				s = s[:len(s)-1]
-				continue
+		//
+		// The bound is what holds that to a partial rune: a rune is at most utf8.UTFMax
+		// bytes, so a truncated one leaves fewer than that behind. Unbounded, the loop
+		// stops at the first byte from the right that can begin a rune — and a string of
+		// bytes that never can (0xFF, or a bare continuation byte) has none, so it walked
+		// the whole input away again and returned the library. Only over the cap, which
+		// is what made the same input narrow at maxQueryBytes and answer at one more.
+		for i := 0; i < utf8.UTFMax-1 && len(s) > 0; i++ {
+			r, n := utf8.DecodeLastRuneInString(s)
+			if r != utf8.RuneError || n > 1 {
+				break
 			}
-			break
+			s = s[:len(s)-1]
 		}
 	}
 	toks := dropUnmatchedClose(tokenize(s))
 	if len(toks) == 0 {
-		return nil
+		return declined(truncated)
 	}
 	p := &parser{toks: toks}
 	// Parsing runs to the end of the input rather than stopping at the first thing it
@@ -67,11 +75,26 @@ func parseQuery(s string) *searchQuery {
 	}
 	switch len(kids) {
 	case 0:
-		return nil
+		return declined(truncated)
 	case 1:
 		return &searchQuery{root: kids[0]}
 	}
 	return &searchQuery{root: andNode{kids: kids}}
+}
+
+// declined is the empty result of a parse, read against whether anything was thrown
+// away to get there. A query the user did not put terms in is the all-match; a query
+// whose terms were cut off before the parser saw them is not the same thing, and
+// answering it with the library is the one direction truncation is written to avoid.
+// Every byte past the cap being a separator is all it takes: 4096 spaces, or a run of
+// ")" that dropUnmatchedClose erases, before the first word.
+//
+// The over-deep group took this shape first (see neverNode); this is the sibling path.
+func declined(truncated bool) *searchQuery {
+	if truncated {
+		return &searchQuery{root: neverNode{}}
+	}
+	return nil
 }
 
 func (q *searchQuery) match(a *assetindex.Asset) bool {

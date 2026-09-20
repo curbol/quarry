@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"testing"
 
 	"github.com/curbol/quarry/internal/tagstore"
@@ -47,6 +48,30 @@ func TestLinkRelatedAndExpansion(t *testing.T) {
 	}
 	if exp.Total != 2 || !names["Heart.fbx"] || !names["Sword.glb"] {
 		t.Fatalf("includeRelated items = %v (total %d), want Heart + Sword", names, exp.Total)
+	}
+	// Expansion reaches the companion; it does not tag it. Links are result expansion
+	// and nothing else, so a linked card carries whatever tags it was given and no
+	// more. Folding a group into the tag union would satisfy every assertion above —
+	// Sword is in the response either way — while silently spreading a tag across
+	// everything linked to it, in a store the user commits.
+	for _, it := range exp.Items {
+		if it.Name != "Sword.glb" {
+			continue
+		}
+		if slices.Contains(it.Tags, "love") {
+			t.Errorf("the linked companion came back carrying %q: a link changed what tags a fingerprint has", "love")
+		}
+	}
+	// And the store agrees: nothing was written for Sword's fingerprints.
+	onDisk, err := tagstore.Load(tagsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loved := onDisk.FingerprintsByTag()["love"]
+	for _, fp := range sword.Fingerprints {
+		if slices.Contains(loved, fp) {
+			t.Errorf("fingerprint %s of the linked companion was assigned the tag in the store", fp)
+		}
 	}
 
 	// /api/related resolves a card's companions to whole cards.

@@ -6,9 +6,11 @@
 package safewrite
 
 import (
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -22,9 +24,9 @@ const StaleTempAge = 24 * time.Hour
 // directory, renamed into place. A reader therefore never sees a half-written file,
 // and a failure at any point leaves the previous contents untouched. The temp file
 // is removed on every failure path. tmpPattern is an os.CreateTemp pattern, and it has
-// to contain a "*": sweepStaleTemps reuses it as a filepath.Glob pattern, and without
-// one the glob matches the literal name while CreateTemp appends a random suffix, so
-// nothing an interrupted write abandons is ever swept and the failure is invisible.
+// to contain a "*": sweepStaleTemps splits on it to recognise what an interrupted write
+// left behind, and without one there is nothing to split, so nothing is ever swept and
+// the failure is invisible.
 //
 // The bytes are fsynced before the rename, because rename atomicity alone only
 // survives a crashing process, not a crashing machine: the rename can reach the
@@ -32,6 +34,12 @@ const StaleTempAge = 24 * time.Hour
 // TOML store truncated that way still parses, so the loss reads as "your tags are
 // gone" with nothing reporting an error.
 func Atomic(path, tmpPattern string, encode func(io.Writer) error) error {
+	// Refused rather than documented. A pattern with no "*" writes correctly and sweeps
+	// nothing, for the life of the program, with no error anywhere — and where it
+	// matters the leftovers pile up in a user's source-controlled project directory.
+	if !strings.Contains(tmpPattern, "*") {
+		return fmt.Errorf("safewrite: tmpPattern %q has no %q, so an abandoned temp file could never be swept", tmpPattern, "*")
+	}
 	path = resolveLinks(path)
 	// Swept here rather than by the caller, which knows the path it asked for but not
 	// the one a symlink resolved it to — and the temp is created in the resolved
@@ -174,14 +182,32 @@ func Stream(dst string, src io.Reader, perm os.FileMode) error {
 // like the tag store sit in a user's project directory, often under source control,
 // where a leftover is one more thing to notice and explain; failures are ignored
 // because this is tidying, not part of the write.
+//
+// The directory is read rather than globbed, and only the pattern decides what matches.
+// Joined into a glob, dir was itself read as one: a tag store under "~/code/[archive]"
+// or "~/assets/Season [2]" turned the whole pattern into a character class that matches
+// no real path, and an unterminated "[" returned ErrBadPattern, which this swallows. The
+// sweep then did nothing for the life of the program with no error anywhere — the same
+// outcome as a pattern with no "*", which Atomic refuses outright, reached by the other
+// half of the same mechanism.
 func sweepStaleTemps(dir, tmpPattern string) {
-	matches, err := filepath.Glob(filepath.Join(dir, tmpPattern))
+	prefix, suffix, ok := strings.Cut(tmpPattern, "*")
+	if !ok {
+		return // Atomic refuses this; nothing else calls here.
+	}
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return
 	}
-	for _, m := range matches {
-		if fi, err := os.Stat(m); err == nil && !fi.IsDir() && time.Since(fi.ModTime()) > StaleTempAge {
-			os.Remove(m)
+	for _, e := range entries {
+		// os.CreateTemp replaces the last "*", so a pattern holding several matches a
+		// name whose middle is free — the same reading Glob gave, minus the metacharacters.
+		n := e.Name()
+		if e.IsDir() || len(n) < len(prefix)+len(suffix) || !strings.HasPrefix(n, prefix) || !strings.HasSuffix(n, suffix) {
+			continue
+		}
+		if fi, err := e.Info(); err == nil && time.Since(fi.ModTime()) > StaleTempAge {
+			os.Remove(filepath.Join(dir, n))
 		}
 	}
 }

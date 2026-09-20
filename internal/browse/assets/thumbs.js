@@ -9,27 +9,20 @@
 
 import { contentURL, CharRegistry } from '/static/charstore.js';
 import { ThumbCache } from '/static/thumbcache.js';
+import { FontCache } from '/static/fontcache.js';
 
 // ---- fonts ----
 
-// loadedFonts caps how many font files stay registered on the document. Every card
-// that scrolls past downloads a whole typeface and document.fonts holds it forever, so
-// scrolling a font pack would keep every file it ever showed resident. Insertion order
-// is eviction order, matching the thumbnail cache.
+// The bound itself is FontCache, where the eviction rule is checked without a document.
+// Here is only what that rule cannot know: an entry's holder is a card, a card is live
+// while it is still in the DOM, and an evicted FontFace is released to document.fonts.
 //
 // Each entry carries the in-flight promise, not just a marker, so two cards for the
-// same font share one download instead of each registering its own FontFace — and the
-// element that asked for it, because a card still on screen must not be evicted.
-// lazyWork fires once per element, so ensureFont never runs again for a card already
-// drawn: dropping its FontFace leaves it showing the sample in the fallback serif with
-// nothing left to put it back, and no way to notice.
-const loadedFonts = new Map(); // asset.id -> { load: Promise<{ fam, face }>, el }
-
-// FONT_CACHE_MAX is the backstop, not the working bound. The bound that matters is how
-// many cards the grid keeps connected, which is what the skip in evictFonts follows —
-// a fixed number smaller than one viewport's worth of font cards is how the visible
-// ones got evicted in the first place.
-const FONT_CACHE_MAX = 200;
+// same font share one download instead of each registering its own FontFace. lazyWork
+// fires once per element, so ensureFont never runs again for a card already drawn:
+// dropping its FontFace leaves it showing the sample in the fallback serif with nothing
+// left to put it back, and no way to notice.
+const loadedFonts = new FontCache({ live: (el) => !!el && el.isConnected });
 
 // ensureFont registers a font's bytes as a FontFace under a per-asset family and
 // resolves that family name, so sample text can be rendered in the real typeface. el is
@@ -37,32 +30,15 @@ const FONT_CACHE_MAX = 200;
 // one at eviction time.
 export function ensureFont(a, el) {
   const fam = 'f' + a.id;
-  const cached = loadedFonts.get(a.id);
-  if (cached) {
-    loadedFonts.delete(a.id);
-    // Only when one is given: the lightbox's specimen asks for the same font without a
-    // card behind it, and letting that clear the slot would make a grid card that is
-    // still on screen evictable.
-    if (el) cached.el = el;
-    loadedFonts.set(a.id, cached); // refresh its place in eviction order
-    return cached.load.then((e) => e.fam);
-  }
+  const cached = loadedFonts.hit(a.id, el);
+  if (cached) return cached.then((e) => e.fam);
   const load = new FontFace(fam, `url(${contentURL(a.id)})`).load()
     .then((face) => { document.fonts.add(face); return { fam, face }; })
-    .catch((err) => { loadedFonts.delete(a.id); throw err; });
-  loadedFonts.set(a.id, { load, el });
-  evictFonts();
-  return load.then((e) => e.fam);
-}
-
-// evictFonts drops the oldest entries whose cards are gone, and only those.
-function evictFonts() {
-  for (const [id, e] of loadedFonts) {
-    if (loadedFonts.size <= FONT_CACHE_MAX) return;
-    if (e.el && e.el.isConnected) continue;
-    loadedFonts.delete(id);
-    e.load.then((v) => document.fonts.delete(v.face)).catch(() => {});
+    .catch((err) => { loadedFonts.forget(a.id); throw err; });
+  for (const evicted of loadedFonts.remember(a.id, load, el)) {
+    evicted.then((v) => document.fonts.delete(v.face)).catch(() => {});
   }
+  return load.then((e) => e.fam);
 }
 
 // ---- lazy 3D thumbnails: one shared renderer, sequential queue, cached ----

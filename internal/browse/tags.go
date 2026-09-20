@@ -16,8 +16,12 @@ type tagView struct {
 	// Count is cards and Assets is rows-when-ungrouped, for the same reason
 	// buildFacets returns two sets: "one result" is not one thing, and the client
 	// picks whichever matches the grouping it is asking under.
-	Count    int `json:"count"`
-	Assets   int `json:"assets"`
+	Count  int `json:"count"`
+	Assets int `json:"assets"`
+	// OffIndex is content this library does not hold, which is what the client tells
+	// the user. An assignment the grid cannot return is not the same thing: a suppressed
+	// root-motion sibling is held and reachable through the card that absorbed it, so it
+	// belongs in none of these three.
 	OffIndex int `json:"offIndex,omitempty"`
 }
 
@@ -55,7 +59,15 @@ func (s *server) paletteLocked() paletteView {
 		for _, fp := range byTag[d.ID] {
 			keys, indexed := s.cardsOfFP[fp]
 			if !indexed {
-				off++
+				// cardsOfFP is built over what the grid can return, so it is missing two
+				// different things: content this library does not hold, and a root-motion
+				// sibling that is held but folded into its in-place card. byFP is built
+				// over every asset, so it separates them. Counted together, a tag on a
+				// file sitting right there in the library was reported to the user as
+				// being on "content outside this library".
+				if _, held := s.byFP[fp]; !held {
+					off++
+				}
 				continue
 			}
 			for _, k := range keys {

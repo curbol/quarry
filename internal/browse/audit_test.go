@@ -17,6 +17,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"net"
 	"net/http"
@@ -26,6 +27,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -195,6 +197,26 @@ func TestFacetCountsExcludeSuppressedRootMotionSiblings(t *testing.T) {
 	// Selecting the facet has to produce exactly what it advertised.
 	if got := getAssets(t, srv, "vendor=quaternius").Total; got != vendorCount {
 		t.Errorf("filtering by the facet returned %d, want the advertised %d", got, vendorCount)
+	}
+	// And again with grouping off. buildFacets fills both sets in one pass, so today
+	// the ungrouped counters are incremented beside the grouped ones — but nothing held
+	// the second half, and an ungrouped count that still included the suppressed sibling
+	// advertises a card no query in either mode can return.
+	u := getAssets(t, srv, "group=0")
+	if u.Total != 1 {
+		t.Errorf("ungrouped grid shows %d rows, want 1: the RM sibling is suppressed in both modes", u.Total)
+	}
+	var ungroupedVendor int
+	for _, f := range u.Facets.Vendors {
+		if f.Value == "quaternius" {
+			ungroupedVendor = f.Count
+		}
+	}
+	if ungroupedVendor != u.Total {
+		t.Errorf("ungrouped vendor facet counts %d but the query returns %d", ungroupedVendor, u.Total)
+	}
+	if got := getAssets(t, srv, "group=0&vendor=quaternius").Total; got != ungroupedVendor {
+		t.Errorf("filtering the ungrouped facet returned %d, want the advertised %d", got, ungroupedVendor)
 	}
 }
 
@@ -1378,7 +1400,7 @@ func frontendImports(t *testing.T, file string) (static, dynamic []string) {
 		return spec
 	}
 	// Multiline: a module's imports are one per line and none of them is the first. An
-	// empty result is legitimate — the five Node-tested modules import nothing at all —
+	// empty result is legitimate — most of the Node-tested modules import nothing at all —
 	// so the callers assert that the files which do import parsed.
 	for _, m := range regexp.MustCompile(`(?m)^import[^;]*?from\s+'([^']+)'`).FindAllStringSubmatch(string(b), -1) {
 		static = append(static, resolve(m[1]))
@@ -1518,4 +1540,558 @@ func TestTheGridDoesNotLoadThreeToRenderItself(t *testing.T) {
 			t.Errorf("%s is in app.js's static import graph; import it dynamically where it is used", banned)
 		}
 	}
+}
+
+// A query string the server cannot read has to narrow, never answer. url.URL.Query()
+// discards its parse error and drops only the pair it failed on, so a bad percent
+// escape or a bare semicolon in `q` left the text search empty — the all-match — while
+// every other filter in the same URL still applied. The user shares a filtered link,
+// the recipient's `q` silently evaporates, and the grid reports the whole library as
+// though that were the answer to what was asked.
+//
+// Read over every handler that takes a query string rather than over handleAssets
+// alone: `id` dropped the same way resolves to the empty asset, and a new handler that
+// reaches for r.URL.Query() directly gets the same hole back.
+func TestAnUnreadableQueryStringIsRefusedNotPartiallyApplied(t *testing.T) {
+	srv := testServer(t)
+	for _, path := range []string{
+		"/api/assets?q=50%off&group=0",
+		"/api/assets?q=a;b",
+		"/api/content?id=%zz",
+		"/api/thumb?id=%zz",
+		"/api/related?fingerprint=%zz",
+	} {
+		resp, err := http.Get(srv.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("GET %s = %d, want 400: what survived the parse was answered with", path, resp.StatusCode)
+		}
+	}
+	// The same shapes, escaped the way the frontend sends them, still reach the handler.
+	resp, err := http.Get(srv.URL + "/api/assets?" + url.Values{"q": {"50%off"}}.Encode())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("a properly escaped query answered %d; the guard is refusing valid requests", resp.StatusCode)
+	}
+}
+
+// Every handler that reads a query string must go through requestQuery. Reaching for
+// r.URL.Query() directly is not a compile error and not a test failure anywhere else:
+// it silently reinstates the partial-parse hole above for that one endpoint.
+// The file list is globbed rather than written out. Restated, the guard covered whatever
+// someone remembered to add to it: pairing.go and searchquery.go were already outside it,
+// and a future handler file would have shipped green, reinstating the hole for exactly the
+// endpoint nobody thought to list. Its old found==0 sentinel could not fire either — the
+// counter was bumped unconditionally and a missing file t.Fatal'd on the read first.
+func TestNoHandlerReadsTheQueryStringDirectly(t *testing.T) {
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found int
+	for _, file := range files {
+		if strings.HasSuffix(file, "_test.go") {
+			continue
+		}
+		b, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		found++
+		for i, line := range strings.Split(string(b), "\n") {
+			if strings.Contains(line, "r.URL.Query()") {
+				t.Errorf("%s:%d reads r.URL.Query() directly; use requestQuery so a malformed query string is refused", file, i+1)
+			}
+		}
+	}
+	// The package has had at least these since this guard was written, so a glob that
+	// stops matching fails loudly rather than reporting a clean sweep of nothing.
+	if found < 7 {
+		t.Fatalf("globbed %d non-test source files in this package; this guard has stopped reading it", found)
+	}
+}
+
+// handleContent tells a miss from a failure by fs.ErrNotExist alone: a corrupt
+// archive, a full cache disk and a stale index pointing outside the library all reach
+// the same place, and answering 404 for every one of them tells a user whose disk
+// filled that their models do not exist. Only the unknown-id half was covered, so an
+// error that stopped wrapping fs.ErrNotExist anywhere in assetindex would silently turn
+// every one of those back into "not found".
+func TestContentSeparatesAMissFromAFailure(t *testing.T) {
+	srv := testServer(t)
+	items := getAssets(t, srv, "").Items
+	if len(items) == 0 {
+		t.Fatal("the fixture library came back empty")
+	}
+	// An id nothing resolves: not an asset at all.
+	resp, err := http.Get(srv.URL + "/api/content?id=nosuchid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("unknown id = %d, want 404", resp.StatusCode)
+	}
+	// An id that resolves to an asset whose bytes are gone: the index is right, the
+	// library moved under it. Still a miss, because that is what fs.ErrNotExist means.
+	at := -1
+	for i, it := range items {
+		if it.Source.ArchivePath != "" {
+			at = i
+			break
+		}
+	}
+	if at < 0 {
+		t.Fatal("no archive-backed asset in the fixture; this test is not exercising the branch it claims")
+	}
+	zip := items[at]
+	if err := os.Remove(zip.Source.ArchivePath); err != nil {
+		t.Fatal(err)
+	}
+	resp, err = http.Get(srv.URL + "/api/content?id=" + url.QueryEscape(zip.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("an asset whose archive is gone = %d, want 404: it wraps fs.ErrNotExist like every other miss", resp.StatusCode)
+	}
+}
+
+// sort=path had no test at all, so swapping its comparator's operands shipped green.
+// It is the ordering a user reaches for to see a pack's files in the order they sit on
+// disk, and reversed it is wrong in a way that looks deliberate.
+func TestAssetsSortByPathIsAscending(t *testing.T) {
+	srv := testServer(t)
+	items := getAssets(t, srv, "sort=path").Items
+	if len(items) < 2 {
+		t.Fatalf("got %d items, need at least 2 to check an ordering", len(items))
+	}
+	for i := 1; i < len(items); i++ {
+		if items[i-1].RelPath > items[i].RelPath {
+			t.Errorf("sort=path is not ascending at %d: %q then %q", i, items[i-1].RelPath, items[i].RelPath)
+		}
+	}
+}
+
+// app.js decides whether a card is a bitmap the lightbox can show and measure, and it
+// does so from its own regex over the extension. classify.go decides the same thing at
+// scan time, and the two are independent lists of the same extensions.
+//
+// Add one to classify.go alone and the card is categorised as an image and given a
+// worker-rendered grid thumbnail, while the lightbox falls to the category icon and
+// reports no dimensions — a format that works everywhere except where the user looks
+// at it. Derived from classify.go's list rather than restated, so this fails on the
+// change rather than on someone remembering to update a third copy.
+func TestTheLightboxKnowsEveryExtensionClassifiedAsABitmap(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("..", "assetindex", "classify.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The one case arm that returns ThumbImage: the formats something can actually
+	// rasterise, as opposed to the CategoryImage arm beside it that returns ThumbNone.
+	arm := regexp.MustCompile(`(?s)case ([^:]+):\s*\n\s*return CategoryImage, ThumbImage`).FindStringSubmatch(string(b))
+	if arm == nil {
+		t.Fatal("no ThumbImage case found in classify.go; this guard has stopped reading it")
+	}
+	var exts []string
+	for _, q := range regexp.MustCompile(`"([a-z0-9]+)"`).FindAllStringSubmatch(arm[1], -1) {
+		exts = append(exts, q[1])
+	}
+	if len(exts) == 0 {
+		t.Fatal("the ThumbImage case listed no extensions; this guard has stopped reading it")
+	}
+
+	app, err := os.ReadFile(filepath.Join("assets", "app.js"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := regexp.MustCompile(`const bitmap = /\^\(([^)]*)\)\$/i`).FindStringSubmatch(string(app))
+	if m == nil {
+		t.Fatal("no bitmap test found in app.js; this guard has stopped reading it")
+	}
+	re, err := regexp.Compile("(?i)^(" + m[1] + ")$")
+	if err != nil {
+		t.Fatalf("app.js's bitmap pattern does not compile as a Go regexp (%q); adjust this guard: %v", m[1], err)
+	}
+	for _, ext := range exts {
+		if !re.MatchString(ext) {
+			t.Errorf("classify.go gives %q a rendered thumbnail but app.js does not treat it as a bitmap: the grid shows it and the lightbox does not", ext)
+		}
+	}
+}
+
+// A library is a stranger's files: a pack ships whatever its author put in it, and
+// /api/content hands those bytes to the browser under a type this map chooses. Every
+// type here has to be inert, because a response the browser will run as a document runs
+// it in this server's origin — where the two write guards step aside by design. The
+// Host header is genuinely this server's, so guardHost passes; a same-origin fetch may
+// set application/json freely, so no preflight is involved. Such a script reads every
+// file under the scan root and rewrites the tag store.
+//
+// .svg is the one that was here and is the reason this test is. Derived from
+// classify.go rather than restated, so an extension taught to the classifier as an
+// image cannot quietly acquire a scriptable type here.
+func TestNoContentTypeIsOneTheBrowserWouldRunAsADocument(t *testing.T) {
+	scriptable := map[string]bool{
+		"image/svg+xml": true, "text/html": true, "application/xhtml+xml": true,
+		"text/xml": true, "application/xml": true, "application/pdf": true,
+	}
+	src, err := os.ReadFile(filepath.Join("..", "assetindex", "classify.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	exts := regexp.MustCompile(`"([a-z0-9]{1,8})"`).FindAllStringSubmatch(string(src), -1)
+	if len(exts) < 40 {
+		t.Fatalf("parsed %d extensions out of classify.go; this test has stopped reading it", len(exts))
+	}
+	for _, m := range exts {
+		if ct := contentType(m[1]); scriptable[ct] {
+			t.Errorf("contentType(%q) = %q, which a browser will run as a document in this origin", m[1], ct)
+		}
+	}
+	// And the ones the grid actually renders still get their real type, or the lightbox
+	// falls back to a category icon for every bitmap in the library.
+	for ext, want := range map[string]string{
+		"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+		"gif": "image/gif", "webp": "image/webp", "bmp": "image/bmp",
+		"fbx": "application/octet-stream", "glb": "application/octet-stream",
+		"svg": "application/octet-stream", "tga": "application/octet-stream",
+	} {
+		if got := contentType(ext); got != want {
+			t.Errorf("contentType(%q) = %q, want %q", ext, got, want)
+		}
+	}
+}
+
+// nosniff is what keeps the declared type binding. Without it the browser is free to
+// re-read a response it finds unconvincing, and the type it can arrive at that way is
+// the one the test above exists to keep out of the map.
+func TestServedBytesAreNotSniffable(t *testing.T) {
+	srv := testServer(t)
+	for _, tc := range []struct{ path, asset string }{
+		{"/api/content?id=", "Rock.fbx"},
+		{"/api/thumb?id=", "Heart.prefab"}, // the unitypackage member carrying a preview.png
+	} {
+		path := tc.path
+		resp := mustGet(t, srv.URL+tc.path+idByName(t, srv, tc.asset))
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s: status %d; this guard is asserting against an error page", path, resp.StatusCode)
+		}
+		if got := resp.Header.Get("X-Content-Type-Options"); got != "nosniff" {
+			t.Errorf("%s: X-Content-Type-Options = %q, want nosniff", path, got)
+		}
+	}
+}
+
+// The default ordering — no sort= at all — is what every user sees on first load, and
+// it was the one arm of sortItems with no test. Reversing its comparator left the whole
+// suite green: the query tests sort the names themselves before comparing, and the
+// paging tests compare paged order against single-page order, which is the same
+// comparator on both sides.
+//
+// Both properties at once, because each hides the other: ascending-but-case-sensitive
+// passes a fold-blind check, and folded-but-descending passes an ordering-blind one.
+func TestAssetsDefaultSortIsAscendingAndCaseInsensitive(t *testing.T) {
+	srv := serverWith(t, func(mk func(...string) string) {
+		for _, n := range []string{"apple.fbx", "Banana.fbx", "cherry.fbx"} {
+			os.WriteFile(mk("v", "Pack", n), []byte("BYTES-"+n), 0o644)
+		}
+	})
+	var got []string
+	for _, it := range getAssets(t, srv, "").Items {
+		got = append(got, it.Name)
+	}
+	want := []string{"apple.fbx", "Banana.fbx", "cherry.fbx"}
+	if !slices.Equal(got, want) {
+		t.Errorf("default order = %v, want %v (ascending, case-folded)", got, want)
+	}
+}
+
+// A root-motion file with no in-place sibling in its group is never paired and never
+// suppressed, and decorate marks it bakedMotion so the lightbox offers the strip-motion
+// toggle for it — `moveBtn.hidden = !(rmClips.length || asset.bakedMotion)`. That is the
+// only consumer of RootMotionVariant with no test on either side of the wire, and the
+// regression is a control that silently stops appearing.
+func TestAStandaloneRootMotionCardOffersTheStripToggle(t *testing.T) {
+	srv := serverWith(t, func(mk func(...string) string) {
+		// Downloaded without its in-place partner, which is how a Quaternius clip pack
+		// commonly arrives.
+		os.WriteFile(mk("quaternius", "RPG_Animations", "Walk_RM.glb"), []byte("GLBBYTESRM"), 0o644)
+	})
+	r := getAssets(t, srv, "")
+	if r.Total != 1 {
+		t.Fatalf("grid shows %d cards, want the unpaired RM file visible", r.Total)
+	}
+	it := r.Items[0]
+	if it.RootMotionID != "" {
+		t.Errorf("rootMotionId = %q, want empty: there is no sibling to toggle to", it.RootMotionID)
+	}
+	if !it.BakedMotion {
+		t.Error("bakedMotion is false, so the lightbox hides the strip-motion toggle for a file that is nothing but root motion")
+	}
+	// And the paired case keeps it off the in-place card, where the toggle comes from
+	// the sibling instead.
+	paired := serverWith(t, func(mk func(...string) string) {
+		os.WriteFile(mk("quaternius", "RPG_Animations", "Walk.glb"), []byte("GLBBYTES"), 0o644)
+		os.WriteFile(mk("quaternius", "RPG_Animations", "Walk_RM.glb"), []byte("GLBBYTESRM"), 0o644)
+	})
+	p := getAssets(t, paired, "").Items[0]
+	if p.BakedMotion {
+		t.Error("the in-place card is marked bakedMotion; its motion is in the sibling, not baked into it")
+	}
+	if p.RootMotionID == "" {
+		t.Error("the in-place card lost its sibling")
+	}
+}
+
+// /api/related resolves a link group to whole cards, and it skips the root-motion
+// siblings the grid hides: surfacing one there shows the strip a card the grid never
+// has, which cannot be opened from anywhere else. The UI cannot create such a link, but
+// the tag store is a file meant to be hand-edited and committed, and an older quarry
+// wrote groups without this rule.
+func TestRelatedDoesNotSurfaceASuppressedRootMotionSibling(t *testing.T) {
+	srv, _ := taggedLibrary(t, func(mk func(...string) string) {
+		os.WriteFile(mk("quaternius", "RPG_Animations", "Walk.glb"), []byte("GLBBYTES"), 0o644)
+		os.WriteFile(mk("quaternius", "RPG_Animations", "Walk_RM.glb"), []byte("GLBBYTESRM"), 0o644)
+		os.WriteFile(mk("quaternius", "RPG_Animations", "Jump.glb"), []byte("GLBJUMP"), 0o644)
+	})
+	// The RM sibling is hidden from the grid, so its fingerprint is not reachable
+	// through /api/assets at all — which is the whole point. It is the content print of
+	// the bytes, so it is derivable here the same way the index derives it.
+	rmFP := crcFingerprintForTest([]byte("GLBBYTESRM"))
+	jump := itemByName(t, srv, "q=Jump", "Jump.glb")
+	if len(jump.Fingerprints) == 0 {
+		t.Fatal("the fixture card carries no fingerprint to link")
+	}
+	fps := append([]string{rmFP}, jump.Fingerprints...)
+	doJSON(t, "POST", srv.URL+"/api/link", map[string]any{"fingerprints": fps, "on": true}).Body.Close()
+
+	for _, it := range relatedItems(t, srv, jump.Fingerprints).Items {
+		if it.Name == "Walk_RM.glb" {
+			t.Error("the related strip offers a card the grid suppresses; it cannot be opened from anywhere else")
+		}
+	}
+	// The link itself is real — it is only the suppressed card that is withheld — so a
+	// companion that *is* in the grid still comes back, and this test is not passing
+	// because /api/related returned nothing at all.
+	walk := itemByName(t, srv, "q=Walk", "Walk.glb")
+	doJSON(t, "POST", srv.URL+"/api/link", map[string]any{"fingerprints": append(append([]string{}, jump.Fingerprints...), walk.Fingerprints...), "on": true}).Body.Close()
+	var sawWalk bool
+	for _, it := range relatedItems(t, srv, jump.Fingerprints).Items {
+		if it.Name == "Walk.glb" {
+			sawWalk = true
+		}
+	}
+	if !sawWalk {
+		t.Fatal("/api/related returned no visible companion either; this guard is asserting against an empty response")
+	}
+}
+
+// crcFingerprintForTest mirrors assetindex's loose/zip print for a byte slice. The
+// scheme is asserted in assetindex's own tests; this is only how a test reaches the
+// print of an asset the grid deliberately does not show.
+func crcFingerprintForTest(b []byte) string {
+	return fmt.Sprintf("crc32:%08x:%d", crc32.ChecksumIEEE(b), len(b))
+}
+
+// tagmode is read as `and := mode == "and"`, so every other spelling is OR. That is the
+// right fallback — a filter that narrows to nothing for a typo looks like an empty
+// library — but nothing held it, and reading an unknown value as AND is a blank grid
+// for a query the UI can produce by version skew alone.
+func TestAnUnknownTagModeFallsBackToOr(t *testing.T) {
+	srv, _ := enabledServer(t)
+	heart := itemByName(t, srv, "q=Heart", "Heart.fbx")
+	sword := itemByName(t, srv, "q=Sword", "Sword.glb")
+	doJSON(t, "POST", srv.URL+"/api/assign", map[string]any{"fingerprints": heart.Fingerprints, "tag": "a", "on": true}).Body.Close()
+	doJSON(t, "POST", srv.URL+"/api/assign", map[string]any{"fingerprints": sword.Fingerprints, "tag": "b", "on": true}).Body.Close()
+
+	both := "tag=a&tag=b"
+	if got := taggedAssets(t, srv, both).Total; got != 2 {
+		t.Fatalf("the default mode returned %d cards, want both: OR is the default", got)
+	}
+	if got := taggedAssets(t, srv, both+"&tagmode=and").Total; got != 0 {
+		t.Fatalf("tagmode=and returned %d, want 0: no card carries both", got)
+	}
+	for _, mode := range []string{"AND", "all", "both", "x"} {
+		if got := taggedAssets(t, srv, both+"&tagmode="+mode).Total; got != 2 {
+			t.Errorf("tagmode=%s returned %d cards, want 2: anything but the exact \"and\" is OR", mode, got)
+		}
+	}
+}
+
+// A body that is not JSON has to be a 400 naming the body, not a 500 and not a partial
+// write. Oversized bodies are covered; a well-formed content-type carrying malformed
+// JSON was not, and it is the shape a half-finished fetch actually arrives in.
+func TestAMalformedJSONBodyIsRefusedWithoutTouchingTheStore(t *testing.T) {
+	srv, tagsPath := enabledServer(t)
+	before, err := os.ReadFile(tagsPath)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	for _, e := range writeEndpoints(t) {
+		resp := httpDo(t, e.method, srv.URL+e.path, "application/json", `{"fingerprints": [`)
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("%s %s with a truncated body = %d, want 400: %s", e.method, e.path, resp.StatusCode, body)
+		}
+		if !strings.Contains(string(body), "JSON") {
+			t.Errorf("%s %s: error body %q does not say what was wrong", e.method, e.path, body)
+		}
+	}
+	after, err := os.ReadFile(tagsPath)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Error("a refused request rewrote the tag store")
+	}
+}
+
+// The modules the Node tests cover have to load with nothing installed: `node --test`
+// resolves them off the filesystem, with no import map, no bundler and no package.json.
+// A bare "three", an absolute "/static/..." specifier, or anything else reaching out of
+// this directory makes them unloadable there, and the whole JS half of the suite stops
+// running — which shows up as a green CI job that checked nothing.
+//
+// Derived from the test directory rather than restated, so a module given a test is
+// held to this without anyone remembering to list it here.
+func TestEveryNodeTestedModuleLoadsWithNothingInstalled(t *testing.T) {
+	entries, err := os.ReadDir(filepath.Join("jstest"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Each test file names the modules it imports from ../assets/.
+	covered := map[string]bool{}
+	for _, e := range entries {
+		if !strings.HasSuffix(e.Name(), ".test.mjs") {
+			continue
+		}
+		b, err := os.ReadFile(filepath.Join("jstest", e.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, m := range regexp.MustCompile(`from '\.\./assets/([^']+)'`).FindAllStringSubmatch(string(b), -1) {
+			covered[m[1]] = true
+		}
+	}
+	if len(covered) < 5 {
+		t.Fatalf("found %d modules under test; this guard has stopped reading jstest/", len(covered))
+	}
+	for file := range covered {
+		static, dynamic := frontendImports(t, file)
+		for _, spec := range append(append([]string{}, static...), dynamic...) {
+			// frontendImports resolves a "./x.js" to "x.js" and leaves everything else
+			// as written, so a specifier that still names a sibling in this directory is
+			// the only shape Node can resolve on its own.
+			if !strings.HasSuffix(spec, ".js") || strings.Contains(spec, "/") || !covered[spec] {
+				t.Errorf("%s imports %q; a module under test may only import a sibling module that is itself under test, relatively — otherwise node --test cannot load it",
+					file, spec)
+			}
+		}
+	}
+}
+
+// A class the page adds with no rule behind it is feedback that does not happen. The
+// copy buttons carry no text, so `.failed` was the whole of their answer to a rejected
+// clipboard write — and there was no such rule: the icon did not change, nothing was
+// logged, and the stale clipboard is what got pasted.
+//
+// Only literal class names are checked; a computed one is out of reach here and rare.
+func TestEveryClassTheFrontendAddsHasARule(t *testing.T) {
+	css, err := assetsFS.ReadFile("assets/style.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, file := range []string{"app.js", "viewer.js", "thumbs.js", "icons.js"} {
+		b, err := assetsFS.ReadFile("assets/" + file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// classList.add('x'), .toggle('x', cond), and the ternary both arms of which are
+		// literals — which is how the copy buttons pick between done and failed.
+		for _, m := range regexp.MustCompile(`classList\.(?:add|toggle)\(\s*(?:[^)]*\?\s*)?'([a-z0-9-]+)'(?:\s*:\s*'([a-z0-9-]+)')?`).FindAllStringSubmatch(string(b), -1) {
+			names = append(names, m[1])
+			if m[2] != "" {
+				names = append(names, m[2])
+			}
+		}
+	}
+	if len(names) < 3 {
+		t.Fatalf("found %d literal class names; this guard has stopped reading the frontend", len(names))
+	}
+	for _, n := range names {
+		if !strings.Contains(string(css), "."+n) {
+			t.Errorf("the page adds the class %q and style.css has no rule for it: whatever it was meant to show, nothing happens", n)
+		}
+	}
+}
+
+// A tag's three numbers each have to mean what the client says they mean. cardsOfFP is
+// built over what the grid can return, so a miss in it covers two unrelated things:
+// content this library does not hold, and a root-motion sibling that is held but folded
+// into the in-place card that plays it. Counted together, the palette told a user that a
+// tag sat on "content outside this library" for a file in the library.
+//
+// Count stays 0 either way — no filter returns a suppressed asset, which is the rule
+// that matters — so nothing but this separates the explanation from the truth.
+func TestASuppressedSiblingIsNotCountedAsContentThisLibraryLacks(t *testing.T) {
+	srv, tagsPath := taggedLibrary(t, func(mk func(...string) string) {
+		os.WriteFile(mk("quaternius", "RPG_Animations", "Walk.glb"), []byte("GLBBYTES"), 0o644)
+		os.WriteFile(mk("quaternius", "RPG_Animations", "Walk_RM.glb"), []byte("GLBBYTESRM"), 0o644)
+	})
+	_ = tagsPath
+
+	// The RM file's own print. It has no card, so it can only be reached the way a
+	// committed store or another machine reaches it: by fingerprint.
+	rmFP := crcPrint("GLBBYTESRM")
+	// And one for content this library genuinely does not hold.
+	absentFP := "crc32:deadbeef:99"
+
+	for _, fp := range []string{rmFP, absentFP} {
+		resp := doJSON(t, "POST", srv.URL+"/api/assign", map[string]any{
+			"fingerprints": []string{fp}, "tag": "hero", "on": true,
+		})
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("assign %s: %d", fp, resp.StatusCode)
+		}
+	}
+
+	var p paletteResp
+	decode(t, doJSON(t, "GET", srv.URL+"/api/tags", nil), &p)
+	var hero *paletteTag
+	for i := range p.Tags {
+		if p.Tags[i].ID == "hero" {
+			hero = &p.Tags[i]
+		}
+	}
+	if hero == nil {
+		t.Fatalf("no hero tag in the palette: %+v", p.Tags)
+	}
+	if hero.OffIndex != 1 {
+		t.Errorf("offIndex = %d, want 1: only the absent fingerprint is content this library lacks; the suppressed root-motion sibling is right here", hero.OffIndex)
+	}
+	// Both are unreachable by a filter, which is the invariant offIndex must not break.
+	if hero.Count != 0 || hero.Assets != 0 {
+		t.Errorf("count/assets = %d/%d, want 0/0: neither assignment can be returned by ?tag=hero", hero.Count, hero.Assets)
+	}
+	if r := getAssets(t, srv, "tag=hero"); r.Total != 0 {
+		t.Errorf("?tag=hero returns %d cards, want 0; a count the query cannot reach is the thing being guarded", r.Total)
+	}
+}
+
+// crcPrint is the loose/zip fingerprint of some bytes, derived the way assetindex
+// derives it rather than restated, so a change to the scheme fails here loudly.
+func crcPrint(content string) string {
+	return fmt.Sprintf("crc32:%x:%d", crc32.ChecksumIEEE([]byte(content)), len(content))
 }

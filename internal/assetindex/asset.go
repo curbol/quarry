@@ -87,6 +87,15 @@ type Source struct {
 	// Sidekick character (see ThumbSidekick). The character has no bytes of its own; the
 	// frontend loads each part by id and merges them onto the shared skeleton.
 	Parts []string `json:"parts,omitempty"`
+	// Complete records that every part the .sk named resolved to a mesh this package
+	// actually holds, which is what makes a character supersede the per-character
+	// prefab, material and combined mesh named after it. A partial one is a torso and a
+	// hand, and those rows are the ones still showing the whole character.
+	//
+	// Indexed rather than recomputed because the same decision has to reach a copy of
+	// the pack extracted beside itself, and that copy is seen by a later pass over the
+	// whole library — one that has no archive to re-read the .sk out of.
+	Complete bool `json:"complete,omitempty"`
 }
 
 // EntryPath is where the asset's file sits inside whatever holds it: the entry name
@@ -97,7 +106,9 @@ type Source struct {
 func (s Source) EntryPath() string {
 	switch s.Kind {
 	case SourceZip:
-		return s.Entry
+		// entryPath, not Entry: the stored name is a lookup key into the central
+		// directory and may be spelled with backslashes, which is not a path.
+		return entryPath(s.Entry)
 	case SourceUnityPackage:
 		return s.Pathname
 	default:

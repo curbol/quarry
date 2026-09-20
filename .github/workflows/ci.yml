@@ -40,6 +40,19 @@ jobs:
 
       - run: go vet ./...
 
+      # The release builds these five for the first time after the tag is pushed, so
+      # without this a platform-specific compile error is found by a failed release
+      # rather than by the PR that introduced it, and the fix needs a new tag. The list
+      # is release.yml's, and TestReleaseSuffixMatchesTheWorkflowLabels parses this loop
+      # and that table and fails when they diverge — so a platform added there and not
+      # here is caught by the suite rather than by the release.
+      - name: Cross-compile the release platforms
+        run: |
+          for p in darwin/amd64 darwin/arm64 linux/amd64 linux/arm64 windows/amd64; do
+            echo "building $p"
+            GOOS=${p%/*} GOARCH=${p#*/} CGO_ENABLED=0 go build -o /dev/null .
+          done
+
       # install.sh is the only install path and the only recovery when `quarry update`
       # refuses a dev build, and nothing else here reads it: the guard tests in
       # selfupdate parse it as text for its platform labels, so a stray brace or a
@@ -52,14 +65,16 @@ jobs:
       # fans out over the tree, so the suite is worth running under the detector.
       - run: go test -race ./...
 
-  # The grid's card recycling, the thumbnail worker's job dispatch, rig matching,
-  # folding a tag edit into a card and deciding where a padded clip stops are
+  # The grid's card recycling, the thumbnail worker's job dispatch, which renders stay
+  # resident and which object URLs that releases, what the preview-character registry
+  # holds and when a rig search may evict from it, rig matching, folding a tag edit into
+  # a card, deciding where a padded clip stops, and which fonts a scroll may drop are
   # arithmetic, message ordering and set logic: a mistake in any of them leaves the UI
-  # working and merely slow or subtly wrong, which is what no Go test and no eye
-  # reliably catches. The pure halves live in assets/gridwindow.js, jobtracker.js,
-  # rigmatch.js, tagedit.js and cliptrim.js and are checked here. Node's own test
-  # runner, no package.json and nothing installed, so this stays a runtime rather than
-  # an ecosystem.
+  # working and merely slow, leaking, or subtly wrong, which is what no Go test and no
+  # eye reliably catches. The pure halves live in assets/gridwindow.js, jobtracker.js,
+  # thumbcache.js, fontcache.js, rigmatch.js, tagedit.js, cliptrim.js and charstore.js,
+  # and are checked here. Node's own test runner, no package.json and nothing installed,
+  # so this stays a runtime rather than an ecosystem.
   js:
     runs-on: ubuntu-latest
     steps:

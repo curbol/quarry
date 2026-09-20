@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/curbol/quarry/internal/safewrite"
 )
@@ -20,7 +21,7 @@ import (
 // also keys the unpacked-archive tree, so a change to what extraction writes belongs
 // here too: an archive whose bytes never changed keeps its fingerprint, and only the
 // version tells the old extraction apart from what the current code would produce.
-const indexVersion = 22
+const indexVersion = 24
 
 // SkippedFile records a library file the scan could not read. A damaged archive
 // costs its own contents, not the rest of the library, so the failure is carried
@@ -77,6 +78,14 @@ type Index struct {
 	archiveMus  map[string]*sync.RWMutex
 	rebuilt     map[string]chan struct{}
 
+	// liveUnpacked is the set of archive fingerprints this scan reached, recorded by
+	// refresh at the moment it finished. PruneUnpacked reads it rather than re-deriving
+	// from Assets, which is exported: a caller that filters or truncates the slice
+	// before pruning would otherwise sweep the extractions of everything it removed,
+	// and those are live for a second quarry sharing this cache dir. nil means no
+	// refresh produced this index, which is the one state the sweep must refuse.
+	liveUnpacked map[string]bool
+
 	zips zipReaders
 }
 
@@ -89,9 +98,19 @@ func fingerprint(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	key := path + "\x00" + strconv.FormatInt(fi.Size(), 10) + "\x00" + strconv.FormatInt(fi.ModTime().UnixNano(), 10)
+	return fingerprintOf(path, fi.Size(), fi.ModTime()), nil
+}
+
+// fingerprintOf is the print itself, over a stat the caller already has. The walk stats
+// every file it enumerates, so refresh deriving the print from that rather than stating
+// again is ~150k syscalls saved on a real library, on the path the user waits on — and
+// it leaves one reading of a file's stat where there were two that could disagree about
+// the file changing between them. The serving side has no such stat in hand and goes
+// through fingerprint.
+func fingerprintOf(path string, size int64, mod time.Time) string {
+	key := path + "\x00" + strconv.FormatInt(size, 10) + "\x00" + strconv.FormatInt(mod.UnixNano(), 10)
 	sum := sha256.Sum256([]byte(key))
-	return hex.EncodeToString(sum[:12]), nil
+	return hex.EncodeToString(sum[:12])
 }
 
 // Options select what a scan covers and where its regenerable state lives. The
@@ -186,9 +205,10 @@ func Build(opt Options) (*Index, error) {
 // every unitypackage and re-reading every loose file's bytes on each run.
 //
 // Reuse is only sound for entries derived by this version's scan logic, so an index
-// carrying another version's is emptied first and re-derived whole. Enforcing that
-// here rather than at the call site is what keeps a caller that reaches for Load and
-// Refresh directly from silently merging two schemes' assets into one index.
+// carrying another version's is emptied first and re-derived whole. Enforcing that here
+// rather than in LoadOrBuild is what keeps the guarantee from depending on the one
+// caller that currently checks: load does not inspect Version, so an index decoded from
+// a cache written by other scan logic reaches this function directly.
 func (ix *Index) refresh() error {
 	if ix.Version != indexVersion {
 		ix.Assets, ix.Suppressed = nil, nil
@@ -250,11 +270,15 @@ func (ix *Index) refresh() error {
 		got := prevAt(idx[0]).RelPath
 		return got == rel || strings.HasPrefix(got, rel+"::")
 	}
+	live := map[string]bool{}
 	for _, e := range entries {
-		fp, err := fingerprint(e.path)
-		if err != nil {
-			skipped = append(skipped, SkippedFile{RelPath: e.rel, Reason: err.Error()})
-			continue
+		fp := fingerprintOf(e.path, e.size, e.modTime)
+		if e.kind != SourceLoose {
+			// Recorded off the walk's own stat, whether or not the enumeration that
+			// follows keeps the print. A refresh whose second pass over an archive
+			// failed drops it from ArchivePrint while keeping the assets the first pass
+			// produced, and those are served out of an extraction that must survive.
+			live[fp] = true
 		}
 		if e.kind == SourceLoose {
 			if ix.LoosePrint[e.path] == fp && describes(oldByLoose[e.path], e.rel) {
@@ -295,6 +319,7 @@ func (ix *Index) refresh() error {
 	}
 	ix.ArchivePrint = newPrint
 	ix.LoosePrint = newLoose
+	ix.liveUnpacked = live
 	ix.Skipped = skipped
 	kept, dropped := dedup(assets)
 	ix.setAssets(kept)

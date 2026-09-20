@@ -204,6 +204,19 @@ func TestLinkMergesTransitively(t *testing.T) {
 	if g := s.Groups(); len(g) != 1 || !reflect.DeepEqual(g[0], []string{"A", "B", "C"}) {
 		t.Errorf("Groups() = %v, want [[A B C]]", g)
 	}
+	// Linking a pair already in the group rebuilds the same set rather than splitting
+	// one off or duplicating the group. The UI sends the whole selection on every
+	// click, so this is the ordinary case, not an edge one.
+	s.Link([]string{"A", "C"})
+	if g := s.Groups(); len(g) != 1 || !reflect.DeepEqual(g[0], []string{"A", "B", "C"}) {
+		t.Errorf("re-linking a pair already in the group gave %v, want [[A B C]]", g)
+	}
+	// And a fingerprint linked to itself is not a group: a group of one is what Groups
+	// filters out, and forming one would put a row in the file nothing can reach.
+	s.Link([]string{"D", "D"})
+	if s.Related("D") != nil {
+		t.Errorf("Related(D) = %v after linking D to itself", s.Related("D"))
+	}
 }
 
 func TestLinkNeedsTwoMembers(t *testing.T) {
@@ -615,6 +628,51 @@ func TestLoadDropsDegenerateGroups(t *testing.T) {
 	}
 }
 
+// A row the next save would not put back is refused rather than skipped, because a save
+// rewrites the file whole: accepted, a hand-typed row disappears on the user's first tag
+// click with nothing said. An unknown key, an unreadable color and a duplicate id were
+// already loud; these two were silently dropped, so no rule covered a new case.
+//
+// A degenerate group stays the documented exception (see above): a group of fewer than
+// two is not a partial row, it is a group that means nothing.
+func TestLoadRefusesARowTheNextSaveWouldDrop(t *testing.T) {
+	for _, tc := range []struct{ name, body, want string }{
+		{"a tag with no id", "[[tag]]\n  color = \"#e11d48\"\n", "no id"},
+		{"an assignment with no fingerprint", "[[assignment]]\n  fingerprint = \"\"\n  tags = [\"hero\"]\n", "empty fingerprint"},
+		{"an empty tag inside an assignment", "[[assignment]]\n  fingerprint = \"crc32:1:2\"\n  tags = [\"\"]\n", "empty fingerprint or tag"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := filepath.Join(t.TempDir(), FileName)
+			if err := os.WriteFile(p, []byte(tc.body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			_, err := Load(p)
+			if err == nil {
+				t.Fatal("Load accepted a row the next save would erase without a word")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error %q does not say what is wrong (want it to mention %q)", err, tc.want)
+			}
+			if !strings.Contains(err.Error(), p) {
+				t.Errorf("error %q does not name the file", err)
+			}
+		})
+	}
+	// And a well-formed store still loads, so the refusal is not catching real ones.
+	p := filepath.Join(t.TempDir(), FileName)
+	body := "[[tag]]\n  id = \"hero\"\n  color = \"#e11d48\"\n\n[[assignment]]\n  fingerprint = \"crc32:1:2\"\n  tags = [\"hero\"]\n"
+	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Load(p)
+	if err != nil {
+		t.Fatalf("a well-formed store was refused: %v", err)
+	}
+	if got := s.TagsFor("crc32:1:2"); len(got) != 1 || got[0] != "hero" {
+		t.Errorf("TagsFor = %v, want [hero]", got)
+	}
+}
+
 // Links are result expansion, nothing more: they travel companions into a query's
 // results without ever changing what tags a fingerprint carries. Both the package doc
 // and the design doc promise this and nothing checked it.
@@ -800,14 +858,19 @@ func TestLoadRefusesAnUnreadableColor(t *testing.T) {
 func TestLoadRefusesADuplicateTagID(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, FileName)
-	os.WriteFile(p, []byte(`
+	// Checked, unlike every other fixture write here it used not to be: a write that
+	// failed leaves Load returning an empty store and this test reporting "a duplicate
+	// tag id was accepted", which points at the wrong thing entirely.
+	if err := os.WriteFile(p, []byte(`
 [[tag]]
   id = "hero"
   color = "#e11d48"
 [[tag]]
   id = "hero"
   color = "#0ea5e9"
-`), 0o644)
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	_, err := Load(p)
 	if err == nil {
@@ -898,10 +961,15 @@ func TestAwkwardLabelsAndFingerprintsRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reloading a store with awkward strings: %v", err)
 	}
+	// The values, not just the count: this is the test whose job is pinning the
+	// escaping, and a label that round-trips to a *different* string satisfies a length
+	// check exactly as well as one that survives. TagsFor is sorted, so the wanted set
+	// is too.
+	want := append([]string(nil), labels...)
+	sort.Strings(want)
 	for _, fp := range fps {
-		got := back.TagsFor(fp)
-		if len(got) != len(labels) {
-			t.Errorf("TagsFor(%q) = %v, want all %d labels", fp, got, len(labels))
+		if got := back.TagsFor(fp); !reflect.DeepEqual(got, want) {
+			t.Errorf("TagsFor(%q) = %#v, want %#v", fp, got, want)
 		}
 	}
 	if got := len(back.Groups()); got != 1 {
@@ -1065,5 +1133,99 @@ func TestFingerprintsByTag(t *testing.T) {
 	}
 	if len(got["unused"]) != 0 {
 		t.Errorf("unused = %v, want nothing", got["unused"])
+	}
+}
+
+// Creating a tag and applying it later is the ordinary UI flow — POST /api/tags with
+// no assign — and a palette entry that carries nothing has no [[assignment]] row to be
+// recovered from. Every other round-trip test here assigns the tag it defines, so a
+// save that skipped unused entries, or a load that dropped them, would leave the whole
+// suite green while the user's new tag vanished on the next restart.
+func TestAnUnassignedPaletteEntrySurvivesTheRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), FileName)
+	s := New()
+	if err := s.Define("unused", "#abcdef"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Define("used", "#112233"); err != nil {
+		t.Fatal(err)
+	}
+	s.Assign("crc32:abc:10", "used")
+	if err := s.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, ok := got.color("unused")
+	if !ok {
+		t.Fatal("the unassigned tag is gone after a reload; the user's new tag disappears on restart")
+	}
+	if c != "#abcdef" {
+		t.Errorf("unassigned tag colour = %q, want #abcdef", c)
+	}
+}
+
+// Discover answers with a path Load is then asked to read. A directory of that name at
+// or above the working directory is not a store, and answering with it made Load fail
+// with "is a directory" — so quarry refused to start instead of walking past to a real
+// store, or to the user-wide one that is the documented fallback.
+func TestDiscoverWalksPastADirectoryOfThatName(t *testing.T) {
+	root := t.TempDir()
+	real := filepath.Join(root, FileName)
+	if err := os.WriteFile(real, []byte(""), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	deep := filepath.Join(root, "project", "sub")
+	if err := os.MkdirAll(filepath.Join(deep, FileName), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := Discover(deep)
+	if !ok {
+		t.Fatal("Discover found nothing; the directory in the way stopped the walk")
+	}
+	if got != real {
+		t.Errorf("Discover = %q, want the regular file at %q", got, real)
+	}
+	if _, err := Load(got); err != nil {
+		t.Errorf("what Discover returned does not load: %v", err)
+	}
+}
+
+// The header is the only warning a user gets before their first tag click erases the
+// comments they wrote in a store meant to be hand-edited and committed. Nothing pinned
+// it: replacing storeHeader with "" left this package and browse green, because every
+// round-trip test compares parsed state or two saves of the same store, and both sides
+// lose the line together.
+func TestASavedStoreWarnsThatItIsRewrittenWhole(t *testing.T) {
+	p := filepath.Join(t.TempDir(), FileName)
+	s := New()
+	s.Assign("crc32:1:2", "hero")
+	if err := s.Save(p); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, _, _ := strings.Cut(string(b), "\n")
+	if !strings.HasPrefix(first, "#") {
+		t.Fatalf("a saved store opens with %q, not a comment; a hand-editor gets no warning at all", first)
+	}
+	// The substance, not the wording: a reader has to learn that what they type here
+	// does not survive an edit made in the UI.
+	for _, want := range []string{"comment", "whole"} {
+		if !strings.Contains(strings.ToLower(first), want) {
+			t.Errorf("the header %q does not mention %q; it has to say what is lost, not just that it is a header", first, want)
+		}
+	}
+	// And it is a comment, so it must survive the round trip it is warning about.
+	back, err := Load(p)
+	if err != nil {
+		t.Fatalf("a store carrying its own header did not load: %v", err)
+	}
+	if got := back.TagsFor("crc32:1:2"); len(got) != 1 || got[0] != "hero" {
+		t.Errorf("TagsFor after a round trip = %v, want [hero]", got)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -20,7 +21,7 @@ func clearQuarryEnv(t *testing.T) {
 
 func TestRootUnsetWithoutConfig(t *testing.T) {
 	clearQuarryEnv(t)
-	c, err := Load(t.TempDir())
+	c, err := Load(t.TempDir(), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,7 +39,7 @@ func TestRootPrecedence(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	c, err := Load(dir)
+	c, err := Load(dir, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,7 +48,7 @@ func TestRootPrecedence(t *testing.T) {
 	}
 
 	t.Setenv("QUARRY_ROOT", "/from/env")
-	c, err = Load(dir)
+	c, err = Load(dir, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,7 +60,7 @@ func TestRootPrecedence(t *testing.T) {
 func TestRootExpandsHome(t *testing.T) {
 	clearQuarryEnv(t)
 	t.Setenv("QUARRY_ROOT", "~/assets/library")
-	c, err := Load(t.TempDir())
+	c, err := Load(t.TempDir(), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +79,7 @@ func TestLoadRejectsMalformedConfig(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte("root = "), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Load(dir); err == nil {
+	if _, err := Load(dir, ""); err == nil {
 		t.Error("malformed config.toml should be an error, not silently ignored")
 	}
 }
@@ -304,7 +305,7 @@ func TestLoadRejectsUnknownKeys(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte(tc.body), 0o644); err != nil {
 				t.Fatal(err)
 			}
-			_, err := Load(dir)
+			_, err := Load(dir, "")
 			if err == nil {
 				t.Fatal("the config was accepted silently")
 			}
@@ -327,7 +328,7 @@ func TestLoadRejectsAnUnreadableConfig(t *testing.T) {
 	if err := os.WriteFile(p, []byte("root = \"/x\"\n"), 0o000); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Load(dir); err == nil {
+	if _, err := Load(dir, ""); err == nil {
 		t.Fatal("an unreadable config.toml was treated as an absent one")
 	}
 }
@@ -336,7 +337,7 @@ func TestFollowSymlinksFromFile(t *testing.T) {
 	clearQuarryEnv(t)
 	dir := t.TempDir()
 
-	c, err := Load(dir)
+	c, err := Load(dir, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -347,7 +348,7 @@ func TestFollowSymlinksFromFile(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte("root = \"/x\"\nfollow_symlinks = true\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	c, err = Load(dir)
+	c, err = Load(dir, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -378,7 +379,7 @@ func TestTheExampleConfigIsOneLoadAccepts(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte(body), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := Load(dir); err != nil {
+		if _, err := Load(dir, ""); err != nil {
 			t.Errorf("Load refused a config.toml copied from config.example.toml: %v", err)
 		}
 	}
@@ -393,4 +394,119 @@ func TestTheExampleConfigIsOneLoadAccepts(t *testing.T) {
 		t.Fatal("no commented-out setting matched; this test has stopped checking half of what it exists for")
 	}
 	t.Run("with every setting on", func(t *testing.T) { load(t, uncommented) })
+}
+
+// A relative scan root from either persistent source means a different library for
+// every directory quarry is run from, and "." indexes whatever the user was standing
+// in — the accident the no-default rule exists to prevent, reintroduced from a shell
+// rc. resolveXDG already refuses a relative QUARRY_CACHE_DIR for exactly this reason;
+// the root had no such check.
+func TestARelativeScanRootIsRefused(t *testing.T) {
+	for _, tc := range []struct{ name, file, env string }{
+		{"config.toml", "assets", ""},
+		{"config.toml dot", ".", ""},
+		{"QUARRY_ROOT", "", "assets"},
+		{"QUARRY_ROOT dot", "", "."},
+		{"QUARRY_ROOT overriding an absolute file value", "/lib", "assets"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if tc.file != "" {
+				if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte("root = "+strconv.Quote(tc.file)+"\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			t.Setenv("QUARRY_ROOT", tc.env)
+			got, err := Load(dir, "")
+			if err == nil {
+				t.Fatalf("Load accepted a relative root, resolving it to %q", got.Root)
+			}
+			// The message has to name where the value came from: the two live in
+			// different files and only one of them is in the config dir.
+			want := "QUARRY_ROOT"
+			if tc.env == "" {
+				want = "config.toml"
+			}
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error %q does not name %s", err, want)
+			}
+			if got.Root != "" {
+				t.Errorf("a refused load still handed back Root = %q", got.Root)
+			}
+		})
+	}
+}
+
+// The flag is the deliberate exception to the absolute-path rule, and the rule must not
+// fire on a value it is discarding. Applied after the refusal, a relative QUARRY_ROOT in
+// a shell rc refused every run whatever --root said — and the refusal's own advice, pass
+// --root, hit the same refusal, so no flag could start quarry at all.
+func TestTheRootFlagWinsOverARelativePersistentRoot(t *testing.T) {
+	for _, tc := range []struct{ name, file, env, flag, want string }{
+		{"over a relative config.toml", "assets", "", "/lib", "/lib"},
+		{"over a relative QUARRY_ROOT", "", "assets", "/lib", "/lib"},
+		{"over both", ".", "assets", "/lib", "/lib"},
+		// The exception itself: one invocation saying "here". Left relative for
+		// assetindex to resolve against the working directory.
+		{"and may itself be relative", "", "assets", "packs", "packs"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearQuarryEnv(t)
+			dir := t.TempDir()
+			if tc.file != "" {
+				if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte("root = "+strconv.Quote(tc.file)+"\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			t.Setenv("QUARRY_ROOT", tc.env)
+			got, err := Load(dir, tc.flag)
+			if err != nil {
+				t.Fatalf("--root %s was refused because of a relative persistent root: %v", tc.flag, err)
+			}
+			if got.Root != tc.want {
+				t.Errorf("Root = %q, want %q", got.Root, tc.want)
+			}
+		})
+	}
+}
+
+// The flag wins, but it does not silence the rest of the file: a key this version does
+// not understand is still the user believing a setting is in effect.
+func TestTheRootFlagDoesNotSuppressTheUnknownKeyError(t *testing.T) {
+	clearQuarryEnv(t)
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte("follow_symlink = true\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(dir, "/lib"); err == nil {
+		t.Fatal("an unknown key was accepted because --root was passed")
+	}
+}
+
+// An absolute root, an unset one, and a "~" one all still load: the check must not cost
+// the ordinary cases, and an unset root is main.go's error to report, not this one's.
+func TestAnAbsoluteOrUnsetScanRootStillLoads(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("QUARRY_ROOT", "")
+	dir := t.TempDir()
+	if got, err := Load(dir, ""); err != nil || got.Root != "" {
+		t.Errorf("no config.toml: Load = %q, %v; want an empty root and no error", got.Root, err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte("root = \"/lib/assets\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := Load(dir, ""); err != nil || got.Root != "/lib/assets" {
+		t.Errorf("absolute root: Load = %q, %v", got.Root, err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte("root = \"~/assets\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Load(dir, "")
+	if err != nil {
+		t.Fatalf("a ~ root: %v", err)
+	}
+	if want := filepath.Join(home, "assets"); got.Root != want {
+		t.Errorf("a ~ root expanded to %q, want %q", got.Root, want)
+	}
 }

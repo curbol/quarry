@@ -15,6 +15,7 @@
   --accent: #ff6a4d;
   --accent-ink: #2a0d06;
   --ok: #5cc985;
+  --bad: #e2777a;
   --display: 'Bricolage Grotesque', system-ui, sans-serif;
 }
 * { box-sizing: border-box; }
@@ -256,6 +257,13 @@ header select:hover { border-color: var(--edge-hi); color: var(--text); }
 .card .copy-icon.done { background: var(--ok); }
 .card .copy-icon.done svg { display: none; }
 .card .copy-icon.done::after { content: '✓'; color: #0d1f14; font-size: 14px; }
+/* The icon buttons carry no text, so the class is the whole of their feedback: without
+   a rule here a rejected write (an unfocused document, the execCommand fallback on a
+   plain-http listener) looks exactly like a successful one and the stale clipboard is
+   what gets pasted. */
+.card .copy-icon.failed { background: var(--bad); }
+.card .copy-icon.failed svg { display: none; }
+.card .copy-icon.failed::after { content: '✕'; color: #2a0d06; font-size: 14px; }
 
 /* Name: two fixed single-line rows — head (fills line 1, ellipsized) and tail (the
    distinguishing suffix on line 2). Two <span> rows make a third line impossible;
@@ -337,6 +345,7 @@ header select:hover { border-color: var(--edge-hi); color: var(--text); }
 .lb-viewbtn.on { color: #f6d488; background: rgba(0, 0, 0, 0.7); }
 .lb-viewbtn[hidden] { display: none; }
 .lb-move { margin-left: 10px; }
+.lb-viewbtn:disabled { opacity: 0.25; cursor: default; }
 .lb-clipsel { max-width: 170px; background: var(--bg); color: var(--text); border: 1px solid var(--edge); border-radius: 6px; padding: 4px; font: inherit; }
 
 /* character sidebar panel */
@@ -378,6 +387,7 @@ header select:hover { border-color: var(--edge-hi); color: var(--text); }
 .lb-copyall { background: none; border: 0; padding: 0; color: var(--accent); cursor: pointer; font: inherit; font-size: 12px; }
 .lb-copyall:hover { text-decoration: underline; }
 .lb-copyall.done { color: var(--ok); }
+.lb-copyall.failed { color: var(--bad); }
 .lb-copyrow { position: relative; display: flex; flex-direction: column; gap: 4px; background: var(--bg); border: 1px solid var(--edge); border-radius: 8px; padding: 8px 34px 8px 10px; }
 .lb-copyrow-label { color: var(--muted); font-size: 11px; }
 .lb-copyrow code { font-size: 10.5px; color: #cfc6bc; word-break: break-all; font-family: ui-monospace, monospace; }
@@ -387,6 +397,9 @@ header select:hover { border-color: var(--edge-hi); color: var(--text); }
 .lb-copyicon.done { color: var(--ok); }
 .lb-copyicon.done svg { display: none; }
 .lb-copyicon.done::after { content: '✓'; font-size: 14px; }
+.lb-copyicon.failed { color: var(--bad); }
+.lb-copyicon.failed svg { display: none; }
+.lb-copyicon.failed::after { content: '✕'; font-size: 14px; }
 
 .lb-related { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
 .lb-related-head { color: var(--muted); font-size: 12px; }

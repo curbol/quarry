@@ -60,6 +60,34 @@ type settings struct {
 // a server and blocking on it.
 var served = serve
 
+// cliFlags is every flag quarry takes, bound to one FlagSet. It is a constructor
+// rather than a run of locals inside run() so a test can walk the same set the help
+// text claims to describe. The two are otherwise independent, and they had already
+// drifted: -version was registered and never mentioned in usage().
+type cliFlags struct {
+	set                             *flag.FlagSet
+	cfgDir, root, addr, cache, tags *string
+	reindex, follow, version        *bool
+}
+
+func newFlagSet() *cliFlags {
+	fs := flag.NewFlagSet("quarry", flag.ContinueOnError)
+	// Silence the flag package's own dump: help prints usage(), and a bad flag comes
+	// back as an error that main reports once.
+	fs.SetOutput(io.Discard)
+	return &cliFlags{
+		set:     fs,
+		cfgDir:  fs.String("config", "", "user config dir holding config.toml (default: $XDG_CONFIG_HOME/quarry or ~/.config/quarry)"),
+		root:    fs.String("root", "", "asset scan root (overrides config.toml / QUARRY_ROOT)"),
+		addr:    fs.String("addr", defaultAddr, "server address (host:port)"),
+		cache:   fs.String("cache", "", "cache dir for the index and unpacked archives (default: $XDG_CACHE_HOME/quarry)"),
+		tags:    fs.String("tags", "", "tag store path (default: the nearest quarry.tags.toml walking up from cwd, else the one in the config dir)"),
+		reindex: fs.Bool("reindex", false, "rebuild the asset index from scratch"),
+		follow:  fs.Bool("follow-symlinks", false, "index symlinked directories pointing outside the scan root"),
+		version: fs.Bool("version", false, "print the version and exit"),
+	}
+}
+
 // run dispatches the command line. Serving is the whole point of the tool, so it is
 // what a bare `quarry` does; update and version are the only subcommands.
 func run(args []string) error {
@@ -74,18 +102,10 @@ func run(args []string) error {
 		return fmt.Errorf("unknown subcommand %q", cmd)
 	}
 
-	fs := flag.NewFlagSet("quarry", flag.ContinueOnError)
-	// Silence the flag package's own dump: help prints usage() below, and a bad flag
-	// comes back as an error that main reports once.
-	fs.SetOutput(io.Discard)
-	cfgDir := fs.String("config", "", "user config dir holding config.toml (default: $XDG_CONFIG_HOME/quarry or ~/.config/quarry)")
-	root := fs.String("root", "", "asset scan root (overrides config.toml / QUARRY_ROOT)")
-	addr := fs.String("addr", defaultAddr, "server address (host:port)")
-	reindex := fs.Bool("reindex", false, "rebuild the asset index from scratch")
-	cacheFlag := fs.String("cache", "", "cache dir for the index and unpacked archives (default: $XDG_CACHE_HOME/quarry)")
-	tagsFlag := fs.String("tags", "", "tag store path (default: the nearest quarry.tags.toml walking up from cwd, else the one in the config dir)")
-	follow := fs.Bool("follow-symlinks", false, "index symlinked directories pointing outside the scan root")
-	showVersion := fs.Bool("version", false, "print the version and exit")
+	f := newFlagSet()
+	fs := f.set
+	cfgDir, root, addr, cacheFlag, tagsFlag := f.cfgDir, f.root, f.addr, f.cache, f.tags
+	reindex, follow, showVersion := f.reindex, f.follow, f.version
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -123,16 +143,9 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
-	cfg, err := config.Load(configDir)
+	cfg, err := config.Load(configDir, *root)
 	if err != nil {
 		return err
-	}
-	if *root != "" {
-		expanded, err := config.ExpandHome(*root)
-		if err != nil {
-			return err
-		}
-		cfg.Root = expanded
 	}
 	// A bool flag cannot distinguish unset from false by its value, so only an
 	// explicitly passed --follow-symlinks overrides config.toml.
@@ -232,6 +245,7 @@ flags:
   -tags <path>        tag store path (default: nearest quarry.tags.toml, else the one in the config dir)
   -follow-symlinks    index symlinked dirs pointing outside the scan root
   -config <dir>       user config dir with config.toml (default: $XDG_CONFIG_HOME/quarry or ~/.config/quarry)
+  -version            print the version and exit
 
 The scan root is the one setting with no default; set it once in config.toml. Tags
 are stored by content fingerprint, so they survive a pack update, a re-index, and a

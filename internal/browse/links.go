@@ -112,7 +112,11 @@ func (s *server) handleLink(w http.ResponseWriter, r *http.Request) {
 // library, not the current page or facet filter, so companions surface regardless of
 // how the grid is filtered.
 func (s *server) handleRelated(w http.ResponseWriter, r *http.Request) {
-	fps := r.URL.Query()["fingerprint"]
+	query, ok := requestQuery(w, r)
+	if !ok {
+		return
+	}
+	fps := query["fingerprint"]
 	own := make(map[string]bool, len(fps))
 	for _, fp := range fps {
 		own[fp] = true

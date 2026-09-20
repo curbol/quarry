@@ -83,8 +83,8 @@ func (ix *Index) openUnpacked(a Asset, member string, want int64) (io.ReadCloser
 	// is instead, the way openZipEntry reports an entry the archive stopped carrying,
 	// and leave the tree alone. An archive with no recorded print took a degraded
 	// enumeration, which says nothing either way, so it keeps the repair.
-	if recorded, known := ix.ArchivePrint[a.Source.ArchivePath]; known && recorded != fp {
-		return nil, 0, fmt.Errorf("%s changed since it was indexed: %w", filepath.Base(a.Source.ArchivePath), fs.ErrNotExist)
+	if ix.reshipped(a.Source.ArchivePath, fp) {
+		return nil, 0, reshipError(a.Source.ArchivePath)
 	}
 	// Repaired once per extraction. The repair costs a full decompress, and a second
 	// disagreement after one means the cause was never the tree, so retrying would
@@ -272,6 +272,23 @@ func (ix *Index) discardExtraction(archivePath string) error {
 	return nil
 }
 
+// reshipped reports whether an archive's bytes have moved since the scan read them —
+// the ordinary way a pack is updated. An archive with no recorded print took a degraded
+// enumeration, which says nothing either way, so it is not reported as re-shipped and
+// keeps every repair path open to it.
+func (ix *Index) reshipped(archivePath, fp string) bool {
+	recorded, known := ix.ArchivePrint[archivePath]
+	return known && recorded != fp
+}
+
+// reshipError is what a re-shipped archive answers with. Wrapping fs.ErrNotExist is
+// the point: this is the same outcome openZipEntry gives for an entry the archive
+// stopped carrying, so browse answers 404 rather than 500 for a card whose bytes the
+// index no longer describes.
+func reshipError(archivePath string) error {
+	return fmt.Errorf("%s changed since it was indexed: %w", filepath.Base(archivePath), fs.ErrNotExist)
+}
+
 // unpackedEntry is where one extracted unitypackage member sits, with the guid
 // re-checked on the way. Every other branch of Open re-validates its locator before
 // building a path from it (see openZipEntry), and this one has the same reason to: an
@@ -313,6 +330,12 @@ func openFile(p string) (io.ReadCloser, int64, error) {
 	}
 	return f, fi.Size(), nil
 }
+
+// ErrPruneWithoutRefresh refuses a sweep over an index that never walked the library.
+// The keep-set is what a walk found, so an absent one reads as "nothing is live" —
+// which deletes every extraction in the cache dir, including the ones another quarry
+// sharing it is serving from right now.
+var ErrPruneWithoutRefresh = errors.New("PruneUnpacked needs an index a full Build or LoadOrBuild produced")
 
 // ErrNoCacheDir is returned when an index built without a cache dir is asked for
 // content that has to be extracted. Falling back to a relative path would write an
@@ -369,13 +392,18 @@ func isLegacyIndex(path string) bool {
 // only one left behind long enough to be nobody's is cleared. A second quarry sharing
 // this cache dir sweeps every time it starts, so the two have to be able to overlap.
 //
-// The keep-set is read off this index, so it may only be called on one a full Build or
-// LoadOrBuild just produced for this root. Over an index anything narrowed — filtered,
-// truncated, half-populated — it deletes the extractions of everything that was
-// removed, and those are live for whoever is still serving them.
+// The keep-set is the snapshot refresh took of what the walk reached, so it describes
+// the scan rather than whatever Assets holds now — Assets is exported, and a caller
+// that filtered or truncated it before pruning would otherwise sweep the extractions
+// of everything it removed, which are live for a second quarry sharing this cache dir.
+// An index no refresh produced has no snapshot, and the sweep refuses rather than
+// reading an empty one as "nothing is live".
 func (ix *Index) PruneUnpacked() error {
 	if ix.cacheDir == "" {
 		return nil
+	}
+	if ix.liveUnpacked == nil {
+		return ErrPruneWithoutRefresh
 	}
 	var firstErr error
 	remove := func(p string) {
@@ -435,29 +463,8 @@ func (ix *Index) PruneUnpacked() error {
 	if err != nil {
 		return err
 	}
-	// Keyed on what the index references, not on what it is willing to reuse. A
-	// refresh whose second pass over an archive failed drops it from ArchivePrint while
-	// keeping the assets its first pass produced, so a keep-set built from the print
-	// alone deletes the extraction those assets are served from — re-decompressing the
-	// package on every run, and, with a second quarry sharing this cache dir, deleting
-	// it out from under one already serving it.
-	live := make(map[string]bool, len(ix.ArchivePrint))
-	for _, fp := range ix.ArchivePrint {
-		live[fp] = true
-	}
-	referenced := map[string]bool{}
-	for i := range ix.Assets {
-		p := ix.Assets[i].Source.ArchivePath
-		if ix.Assets[i].Source.Kind != SourceUnityPackage || p == "" || referenced[p] {
-			continue
-		}
-		referenced[p] = true
-		if fp, err := fingerprint(p); err == nil {
-			live[fp] = true
-		}
-	}
 	for _, e := range entries {
-		if !e.IsDir() || live[e.Name()] {
+		if !e.IsDir() || ix.liveUnpacked[e.Name()] {
 			continue
 		}
 		remove(filepath.Join(dir, e.Name()))
@@ -490,6 +497,17 @@ func (ix *Index) ensureExtracted(archivePath string) (string, error) {
 	dest := filepath.Join(ix.unpackedDir(), fp)
 	if _, err := os.Stat(dest); err == nil {
 		return dest, nil
+	}
+	// There is nothing here to build. The extraction is named for the archive's print,
+	// so an archive replaced in place since the scan always misses the fast path above
+	// — and decompressing it would produce a tree correct under its new print while
+	// every size this index carries is still the old one. The member read then
+	// disagrees, openUnpacked reports the miss, and the hundreds of MB just written are
+	// never served from. On a library where several packs were updated while quarry
+	// stayed open, one scroll pays that once per pack. Answer the miss here instead,
+	// before the cost, rather than after it.
+	if ix.reshipped(archivePath, fp) {
+		return "", reshipError(archivePath)
 	}
 
 	ix.extractMu.Lock()

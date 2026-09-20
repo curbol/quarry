@@ -6,6 +6,8 @@
 
 # The directory quarry scans. This is the one setting with no default: point it at
 # the tree holding your asset packs, whatever their vendor. A leading ~ is expanded.
+# Must be absolute: this file and QUARRY_ROOT both follow you into every directory, so
+# a relative root would mean a different library in each. Use --root for a one-off.
 # Overridden by QUARRY_ROOT and by --root.
 root = "/path/to/your/assets"
 

@@ -171,9 +171,11 @@ type assetsResp struct {
 	Offset int
 	Items  []struct {
 		ID, Name, Category, Ext, Variant, CopyPath string
+		RelPath                                    string
 		Thumb                                      string
 		Size                                       int64
 		RootMotionID                               string `json:"rootMotionId"`
+		BakedMotion                                bool   `json:"bakedMotion"`
 		Count                                      int
 		Width, Height                              int
 		Source                                     sourceJSON

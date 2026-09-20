@@ -20,10 +20,44 @@ export const thumbURL = (id) => '/api/thumb?id=' + encodeURIComponent(id);
 
 // CharRegistry persists to localStorage on the main thread; a worker has none, so it
 // falls back to an in-memory store (its rig cache then lasts the worker's lifetime).
+//
+// How many entries a save keeps belongs to the store rather than to CharRegistry,
+// because the two realms are bounded by different things. STORED_MAX is the page's:
+// one localStorage value, which grows until a save throws and every later one is
+// silently dropped. MEMORY_MAX is the worker's, where there is no quota and the only
+// cost is the linear scan match() makes.
+//
+// The worker's has to be the looser of the two. Its entries are what discoverForVendor
+// found by loading models, and they are work the page cannot redo: the memos recording
+// a scope as already searched live on CharRegistry and survive any eviction. A reseed
+// carries the page's whole list, so at a shared bound one merge pushed every discovered
+// body out permanently and the pack's clips drew the category icon for the session.
+export const STORED_MAX = 40;
+export const MEMORY_MAX = 400;
+
 const memStore = new Map();
+const hasLocalStorage = () => { try { return typeof localStorage !== 'undefined'; } catch { return false; } };
+// Once a write has fallen back to memory, reads have to follow it there. Otherwise the
+// two halves disagree: a setItem that throws — a quota exhausted, a browser with site
+// data blocked, Safari private browsing — sent the write to memStore while get kept
+// reading localStorage and handing back the value from before it, so every save
+// vanished silently and nothing downstream could tell a stored registry from a stale one.
+let degraded = false;
+const fromMemory = (k) => (memStore.has(k) ? memStore.get(k) : null);
 const store = {
-  get(k) { try { return typeof localStorage !== 'undefined' ? localStorage.getItem(k) : (memStore.has(k) ? memStore.get(k) : null); } catch { return memStore.has(k) ? memStore.get(k) : null; } },
-  set(k, v) { try { if (typeof localStorage !== 'undefined') localStorage.setItem(k, v); else memStore.set(k, v); } catch { memStore.set(k, v); } },
+  limit: hasLocalStorage() ? STORED_MAX : MEMORY_MAX,
+  get(k) {
+    if (degraded) return fromMemory(k);
+    try { return typeof localStorage !== 'undefined' ? localStorage.getItem(k) : fromMemory(k); } catch { return fromMemory(k); }
+  },
+  set(k, v) {
+    if (!degraded) {
+      try {
+        if (typeof localStorage !== 'undefined') { localStorage.setItem(k, v); return; }
+      } catch { degraded = true; }
+    }
+    memStore.set(k, v);
+  },
 };
 
 // A skinned character mesh whose bone names cover a clip's tracks can play that clip
@@ -44,7 +78,16 @@ export const CharRegistry = {
       return [];
     }
   },
-  save(l) { try { store.set(this.key, JSON.stringify(l.slice(0, 40))); } catch { /* quota */ } },
+  // Pinned entries are held above the recency trim. add() unshifts on every lightbox
+  // open of a rigged character, so browsing a character library pushes a pinned body
+  // past the bound within one session — and dropping it reverts every clip on that rig
+  // to coverage ranking, which is the one thing pinning exists to override. Order is
+  // read for nothing but tie-breaking, and pinned already wins every tie, so hoisting
+  // them costs nothing.
+  save(l) {
+    const keep = [...l.filter((e) => e.pinned), ...l.filter((e) => !e.pinned)].slice(0, store.limit);
+    try { store.set(this.key, JSON.stringify(keep)); } catch { /* quota */ }
+  },
   // add records a character's rig, most recent first, and reports whether what the
   // matcher can pick actually changed — the order is refreshed on every lightbox open
   // and nothing downstream reads it.
@@ -55,6 +98,12 @@ export const CharRegistry = {
     // rigEntry rebuilds an entry from the model and knows nothing about pinning, so the
     // flag is carried across here. Without it, opening a pinned character un-pins it.
     if (prev && prev.pinned) entry = { ...entry, pinned: true };
+    // The vendor is carried the same way, and for a sharper reason: an entry saved
+    // without one is a wildcard the scope check in match() no longer skips, so a body
+    // re-registered from an item that did not carry its vendor starts auto-matching
+    // every other vendor's clips — in the grid's thumbnails as well as the lightbox.
+    // Re-registration must not be able to widen what an entry already knows.
+    if (prev && prev.vendor && !entry.vendor) entry = { ...entry, vendor: prev.vendor };
     const rest = l.filter((e) => e.id !== entry.id);
     rest.unshift(entry);
     this.save(rest);
@@ -116,7 +165,16 @@ export const CharRegistry = {
 // once every known entry had failed and the other gave up there.
 export async function resolveRig(bones, asset, tryLoad, cancelled) {
   const attempt = async () => {
-    for (let m = CharRegistry.match(bones, asset.vendor, asset.name); m && !cancelled(); m = CharRegistry.match(bones, asset.vendor, asset.name)) {
+    // tried is what bounds the walk, rather than the eviction below. The eviction is
+    // the registry's business and can fail to take — a store whose write does not
+    // land hands match() the same entry forever — and the loop then never advanced:
+    // in the lightbox an unbounded stream of 404s for as long as it stayed open, in
+    // the worker a spin until the card scrolled away, neither stopped by the job
+    // deadline, which only stops a job being waited on. Termination should not depend
+    // on a write.
+    const tried = new Set();
+    for (let m = CharRegistry.match(bones, asset.vendor, asset.name); m && !tried.has(m.id) && !cancelled(); m = CharRegistry.match(bones, asset.vendor, asset.name)) {
+      tried.add(m.id);
       const got = await tryLoad(m);
       if (got) return got;
       if (cancelled()) return null;

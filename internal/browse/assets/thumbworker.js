@@ -39,6 +39,20 @@ const SIZE = 220;
 const canvas = new OffscreenCanvas(SIZE, SIZE);
 let renderer, scene, camera;
 
+// A lost context renders nothing but still resolves convertToBlob, so without this
+// every later thumbnail would come back as a blank image with no error anywhere.
+// Dropping the reference makes the next job build a fresh renderer.
+//
+// Registered once, beside the canvas it listens on, rather than inside ensureRenderer:
+// the canvas is reused for the life of the worker while ensureRenderer runs again after
+// every loss, so registering there left one more listener attached and one more
+// undisposed WebGLRenderer behind on each one.
+canvas.addEventListener?.('webglcontextlost', (e) => {
+  e.preventDefault();
+  if (renderer) renderer.dispose();
+  renderer = null;
+});
+
 // noContext latches a WebGL context this worker will never get: a browser blocklist, no
 // GPU, --disable-gpu without a software fallback. The retry below exists for a
 // transient startup race and cannot tell the two apart, so without the latch every
@@ -68,13 +82,6 @@ async function ensureRenderer() {
       await new Promise((r) => setTimeout(r, 150));
     }
   }
-  // A lost context renders nothing but still resolves convertToBlob, so without this
-  // every later thumbnail would come back as a blank image with no error anywhere.
-  // Dropping the reference makes the next job build a fresh renderer.
-  canvas.addEventListener?.('webglcontextlost', (e) => {
-    e.preventDefault();
-    renderer = null;
-  });
   scene = new THREE.Scene();
   scene.add(new THREE.HemisphereLight(0xffffff, 0x33343a, 2.6));
   const dir = new THREE.DirectionalLight(0xffffff, 2.2);
@@ -141,8 +148,17 @@ async function buildShared(asset, key, current) {
     // disposes the oldest entry outright, and an abandoned job seeding a new one can
     // push out the file the running job is holding.
     if (!current()) return false;
-    pending = loadSharedFile(asset);
-    files.set(key, pending);
+    // A load that rejects is dropped from the cache rather than kept as the answer.
+    // Every clip of a split file shares this key, so a single transient read error
+    // would otherwise be re-thrown instantly for every one of them until six other
+    // files pushed it out — and the page keeps asking, because a failed thumbnail is
+    // deliberately not memoized on the other side of the wire.
+    const p = loadSharedFile(asset).catch((err) => {
+      if (files.get(key) === p) files.delete(key);
+      throw err;
+    });
+    pending = p;
+    files.set(key, p);
     evictFiles();
   }
   const ctx = await pending;
@@ -249,10 +265,15 @@ async function buildPosed(clip, asset, rootRest, current) {
 // during decode, so the full-resolution bitmap is never resident on the main thread —
 // which is the whole point, since a 4096² texture atlas is ~67MB decoded and a page of
 // them is measured in gigabytes.
-async function downscale(asset, signal) {
+async function downscale(asset, signal, current) {
   const res = await fetch(contentURL(asset.id), { signal });
   if (!res.ok) throw new Error('HTTP ' + res.status);
-  const src = await createImageBitmap(await res.blob(), { resizeWidth: SIZE, resizeQuality: 'medium' });
+  const body = await res.blob();
+  // Checked between the download and the decode as well as at the start: a 4096² atlas
+  // is most of a second of decode, and a cancel that lands while the bytes are arriving
+  // has nothing else to stop it.
+  if (current && !current()) throw new DOMException('superseded', 'AbortError');
+  const src = await createImageBitmap(body, { resizeWidth: SIZE, resizeQuality: 'medium' });
   // Its own canvas, not the shared 3D one: this runs off the queue, so drawing onto
   // that canvas would race whatever render is in flight.
   const c = new OffscreenCanvas(src.width, src.height);
@@ -269,6 +290,12 @@ let queue = Promise.resolve();
 // working through a backlog for cards nobody is looking at before it renders what is
 // on screen. See jobtracker.js for why the decision is per request rather than per id.
 const jobs = new JobTracker();
+
+// The in-flight image download per asset id, so a cancel can abort the fetch rather
+// than only discard what it returns. Keyed by id alone, like the tracker: a newer
+// request for the same asset supersedes the older one, and only the newest is live.
+// Entries are removed when the job settles, so this holds only what is running.
+const imageJobs = new Map();
 
 // JOB_TIMEOUT_MS bounds one render. A stalled fetch or a pathological parse would
 // otherwise hold the single queue forever, and every card behind it keeps its spinner
@@ -319,6 +346,17 @@ self.onmessage = (e) => {
   }
   if (e.data.type === 'cancel') {
     jobs.cancel(e.data.id);
+    // The queued path checks current() when it reaches the front, so an abandoned job
+    // costs nothing there. An image job is already in flight by the time a cancel
+    // arrives, and cancelling only its *result* left the fetch and the full-resolution
+    // decode running: a fling past a few hundred texture cards put that many downloads
+    // nobody wants ahead of the dozen now on screen, six connections at a time, and
+    // those cards kept their spinners until the backlog drained.
+    const ac = imageJobs.get(e.data.id);
+    if (ac) {
+      imageJobs.delete(e.data.id);
+      ac.abort();
+    }
     return;
   }
   const { id, seq, asset } = e.data;
@@ -348,9 +386,24 @@ self.onmessage = (e) => {
     // nothing at all — not even the null — so the card keeps its spinner and the main
     // thread's pending entry is never cleared for a later holder to re-ask.
     const ac = new AbortController();
-    withTimeout(downscale(asset, ac.signal), () => ac.abort())
-      .then((blob) => settle(blob))
-      .catch((e) => { reportFailure(asset, e); settle(null, true); });
+    // A second request for the same asset supersedes the first, and the tracker already
+    // stops the older one posting. Its download is what is left: without this, asking
+    // again while the first is in flight leaks exactly the fetch a cancel now aborts.
+    const prev = imageJobs.get(id);
+    imageJobs.set(id, ac);
+    if (prev) prev.abort();
+    const done = () => { if (imageJobs.get(id) === ac) imageJobs.delete(id); };
+    withTimeout(downscale(asset, ac.signal, current), () => ac.abort())
+      .then((blob) => { done(); settle(blob); })
+      .catch((e) => {
+        done();
+        // A cancelled job posts nothing, exactly as the queued path does. Reported as
+        // a failure it would reach the page as failed:true, and a card scrolled back
+        // into view would be told this asset has no thumbnail.
+        if (ac.signal.aborted && !jobs.isCurrent(id, seq)) return;
+        reportFailure(asset, e);
+        settle(null, true);
+      });
     return;
   }
   queue = queue.then(async () => {

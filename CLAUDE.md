@@ -22,11 +22,11 @@ gofmt -l .                      # list unformatted files
 ```
 
 The frontend's pure decisions — the grid's card recycling, the thumbnail worker's job
-dispatch, which renders stay resident and which object URLs that releases, what the
-preview-character registry holds, matching a mesh-less clip to a rig, folding a tag edit
-into a card, and deciding where a padded clip actually stops — are checked separately,
-because a mistake in any of them leaves the UI working and merely slow, leaking, or
-subtly wrong:
+dispatch, which renders stay resident and which object URLs that releases, which fonts a
+scroll may drop, what the preview-character registry holds, matching a mesh-less clip to
+a rig, folding a tag edit into a card, and deciding where a padded clip actually stops —
+are checked separately, because a mistake in any of them leaves the UI working and
+merely slow, leaking, or subtly wrong:
 
 ```bash
 node --test 'internal/browse/jstest/*.test.mjs'
@@ -49,10 +49,11 @@ packages, each with a package doc comment stating its contract:
 - `config` — resolves settings by precedence: `config.toml` → env (`QUARRY_ROOT`) →
   flags. Config dir and cache dir are XDG-resolved (`ResolveDir`, `ResolveCacheDir`,
   both of which report failure rather than falling back to a cwd-relative name). The
-  scan root has **no default**: an unset root is an error, never a guess at cwd. An
-  unreadable `config.toml`, or one setting a key this version does not know, is an
-  error too — a silently ignored `follow_symlinks` typo is a drive missing from the
-  index with nothing said about it.
+  scan root has **no default**: an unset root is an error, never a guess at cwd, and a
+  relative one from either persistent source is an error as well. An unreadable
+  `config.toml`, or one setting a key this version does not know, is an error too — a
+  silently ignored `follow_symlinks` typo is a drive missing from the index with
+  nothing said about it.
 - `assetindex` — scans the library into a searchable index, seeing inside `.zip` and
   `.unitypackage` archives as well as loose files, and splitting a multi-animation
   `.glb` (a Quaternius-style animation library) into one virtual per-clip asset that
@@ -62,23 +63,26 @@ packages, each with a package doc comment stating its contract:
   thumbnail on demand. It also assembles Synty **Sidekick** modular characters: a
   Sidekick pack ships no whole-character mesh, so `sidekick.go` parses each `.sk`
   definition, upgrades its entry into a character asset (`ThumbSidekick`,
-  `Source.Parts` = the part FBX ids), and drops the per-character byproducts — matched
-  by the character's own name as well as its directory, since two characters commonly
-  share one. HTTP-free — the `browse` server queries it.
-- `browse` — serves the web UI, querying an `assetindex.Index` and streaming asset
-  bytes and thumbnails (three.js 3D previews, copy-path). Its frontend is plain ES
-  modules under `assets/`, no build step: `app.js` is the page (grid, search, filters,
-  tagging), `viewer.js` the lightbox's 3D preview and the only three.js consumer on the
-  main thread, `thumbs.js` the three caches a scroll has to keep bounded (rendered
-  thumbnails, registered fonts, deferred per-card work), `scene.js` the model/clip
-  helpers the page shares with `thumbworker.js`, and `gridwindow.js` / `jobtracker.js` /
-  `rigmatch.js` / `tagedit.js` / `cliptrim.js` / `thumbcache.js` / `charstore.js` the
-  pure decisions the Node tests cover — all seven THREE-free precisely so they can be,
-  and the first six import nothing at all, `charstore.js` only `./rigmatch.js`. That is
-  also why `resolveRig` lives in `charstore.js` rather than beside the loaders it drives:
-  it is control flow over the registry and two injected callbacks, and its eviction rule
-  is exactly the kind of thing that fails silently. `app.js`'s static import graph reaches none
-  of the 3D stack: it takes `contentURL` / `thumbURL` and the character registry from
+  `Source.Parts` = the part FBX ids, `Source.Complete` = every part it named resolved),
+  and drops the per-character byproducts — matched by the character's own name as well
+  as its directory, since two characters commonly share one, and dropped on both sides
+  of a pack unpacked beside itself, which is why `Source.Complete` is indexed rather
+  than recomputed. HTTP-free — the `browse` server queries it.
+- `browse` — serves the web UI, querying an `assetindex.Index` and streaming asset bytes
+  and thumbnails (three.js 3D previews, copy-path). Its frontend is plain ES modules
+  under `assets/`, no build step: `app.js` is the page (grid, search, filters, tagging),
+  `viewer.js` the lightbox's 3D preview and the only three.js consumer on the main
+  thread, `thumbs.js` what the browser will not release on its own — rendered
+  thumbnails, registered fonts, observed nodes — bound to the DOM that holds them,
+  `scene.js` the model/clip helpers the page shares with `thumbworker.js`, and
+  `gridwindow.js` / `jobtracker.js` / `rigmatch.js` / `tagedit.js` / `cliptrim.js` /
+  `thumbcache.js` / `fontcache.js` / `charstore.js` the pure decisions the Node tests
+  cover — all eight THREE-free precisely so they can be, and the first seven import
+  nothing at all, `charstore.js` only `./rigmatch.js`. That is also why `resolveRig`
+  lives in `charstore.js` rather than beside the loaders it drives: it is control flow
+  over the registry and two injected callbacks, and its eviction rule is exactly the
+  kind of thing that fails silently. `app.js`'s static import graph reaches none of the
+  3D stack: it takes `contentURL` / `thumbURL` and the character registry from
   `charstore.js`, and loads `viewer.js` with a dynamic `import()` when a lightbox first
   needs one, so the grid's first request does not wait on three.js. `includeRelated=1`
   folds each tag match's linked companions into results; `/api/link` and `/api/related`
@@ -117,6 +121,24 @@ packages, each with a package doc comment stating its contract:
   run that has to be caught is the first one, when the cache dir does not exist yet.
   Under `--follow-symlinks` the same refusal covers every target the walk followed,
   which is only known once it has.
+- **An archive entry is read as a path, not as a name.** Older Windows zip tooling
+  writes `\` as the separator, and taken literally such an entry is one long segment:
+  the card is named for its whole internal path, the classifier's `/`, `_`, `:`
+  boundaries never fire, a dot-directory inside it is not recognised, and no extracted
+  twin can produce the same dedup key. `zip.entryPath` normalizes once and
+  `Source.EntryPath` is what everything treating an entry as a path uses;
+  `Source.Entry` keeps the stored spelling, because that is the key the central
+  directory resolves.
+- **The scan root is absolute, and has no default.** An unset root is an error, never a
+  guess at cwd; a relative one from `config.toml` or `QUARRY_ROOT` is an error too,
+  because both follow the user into every directory and would mean a different library
+  in each. A relative `--root` is the deliberate exception: one invocation saying
+  "here".
+- **A library's bytes are served under an inert content type, with `nosniff`.** A pack
+  ships whatever its author put in it, and a response the browser will run as a
+  document runs it in this server's origin — where both write guards step aside by
+  design. `contentType` must stay free of `image/svg+xml` and every other scriptable
+  type.
 - **Tagging is never silently off.** With no project store discoverable, the
   user-wide store in the config dir is used. `browse.Serve` still honors an empty
   `tagsPath` as "disabled" so the package stays usable that way, but the CLI never

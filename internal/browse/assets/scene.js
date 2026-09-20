@@ -4,7 +4,7 @@
 // (which has no import map); it is the same file the document's import map points
 // "three" at, so a single three instance is shared across both.
 import * as THREE from '/static/vendor/three/three.module.min.js';
-import { clipsForAsset, clipsMatching, coversBones, nameSeries, packRigCandidates, searchedSkeleton, stackedCharacter, storedBindFits } from '/static/rigmatch.js';
+import { clipAcross, clipsForAsset, clipsMatching, coversBones, nameSeries, packRigCandidates, pairClipsByName, searchedSkeleton, stackedCharacter, storedBindFits, togglePairable } from '/static/rigmatch.js';
 import { trimmedDuration } from '/static/cliptrim.js';
 import { CharRegistry, contentURL, resolveRig, thumbURL } from '/static/charstore.js';
 import { GLTFLoader } from '/static/vendor/three/jsm/loaders/GLTFLoader.js';
@@ -847,7 +847,7 @@ Object.assign(CharRegistry, {
 export { CharRegistry, contentURL, resolveRig, thumbURL };
 
 export {
-  clipsForAsset, coversBones,
+  clipsForAsset, coversBones, pairClipsByName, clipAcross, togglePairable,
   loadModel, loadSidekick, normalizeClip, boneNames, clipBones, loadRMClips, isSynty,
   posedBox, frameBox, isRenderable, captureRootRest, uprightRig, prepareClipRig,
   cloneRig, oneCharacter, alignBindToRest, hideAlternates, poseAt, retargetedFor, stripRootMotion, dispose, disposeClone, rigEntry, rigCandidates, CLAY, _posedV,

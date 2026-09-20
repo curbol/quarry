@@ -110,22 +110,27 @@ func buildRootMotionPairs(assets []assetindex.Asset) (sibling map[string]string,
 		// no such pair anywhere in the group, and there the unrestricted weighting is
 		// what makes the layout pair at all.
 		//
-		// Asked per container format, because that is the granularity pickRM chooses at:
-		// one pack can ship its FBX copies beside their RM and split its GLB copies
-		// across folders, and a group-wide answer lets the FBX pair — which the GLB
-		// clips can never select — decide that the GLB ones have no sibling.
-		sameDirFor := map[string]bool{}
+		// Asked per container format and per archive, because that is the granularity
+		// pickRM chooses at: one pack can ship its FBX copies beside their RM and split
+		// its GLB copies across folders, and a group-wide answer lets the FBX pair —
+		// which the GLB clips can never select — decide that the GLB ones have no
+		// sibling. The archive is the same argument one step further in: one pack
+		// commonly ships as both a SourceFiles zip and a unitypackage whose internal
+		// layouts differ, and an answer read across both lets the one that keeps its RM
+		// beside the clip decide that the one that does not has no sibling at all.
+		sameDirFor := map[probeKey]bool{}
 		for _, ni := range g.nonRM {
 			a := assets[ni]
 			if a.Category != assetindex.CategoryAnimation {
 				continue
 			}
-			sameDir, asked := sameDirFor[a.Ext]
+			k := probeKey{ext: a.Ext, archive: a.Source.ArchivePath}
+			sameDir, asked := sameDirFor[k]
 			if !asked {
-				sameDir = groupPairsByDirectory(assets, g.nonRM, g.rm, a.Ext)
-				sameDirFor[a.Ext] = sameDir
+				sameDir = groupPairsByDirectory(assets, g.nonRM, g.rm, k)
+				sameDirFor[k] = sameDir
 			}
-			if rmID := pickRM(assets, g.rm, a, sameDir); rmID != "" {
+			if rmID := pickRM(assets, g.nonRM, g.rm, a, sameDir); rmID != "" {
 				sibling[a.ID] = rmID
 				suppressed[rmID] = true
 			}
@@ -134,17 +139,35 @@ func buildRootMotionPairs(assets []assetindex.Asset) (sibling map[string]string,
 	return sibling, suppressed
 }
 
+// probeKey is the scope the same-directory question is asked over: one container format
+// inside one archive. The format half is also a hard filter in pickRM; the archive half
+// is not — there it is only the low bit of the score, so a better-placed RM in another
+// archive still wins (see TestPickRMRanksDirectoryAboveArchive). The question is asked
+// per archive anyway because the layout it asks about is a property of one archive's
+// internal tree: one pack commonly ships as both a SourceFiles zip and a unitypackage
+// whose trees differ, and an answer read across both lets the one that keeps its RM
+// beside the clip decide that the one that does not has no sibling at all.
+type probeKey struct{ ext, archive string }
+
+// holds reports whether a is inside the scope k.
+func (k probeKey) holds(a assetindex.Asset) bool {
+	return a.Ext == k.ext && a.Source.ArchivePath == k.archive
+}
+
 // groupPairsByDirectory reports whether any in-place asset in the group has an RM in
-// its own directory, over the pairs that could actually be made in container format
-// ext. See buildRootMotionPairs for why that is decided per group and per format.
+// its own directory, over the pairs that could actually be made inside scope k. See
+// buildRootMotionPairs for why that is decided per group, per format and per archive.
 //
-// Both sides are narrowed to what pickRM would consider: an RM of another extension is
-// never selected, and a non-animation is never paired at all, so counting either would
-// let a pair nobody can make decide that a pair somebody can make is cross-directory.
-func groupPairsByDirectory(assets []assetindex.Asset, nonRM, rm []int, ext string) bool {
+// Both sides are narrowed to the scope whose layout is being asked about, which is also
+// what pickRM would consider: an RM of another extension is never selected at all, a
+// non-animation is never paired, and an RM in another archive answers a different
+// archive's layout question. Counting any of them would let a pair nobody can make, or
+// one made under another tree's rules, decide that a pair somebody can make is
+// cross-directory.
+func groupPairsByDirectory(assets []assetindex.Asset, nonRM, rm []int, k probeKey) bool {
 	dirs := make(map[string]bool, len(rm))
 	for _, ri := range rm {
-		if assets[ri].Ext != ext {
+		if !k.holds(assets[ri]) {
 			continue
 		}
 		d, _ := entryParts(assets[ri].Source)
@@ -152,7 +175,7 @@ func groupPairsByDirectory(assets []assetindex.Asset, nonRM, rm []int, ext strin
 	}
 	for _, ni := range nonRM {
 		a := assets[ni]
-		if a.Ext != ext || a.Category != assetindex.CategoryAnimation {
+		if !k.holds(a) || a.Category != assetindex.CategoryAnimation {
 			continue
 		}
 		if d, _ := entryParts(a.Source); dirs[d] {
@@ -224,7 +247,13 @@ func splitDir(s assetindex.Source, dir string) []string {
 // the archive alone every candidate ties and the first one found wins for every card in
 // the group. The score packs the two terms so affinity dominates and the archive breaks
 // its ties, rather than the two being summed into a tie again.
-func pickRM(assets []assetindex.Asset, rm []int, nonRM assetindex.Asset, sameDirOnly bool) string {
+//
+// Ranking is not enough on its own, though, which is what bestClaim covers: ranking
+// only orders the candidates this card can see, and with one candidate left it takes it
+// however distant. So a card is also held to the best any card in the group reaches
+// with that RM — the same "it belongs to someone else" rule the directory filter
+// applies, one rung down and reachable where that filter is not.
+func pickRM(assets []assetindex.Asset, nonRMIdx, rm []int, nonRM assetindex.Asset, sameDirOnly bool) string {
 	best, bestScore := "", -1
 	nonDir, _ := entryParts(nonRM.Source)
 	for _, ri := range rm {
@@ -235,12 +264,43 @@ func pickRM(assets []assetindex.Asset, rm []int, nonRM assetindex.Asset, sameDir
 		if rDir, _ := entryParts(r.Source); sameDirOnly && rDir != nonDir {
 			continue
 		}
-		score := dirAffinity(nonRM.Source, r.Source) << 1
+		aff := dirAffinity(nonRM.Source, r.Source)
+		if aff < bestClaim(assets, nonRMIdx, r) {
+			continue
+		}
+		score := aff << 1
 		if r.Source.ArchivePath == nonRM.Source.ArchivePath {
 			score++
 		}
 		if score > bestScore {
 			best, bestScore = r.ID, score
+		}
+	}
+	return best
+}
+
+// bestClaim is the highest directory affinity any in-place asset in the group reaches
+// with r. A card below it is not the card r belongs to, so it takes nothing rather
+// than the better-matched card's sibling.
+//
+// This is the same rule the same-directory filter applies, one rung down, and it is
+// what covers the layout that filter cannot see. A pack mirroring per-character folders
+// under one root-motion tree puts no RM in any card's own directory, so sameDirOnly is
+// false and affinity alone separates the characters — but only while every character
+// ships an RM. Root-motion variants usually exist for locomotion and not much else, so
+// a group where one character's RM is missing is ordinary, and there every remaining
+// candidate is equally distant from it. Without this, that card scores 1 on the archive
+// term alone and takes a *different character's* travel animation: a file that loads,
+// clips that play, and nothing anywhere to say the body is wrong.
+func bestClaim(assets []assetindex.Asset, nonRM []int, r assetindex.Asset) int {
+	best := 0
+	for _, ni := range nonRM {
+		a := assets[ni]
+		if a.Ext != r.Ext || a.Category != assetindex.CategoryAnimation {
+			continue
+		}
+		if n := dirAffinity(a.Source, r.Source); n > best {
+			best = n
 		}
 	}
 	return best

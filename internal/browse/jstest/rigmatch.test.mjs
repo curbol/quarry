@@ -9,9 +9,30 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  clipsForAsset, clipsMatching, coversBones, matchRig, nameSeries, packRigCandidates, searchedSkeleton,
-  stackedCharacter, storedBindFits, hasNamedBody,
+  clipsForAsset, clipsMatching, coversBones, matchRig, nameSeries, packRigCandidates, pairClipsByName,
+  searchedSkeleton, stackedCharacter, storedBindFits, hasNamedBody, clipAcross, togglePairable,
 } from '../assets/rigmatch.js';
+
+// The two steps between a correct pairing and what the toggle actually plays. Both read
+// the mapping *from* the side being left, and both fail the same way pairClipsByName
+// does: silently, as a clip that loads on the right body and is the wrong animation.
+test('the toggle lands on the counterpart, and holds position when there is none', () => {
+  assert.equal(clipAcross([2, 0, 1], 0), 2);
+  assert.equal(clipAcross([2, -1, 1], 1), 1, 'no counterpart: stay where we are rather than fall to the first');
+  assert.equal(clipAcross([], 3), 3, 'an unsplit sibling is reachable at the same index');
+  assert.equal(clipAcross(undefined, 3), 3);
+  assert.equal(clipAcross([0, 1, 2], 9), 9, 'a clip past the end of the mapping');
+});
+
+test('the toggle is offered only where the other side has the clip', () => {
+  assert.equal(togglePairable([2, -1, 1], 0), true);
+  assert.equal(togglePairable([2, -1, 1], 1), false, 'a clip with no travel variant must not offer one');
+  // An empty mapping is a whole animation file on the other side — nothing was split,
+  // so every clip is reachable and the toggle stands.
+  assert.equal(togglePairable([], 0), true);
+  assert.equal(togglePairable(undefined, 0), true);
+  assert.equal(togglePairable([0, 1], 5), false, 'past the end is not a counterpart');
+});
 
 const clips = (...names) => names.map((name) => ({ name }));
 const forClip = (clip, clipIndex) => ({ source: clipIndex === undefined ? { clip } : { clip, clipIndex } });
@@ -143,6 +164,21 @@ test('a legacy multi-skeleton showcase entry is skipped', () => {
   assert.equal(matchRig([slight], clip, 'synty').id, 'slight');
 });
 
+// The two cases above sit at 3.0x and 1.25x, which leaves the whole of (1.25, 3.0]
+// free: the constant could drift anywhere in there with both assertions green, and
+// what that costs is a showcase mesh quietly winning matches — a plausible body, the
+// wrong one, on every clip of the pack. Straddled instead, one either side.
+test('the multi-skeleton cutoff sits between 1.35x and 1.45x', () => {
+  const clip = bones(20);
+  // 27 names over 20 distinct: 1.35x, under the cutoff, still a body.
+  const under = entry({ id: 'under', vendor: 'synty', bones: [...clip, ...clip.slice(0, 7)] });
+  const got = matchRig([under], clip, 'synty');
+  assert.ok(got && got.id === 'under', `1.35x was rejected: ${JSON.stringify(got)}`);
+  // 29 over 20: 1.45x, past it.
+  const over = entry({ id: 'over', vendor: 'synty', bones: [...clip, ...clip.slice(0, 9)] });
+  assert.equal(matchRig([over], clip, 'synty'), null, '1.45x was accepted');
+});
+
 test('no bones, no entries, no match', () => {
   assert.equal(matchRig([entry({ id: 'a', bones: bones(20) })], [], 'synty'), null);
   assert.equal(matchRig([], bones(20), 'synty'), null);
@@ -160,6 +196,23 @@ test('a skeleton sharing no bone with one already searched for is searched on it
   assert.equal(searchedSkeleton([unity], unity), true);
   assert.equal(searchedSkeleton([unity], unreal), false);
   assert.equal(searchedSkeleton([unity, unreal], unreal), true);
+});
+
+// Sameness is deliberately not a subset test in one direction only: a pack's partial
+// clips (upper body, face) drive a strict subset of the bones its full-body clips do,
+// and both read as the same skeleton here — which is the answer that wants to be given,
+// since a search over that pack found the same nothing either way and repeating it per
+// clip is what the memo exists to avoid. The two sets that must stay apart are two
+// *skeletons*, and those share no bone name at all (the test above). Straddled from
+// both sides, because the thresholds are asymmetric and a one-sided test would pass
+// while the other direction started re-searching every partial clip in a pack.
+test('a subset of an already-searched skeleton is the same skeleton once it is most of it', () => {
+  const full = bones(70);
+  assert.equal(searchedSkeleton([full], full.slice(0, 45)), true, 'a partial clip driving most of the searched skeleton');
+  assert.equal(searchedSkeleton([full], full.slice(0, 40)), false, 'one driving too little of it is searched on its own');
+  // The other way round has no such floor: a clip richer than the set already searched
+  // is still that skeleton, and nothing new would be found by looking again.
+  assert.equal(searchedSkeleton([full.slice(0, 40)], full), true);
 });
 
 // Nothing searched for yet: the first clip of a pack has to reach the search.
@@ -350,4 +403,57 @@ test('a clip with no name asks for nothing', () => {
   assert.equal(hasNamedBody([], 'kevdev', ''), true);
   assert.equal(hasNamedBody([], 'kevdev', null), true);
   assert.equal(hasNamedBody(null, 'kevdev', 'HumanM@Idle.fbx'), false);
+});
+
+// The root-motion toggle swaps between a file's clips and the same clips in its
+// root-motion sibling. A card for a whole animation file carries no clip name, so
+// clipsMatching hands back every clip the sibling holds and the two lists share
+// neither length nor order — swapping by position played whichever animation sat at
+// that index and presented it as this one's travel variant.
+const clip = (name) => ({ name });
+
+test('clips pair by animation, not by position', () => {
+  const inPlace = [clip('Walk'), clip('Run'), clip('Idle')];
+  const motion = [clip('Idle'), clip('Walk'), clip('Run')];
+  assert.deepEqual(pairClipsByName(inPlace, motion), [1, 2, 0]);
+  assert.deepEqual(pairClipsByName(motion, inPlace), [2, 0, 1]);
+});
+
+// FBX exporters prefix a take name; glTF does not. clipsForAsset and clipsMatching
+// already compare this way, so a pair exported by the two tools still lines up.
+test('the FBX take prefix is not part of the name', () => {
+  assert.deepEqual(pairClipsByName([clip('Take 001|Walk')], [clip('Walk')]), [0]);
+  assert.deepEqual(pairClipsByName([clip('Walk')], [clip('mixamo.com|Walk')]), [0]);
+});
+
+// A sibling need not carry every animation of the file it pairs with: root-motion
+// variants usually exist for locomotion and not much else. The clip with no
+// counterpart must report none rather than borrow a neighbour's.
+test('a clip the sibling does not carry pairs with nothing', () => {
+  const got = pairClipsByName([clip('Walk'), clip('Wave')], [clip('Walk')]);
+  assert.deepEqual(got, [0, -1]);
+});
+
+// Position is evidence only where nothing else is: two files of the same length whose
+// takes were exported unnamed, or renamed wholesale, are still the same animations in
+// the same order. A partial name match is not that case — there the -1s stand.
+test('position is the fallback only when no name matches and the counts agree', () => {
+  assert.deepEqual(pairClipsByName([clip('a'), clip('b')], [clip('x'), clip('y')]), [0, 1]);
+  assert.deepEqual(pairClipsByName([clip('a'), clip('b')], [clip('x')]), [-1, -1]);
+  assert.deepEqual(pairClipsByName([clip('a'), clip('b')], [clip('a'), clip('y')]), [0, -1],
+    'a partial match must not fall back to position for the rest');
+});
+
+// Two clips under one name — or two unnamed ones, which is the same thing here — must
+// pair off in order. Sending both to the first match is the position bug again, wearing
+// a name: the second clip's toggle would play the first one's travel variant.
+test('a repeated name is consumed, not handed out twice', () => {
+  assert.deepEqual(pairClipsByName([clip(''), clip('')], [clip(''), clip('')]), [0, 1]);
+  assert.deepEqual(pairClipsByName([clip('Walk'), clip('Walk')], [clip('Walk'), clip('Walk')]), [0, 1]);
+  assert.deepEqual(pairClipsByName([clip('Walk'), clip('Walk')], [clip('Walk')]), [0, -1]);
+});
+
+test('an absent list pairs with nothing rather than throwing', () => {
+  assert.deepEqual(pairClipsByName(null, [clip('a')]), []);
+  assert.deepEqual(pairClipsByName([clip('a')], null), [-1]);
 });

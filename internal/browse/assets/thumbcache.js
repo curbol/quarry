@@ -103,6 +103,11 @@ export class ThumbCache {
     // Overwriting the key alone would leave the old URL alive with nothing tracking it,
     // outside the bound entirely.
     if (prev !== undefined && prev !== url) stale.push(prev);
+    // Deleted before it is set, because Map.set on a key already present leaves its
+    // insertion order where it was — and insertion order is eviction order here. A
+    // re-render would otherwise arrive as the newest thumbnail holding the oldest slot,
+    // and age out on a position the scroll has long since come back past.
+    this.cache.delete(id);
     this.cache.set(id, url);
     while (this.cache.size > this.cacheMax) {
       const oldest = this.cache.keys().next().value;

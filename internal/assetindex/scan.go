@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // versionSuffix matches a trailing Synty version token like "_v3" or "_v1_1_3".
@@ -86,7 +87,13 @@ type libEntry struct {
 	pack    string
 	name    string
 	variant string // archives only
-	size    int64  // loose only
+	size    int64
+	// The stat the walk already took, for every kind. fingerprint() is path + size +
+	// mtime and nothing else, so carrying these is what saves refresh a second stat of
+	// every file in the library — ~150k syscalls on the path the user waits on — and
+	// leaves one reading of a file's stat rather than two that can disagree about a
+	// file changing between them.
+	modTime time.Time
 }
 
 // walkLibrary enumerates the browseable files under absRoot without opening any
@@ -280,14 +287,14 @@ func (w *walker) file(p, r, name string, info os.FileInfo) {
 		return
 	}
 	vendor, pack := vendorPack(r)
-	e := libEntry{path: p, rel: r, vendor: vendor, pack: pack, name: name}
+	e := libEntry{path: p, rel: r, vendor: vendor, pack: pack, name: name, size: info.Size(), modTime: info.ModTime()}
 	switch ext {
 	case "zip":
 		e.kind, e.variant = SourceZip, deriveVariant(pack, name)
 	case "unitypackage":
 		e.kind, e.variant = SourceUnityPackage, deriveVariant(pack, name)
 	default:
-		e.kind, e.size = SourceLoose, info.Size()
+		e.kind = SourceLoose
 	}
 	w.entries = append(w.entries, e)
 }
@@ -528,7 +535,15 @@ func vendorPack(rel string) (vendor, pack string) {
 // property of the pair, not of the archive: the loose twin can be deleted while the
 // archive's stat print stays identical, and an incremental refresh that kept only
 // the survivors would reuse the suppression along with them and lose the asset.
+//
+// It is also where an assembled Sidekick character's byproducts are dropped on the
+// loose side. applySidekick drops them inside the package it can read the .sk out of;
+// a pack unpacked beside itself puts the same files in the library as loose ones,
+// which are not archive entries and so are invisible to the rule above — leaving the
+// grid showing every character alongside the prefab, material and combined mesh it
+// exists instead of.
 func dedup(assets []Asset) (kept, dropped []Asset) {
+	chars := sidekickChars(assets)
 	looseKeys := make(map[string]struct{})
 	// An assembled character has no bytes of its own and reaches its part meshes by id,
 	// which only resolves for an asset the index kept. Suppressing a part in favour of a
@@ -544,6 +559,10 @@ func dedup(assets []Asset) (kept, dropped []Asset) {
 	}
 	for _, a := range assets {
 		if a.Source.Kind == SourceLoose {
+			if sidekickByproduct(a, chars) {
+				dropped = append(dropped, a)
+				continue
+			}
 			kept = append(kept, a)
 			continue
 		}

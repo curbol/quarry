@@ -154,6 +154,24 @@ test('needsRebuild is driven by margin, not by movement', () => {
   );
 });
 
+// A rebuild has to leave the margin it was fired for, or it is immediately due again.
+// wantedRange centring the window is what supplies that, and nothing else asserts it
+// directly: a version that stopped centring — biasing the window down the list, say —
+// would still pass the rebuild-count test (which measures the common direction) and the
+// margin test above (which is about SLACK, not about where the window lands).
+test('a rebuild leaves the margin on both sides that made it due', () => {
+  const at = (row) => ({ scrollTop: row * ROW_H, rowH: ROW_H, cols: COLS, total: BIG });
+  // Away from both ends, where the margin is genuinely available on both sides.
+  for (const row of [200, 1000, 5000, 20000]) {
+    const live = wantedRange({ ...at(row), size: LIVE });
+    const view = visibleRange({ ...at(row), viewportH: VIEWPORT_H });
+    assert.equal(
+      needsRebuild({ live, view, total: BIG }), false,
+      `a rebuild at row ${row} landed on a window that is already due again: live ${live.start}-${live.end}, view ${view.start}-${view.end}`,
+    );
+  }
+});
+
 test('SLACK leaves room to scroll before the rebuild is due', () => {
   // A rebuild that fired with less than a screenful in hand would be visible as a
   // stutter, so the margin has to exceed what one viewport can cross.

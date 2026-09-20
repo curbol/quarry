@@ -437,3 +437,47 @@ func TestOverlappingSymlinkTargetsAreWalkedOnce(t *testing.T) {
 		})
 	}
 }
+
+// A library assembled across drives loses one the moment a drive is not mounted, and
+// what is left behind is a link whose target cannot be resolved at all. That is the
+// ordinary failure for this layout rather than an exotic one, and it is the one drop
+// path in walker.symlink with no test: every other reason a link is dropped is pinned,
+// so an EvalSymlinks error that stopped recording a skip — or that aborted the walk
+// instead — would leave a whole drive missing from the index with nothing said, which
+// is exactly what the skip exists to prevent.
+func TestADanglingSymlinkIsReportedNotSilentlyDropped(t *testing.T) {
+	for _, follow := range []bool{false, true} {
+		name := "unfollowed"
+		if follow {
+			name = "followed"
+		}
+		t.Run(name, func(t *testing.T) {
+			root, mk := libRoot(t)
+			os.WriteFile(mk("synty", "Real", "axe.glb"), []byte("GLBBYTES"), 0o644)
+			gone := filepath.Join(t.TempDir(), "unmounted-drive")
+			if err := os.Symlink(gone, filepath.Join(root, "synty", "Linked")); err != nil {
+				t.Skipf("symlinks unavailable: %v", err)
+			}
+
+			ix, err := Build(Options{Root: root, CacheDir: t.TempDir(), FollowSymlinks: follow})
+			if err != nil {
+				t.Fatalf("a dangling link aborted the whole scan: %v", err)
+			}
+			if len(ix.Assets) != 1 || ix.Assets[0].Name != "axe.glb" {
+				t.Errorf("assets = %v, want the one real file: the rest of the library still indexes", names(ix.Assets))
+			}
+			var skipped *SkippedFile
+			for i := range ix.Skipped {
+				if strings.Contains(ix.Skipped[i].RelPath, "Linked") {
+					skipped = &ix.Skipped[i]
+				}
+			}
+			if skipped == nil {
+				t.Fatalf("nothing recorded for the dangling link; a whole drive goes missing without a word. skipped=%v", ix.Skipped)
+			}
+			if skipped.Reason == "" {
+				t.Error("the skip carries no reason, so the warning says only that something was skipped")
+			}
+		})
+	}
+}

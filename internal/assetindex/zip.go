@@ -16,8 +16,9 @@ import (
 // alongside ErrInsecurePath — for an entry with a non-local name or a backslash in it,
 // which is what older Windows zip tooling emits — and the stdlib says outright that a
 // program willing to accept such names should ignore the error and use the reader.
-// safeEntry is that willingness, and it is the stronger rule: it drops the offending
-// entries and keeps the rest of the archive.
+// entryPath and safeEntry are that willingness: the backslash spelling is read as the
+// path it is, a name that still escapes its archive after that is dropped, and the rest
+// of the archive is kept either way.
 //
 // Treating it as a failure instead dropped every safe entry in the archive too, and
 // leaked the returned reader's descriptor, once per archive per scan and once per
@@ -31,9 +32,26 @@ func openZip(archivePath string) (*zip.ReadCloser, error) {
 	return zr, nil
 }
 
+// entryPath reads an archive entry name as the path it means. archive/zip stores
+// whatever the writer put in the header, and older Windows tooling writes "\" as the
+// separator — the spelling archive/zip itself flags as insecure. Taken literally such a
+// name is one long segment, and every rule that reads an entry as a path then misses:
+// the card is named for its whole internal path, textures and UI files land in the
+// plain image facet because the classifier's boundaries are "/", "_" and ":", a
+// dot-directory inside it is not recognised as one so the packed tree indexes
+// differently from the extracted one, and no loose twin can ever produce the same dedup
+// key. Normalizing once here is what keeps all four reading the same path.
+//
+// Source.Entry keeps the stored spelling, because that is the key the central directory
+// resolves; Source.EntryPath is this, and is what everything treating an entry as a
+// path uses.
+func entryPath(name string) string { return strings.ReplaceAll(name, `\`, "/") }
+
 // safeEntry rejects archive entry names that are absolute or escape their archive
 // via "..". Such names never enter the index, so the content API can never be
-// tricked into serving a path outside the archive.
+// tricked into serving a path outside the archive. It is applied to entryPath's
+// reading of a name, never the raw one: a "..\..\x" written the Windows way is the
+// same escape as "../../x" and has to be refused as one.
 func safeEntry(name string) bool {
 	if name == "" || path.IsAbs(name) || strings.HasPrefix(name, "/") {
 		return false
@@ -44,6 +62,13 @@ func safeEntry(name string) bool {
 		}
 	}
 	return true
+}
+
+// isDir reports a directory entry, over both spellings a writer may use to mark one.
+// p is the entry read as a path; f carries the MS-DOS attribute word, which is the
+// half archive/zip can read on its own.
+func isDir(f *zip.File, p string) bool {
+	return f.FileInfo().IsDir() || strings.HasSuffix(p, "/")
 }
 
 // zipAssets enumerates the files inside a .zip as assets. Directory entries and
@@ -63,14 +88,25 @@ func zipAssets(archivePath, displayRel, vendor, pack, variant string) ([]Asset, 
 	// and so tagging what the user is not looking at.
 	seen := make(map[string]bool, len(zr.File))
 	for _, f := range zr.File {
-		if f.FileInfo().IsDir() || !safeEntry(f.Name) || skipEntry(f.Name) || seen[f.Name] {
+		// Deduped on the stored name rather than on the path it reads as: two entries
+		// spelled differently are two distinct members, each retrievable by its own
+		// exact name, and collapsing them would lose one.
+		p := entryPath(f.Name)
+		// isDir asks the normalised path, not the stored name, for the same reason
+		// every other rule on this line does: archive/zip reads a directory off the
+		// MS-DOS attribute word or a trailing "/" in the stored name, and neither
+		// fires for the backslash spelling entryPath exists to handle. Such an entry
+		// became a card named for its last segment, sized 0, classified "other", and
+		// fingerprinted crc32:0:0 — the print every genuinely empty entry in the
+		// library shares, so tagging the phantom tagged all of them.
+		if isDir(f, p) || !safeEntry(p) || skipEntry(p) || seen[f.Name] {
 			continue
 		}
 		seen[f.Name] = true
 		src := Source{Kind: SourceZip, ArchivePath: archivePath, Entry: f.Name}
 		a := newAsset(src,
-			path.Base(f.Name),
-			archiveRel(displayRel, f.Name),
+			path.Base(p),
+			archiveRel(displayRel, p),
 			vendor, pack, variant,
 			int64(f.UncompressedSize64),
 			crcFingerprint(f.CRC32, int64(f.UncompressedSize64)),
@@ -84,7 +120,7 @@ func zipAssets(archivePath, displayRel, vendor, pack, variant string) ([]Asset, 
 // openZipEntry streams one entry's bytes by exact-name match. The name comes from
 // an indexed asset (never raw client input), and is re-validated defensively.
 func (ix *Index) openZipEntry(archivePath, entry string) (io.ReadCloser, int64, error) {
-	if !safeEntry(entry) {
+	if !safeEntry(entryPath(entry)) {
 		return nil, 0, fmt.Errorf("unsafe zip entry %q", entry)
 	}
 	ref, err := ix.zips.acquire(archivePath)

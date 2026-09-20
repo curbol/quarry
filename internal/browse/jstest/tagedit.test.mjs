@@ -57,3 +57,20 @@ test('a card with no fingerprints is never cleared by someone else\'s edit', () 
     ['hero'],
   );
 });
+
+// The guard has two halves and only the empty-list one was covered. A card whose
+// fingerprints are absent altogether — an asset whose content could not be read, which
+// the server sends with no fingerprint at all — reaches the same place, and without the
+// truthiness test every() on undefined throws rather than leaving the tag alone.
+test('a card with no fingerprint field is left alone by someone else\'s removal', () => {
+  assert.deepEqual(
+    nextTags({ cardFingerprints: undefined, cardTags: ['hero', 'wip'], edited: ['fp1'], tag: 'hero', on: false }),
+    ['hero', 'wip'],
+  );
+  // And the adding half does not depend on the card's fingerprints at all: the caller
+  // has already established the card is in the edit.
+  assert.deepEqual(
+    nextTags({ cardFingerprints: undefined, cardTags: [], edited: ['fp1'], tag: 'hero', on: true }),
+    ['hero'],
+  );
+});

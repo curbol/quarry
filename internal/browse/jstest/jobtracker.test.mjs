@@ -132,3 +132,20 @@ test('a result is matched to its own request, not merely to its asset', () => {
   assert.equal(jobs.isCurrent('a', 2), true);
   assert.equal(jobs.isCurrent('never-asked', 1), false);
 });
+
+// A cancel for an id the tracker never noted is the ordinary shape of a late one: the
+// page drops its pending entry when a result lands, so the cancel it would have sent is
+// skipped — but a card scrolled past during a filter change sends one for an id whose
+// entry a reset already cleared. It must be a no-op, not a throw and not an entry.
+test('a cancel for an id that was never noted changes nothing', () => {
+  const jobs = new JobTracker();
+  jobs.note('a', 1);
+  jobs.cancel('never-asked');
+  assert.equal(jobs.size, 1);
+  assert.equal(jobs.isCurrent('a', 1), true, 'an unrelated cancel retired a live job');
+  // And twice over the same id is equally inert.
+  jobs.cancel('a');
+  jobs.cancel('a');
+  assert.equal(jobs.size, 0);
+  assert.equal(jobs.isCurrent('a', 1), false);
+});

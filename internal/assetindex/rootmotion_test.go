@@ -21,6 +21,13 @@ func TestRootMotionVariant(t *testing.T) {
 		{"Warm_Idle", "Warm_Idle", false},                                                     // "arm"/"rm" substrings are not the token
 		{"Storm", "Storm", false},
 		{"A_Jump_Running_RootMotionVertical_Femn", "A_Jump_Running_RootMotionVertical_Femn", false}, // deliberately unmatched: ambiguous in-place target
+		// The bracket spelling carries its own boundary, so unlike the "_" tokens it is
+		// read wherever it sits rather than only as a suffix.
+		{"Attack[RM]2", "Attack2", true},
+		// The extension has to be off before this is called; with one on, the name is
+		// simply not recognized and nothing reports it. Pinned so the doc's warning is
+		// a fact about the code rather than a claim beside it.
+		{"UAL1_RM.glb", "UAL1_RM.glb", false},
 	}
 	for _, c := range cases {
 		canon, isRM := RootMotionVariant(c.base)

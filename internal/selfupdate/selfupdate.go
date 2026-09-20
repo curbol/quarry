@@ -407,6 +407,14 @@ func download(token, url, dst string) error {
 	}
 	// Bounded for the same reason the extraction below is: this writes beside the
 	// running binary, and a response that never ends would fill the user's disk.
+	//
+	// Truncating here is safe where truncating in extractBinary is not, and the
+	// difference is worth naming because the two look like the same decision made two
+	// ways. What lands here is a zip: cut short it has no end-of-central-directory
+	// record, so zip.OpenReader refuses it and nothing reaches the binary. The entry
+	// inside is the binary itself, with only its own CRC standing between a short read
+	// and an unrunnable file over a working install — which is why that one refuses the
+	// oversize case outright instead of limiting the reader.
 	return safewrite.Stream(dst, io.LimitReader(resp.Body, maxBinaryBytes), 0o644)
 }
 

@@ -225,9 +225,9 @@ func TestSaveLoadRefresh(t *testing.T) {
 }
 
 // The version keys both the cached index and the unpacked tree, so entries derived by
-// other scan logic must never be merged into a current index. LoadOrBuild guards this
-// at the top, but Load and Refresh are exported separately and the guarantee has to
-// hold for that route too.
+// other scan logic must never be merged into a current index. LoadOrBuild guards this at
+// the top; this drives refresh's own guard, which is what holds when the cache that
+// reaches it was written by another version.
 func TestRefreshRebuildsAcrossAnIndexVersion(t *testing.T) {
 	root, mk := libRoot(t)
 	cacheDir := t.TempDir()

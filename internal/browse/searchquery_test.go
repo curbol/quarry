@@ -267,6 +267,19 @@ func TestADeclinedQueryNarrowsRatherThanMatchingEverything(t *testing.T) {
 		// validity walked every term away and left nothing.
 		{"overlong with a bad byte at the front", "\xff" + strings.Repeat("a", maxQueryBytes*2)},
 		{"overlong with a bad byte in the middle", strings.Repeat("a", 64) + "\xff" + strings.Repeat("a", maxQueryBytes*2)},
+		// Both cases above leave a valid ASCII tail, so the rune-boundary trim stops at
+		// the first byte it looks at. These have no byte anywhere that can begin a rune,
+		// which is what an unbounded trim walked all the way through. 0xFF is never a
+		// start byte; 0x80 is a continuation byte, and a lone one is no better.
+		{"overlong and entirely invalid", strings.Repeat("\xff", maxQueryBytes*2)},
+		{"overlong and nothing but continuation bytes", strings.Repeat("\x80", maxQueryBytes*2)},
+		// Nothing but separators ahead of the first word: the cut lands before any term
+		// and the parse comes out empty, which is the shape an *unasked* query has. The
+		// two are not the same answer, and reading the second as the first handed back
+		// the library. A run of ")" is the same case one layer on, since
+		// dropUnmatchedClose erases every one of them.
+		{"overlong with every term past the cut", strings.Repeat(" ", maxQueryBytes) + "sword"},
+		{"overlong and nothing but unmatched closes", strings.Repeat(")", maxQueryBytes) + "sword"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			q := parseQuery(tc.q)
@@ -280,6 +293,27 @@ func TestADeclinedQueryNarrowsRatherThanMatchingEverything(t *testing.T) {
 	}
 }
 
+// The cap is straddled from below as well, because only the far side was checked: a
+// maxQueryDepth of 2 leaves every other test here green — nothing else nests more than
+// one level — while turning an ordinary grouped query into neverNode. That is an empty
+// grid for a query the user typed correctly, with nothing saying why.
+func TestNestingUnderTheCapStillParses(t *testing.T) {
+	sword := assetindex.Asset{Name: "Sword", Pack: "Weapons", RelPath: "w/sword.fbx"}
+	rock := assetindex.Asset{Name: "Rock", Pack: "Nature", RelPath: "n/rock.fbx"}
+	// One level short of the cap: the deepest query the parser is meant to read.
+	depth := maxQueryDepth - 1
+	q := parseQuery(strings.Repeat("(", depth) + "sword" + strings.Repeat(")", depth))
+	if q == nil {
+		t.Fatalf("a query nested %d deep compiled to nil", depth)
+	}
+	if !q.match(&sword) {
+		t.Errorf("a query nested %d deep stopped matching what it asks for", depth)
+	}
+	if q.match(&rock) {
+		t.Error("...and started matching what it does not")
+	}
+}
+
 // `q` arrives in a URL, so it is bounded only by the server's header limit — about a
 // megabyte — and everything downstream is sized from it. Past the cap the tail is cut,
 // which narrows the query rather than widening it: the terms that survive still apply,
@@ -288,6 +322,13 @@ func TestADeclinedQueryNarrowsRatherThanMatchingEverything(t *testing.T) {
 func TestOverlongQueryIsTruncatedNotWidened(t *testing.T) {
 	sword := assetindex.Asset{Name: "Sword", Pack: "Weapons", RelPath: "w/sword.fbx"}
 	rock := assetindex.Asset{Name: "Rock", Pack: "Nature", RelPath: "n/rock.fbx"}
+
+	// A query short enough to survive whole is untouched, however little it says: with
+	// nothing cut there is nothing to decline, and a blank search is the all-match the
+	// grid opens on.
+	if parseQuery(strings.Repeat(" ", maxQueryBytes)) != nil {
+		t.Error("a query that fits, holding no terms, is the all-match and must stay nil")
+	}
 
 	// Padded with spaces, the surviving text is exactly the leading term.
 	q := parseQuery("sword" + strings.Repeat(" ", maxQueryBytes*4))

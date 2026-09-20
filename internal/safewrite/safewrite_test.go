@@ -455,3 +455,45 @@ func TestTheSweepReadsTheDestinationDirectoryRatherThanGlobbingIt(t *testing.T) 
 		})
 	}
 }
+
+// The durability half of Atomic, which is the whole of what separates it from Stream and
+// the reason the tag store writes through it. Every other test here asserts post-rename
+// state, and all of them stay green with both fsyncs deleted: a crash right after a save
+// then lands the rename in the journal with the data blocks unwritten, quarry.tags.toml
+// comes back zero-length, and a zero-length store parses cleanly as one holding nothing.
+// The loss reads as "my tags are gone" with nothing reporting it.
+//
+// Structural because the behaviour needs a crashing machine to observe. A test with a
+// filesystem seam would change Atomic's signature for one caller that is a test.
+func TestAtomicFsyncsTheBytesBeforeTheRenameAndTheDirectoryAfter(t *testing.T) {
+	src, err := os.ReadFile("safewrite.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := strings.Index(string(src), "\nfunc Atomic(")
+	if start < 0 {
+		t.Fatal("no func Atomic in safewrite.go; this guard has stopped reading it")
+	}
+	body := string(src[start:])
+	end := strings.Index(body, "\n}\n")
+	if end < 0 {
+		t.Fatal("could not find the end of func Atomic; this guard has stopped reading it")
+	}
+	body = body[:end]
+
+	fileSync := strings.Index(body, "tmp.Sync()")
+	rename := strings.Index(body, "os.Rename(")
+	dirSync := strings.Index(body, "d.Sync()")
+	switch {
+	case fileSync < 0:
+		t.Error("Atomic no longer fsyncs the temp file; a crash after the rename can bring the target back empty")
+	case rename < 0:
+		t.Fatal("no os.Rename in Atomic; this guard has stopped reading it")
+	case fileSync > rename:
+		t.Error("Atomic fsyncs the temp file after renaming it into place, which is not a barrier at all")
+	}
+	if dirSync < 0 || dirSync < rename {
+		t.Error("Atomic no longer fsyncs the destination directory after the rename; " +
+			"the bytes are then durable but the directory entry pointing at them is not, so a crash can restore the previous contents")
+	}
+}

@@ -26,6 +26,12 @@ import (
 
 const binaryName = "quarry"
 
+// stagingPrefix names the directory an update unpacks into, beside the binary it is
+// replacing. One constant because the sweep has to recognise what the unpack creates:
+// spelled twice, a rename on one side leaves abandoned staging dirs accumulating on the
+// other with nothing reporting it.
+const stagingPrefix = ".quarry-update-"
+
 // releasesAPIURL is a var so tests can point it at a stub server.
 var releasesAPIURL = "https://api.github.com/repos/curbol/quarry/releases"
 
@@ -214,14 +220,23 @@ func platformAsset(rel *release, goos, goarch string) (string, error) {
 // sweepStaleStaging removes staging directories abandoned by an interrupted update.
 // Failures are ignored: this is tidying, not part of the update, and a directory that
 // cannot be removed must not stop the one thing that repairs a broken install.
+// The directory is read rather than globbed, and only the prefix decides what matches.
+// Joined into a glob, dir was itself read as a pattern: a binary installed under
+// "~/tools [old]" turned the whole thing into a character class matching no real path,
+// an unterminated "[" returned ErrBadPattern, which this swallows, and a "*" in the path
+// reached across sibling installs to delete their staging dirs. safewrite.sweepStaleTemps
+// is the same sweep written the same way for the same reason.
 func sweepStaleStaging(dir string) {
-	matches, err := filepath.Glob(filepath.Join(dir, ".quarry-update-*"))
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return
 	}
-	for _, m := range matches {
-		if fi, err := os.Stat(m); err == nil && time.Since(fi.ModTime()) > safewrite.StaleTempAge {
-			os.RemoveAll(m)
+	for _, e := range entries {
+		if !e.IsDir() || !strings.HasPrefix(e.Name(), stagingPrefix) {
+			continue
+		}
+		if fi, err := e.Info(); err == nil && time.Since(fi.ModTime()) > safewrite.StaleTempAge {
+			os.RemoveAll(filepath.Join(dir, e.Name()))
 		}
 	}
 }
@@ -255,7 +270,7 @@ func installTo(token, assetURL, exe string) error {
 	sweepStaleStaging(filepath.Dir(exe))
 	// Stage next to the target binary so the final rename stays on one filesystem
 	// (a temp dir under /tmp is often a separate device, and rename can't cross it).
-	tmp, err := os.MkdirTemp(filepath.Dir(exe), ".quarry-update-*")
+	tmp, err := os.MkdirTemp(filepath.Dir(exe), stagingPrefix+"*")
 	if err != nil {
 		// The usual cause is a binary living somewhere the invoking user cannot write —
 		// /usr/local/bin, a system package dir, a read-only mount — and a bare mkdir

@@ -1305,7 +1305,14 @@ function openLightbox(a) {
     img.src = contentURL(a.id);
     lb.view.appendChild(img);
   } else if (a.thumb === 'preview') {
-    const img = new Image(); img.src = thumbURL(a.id); lb.view.appendChild(img);
+    // A 404 here is not only "this entry carries no preview": a torn extraction, a pack
+    // re-shipped since the scan, or a full cache disk all answer the same way. Without
+    // the fallback those show the broken-image glyph, where every other image path in
+    // the page shows the category icon.
+    const img = new Image();
+    img.onerror = () => img.replaceWith(iconEl(a.category));
+    img.src = thumbURL(a.id);
+    lb.view.appendChild(img);
   } else if (a.thumb === 'font') {
     lb.view.appendChild(fontSample(a));
   } else {

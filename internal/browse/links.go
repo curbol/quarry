@@ -146,6 +146,12 @@ func (s *server) handleRelated(w http.ResponseWriter, r *http.Request) {
 			sel = append(sel, ai)
 		}
 	}
+	// Back into index order before grouping. related is a map, so sel arrives in a
+	// different order each call, and groupItems keeps the first position it saw for a
+	// card whose copies tie on thumb rank — which is every card shipped twice in one
+	// format. The representative decides the id, path and source the strip serves, so
+	// without this one card previews a different file from one open to the next.
+	slices.Sort(sel)
 	grouped := groupItems(s.ix.Assets, sel)
 	s.decorate(grouped)
 	sortItems(grouped, "")

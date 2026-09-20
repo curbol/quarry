@@ -481,3 +481,93 @@ func TestADanglingSymlinkIsReportedNotSilentlyDropped(t *testing.T) {
 		})
 	}
 }
+
+// The in-root drop reads a link as a duplicate of a file the walk reaches by its real
+// path, and says nothing, which is right: reporting every "latest" alias in a library
+// would bury the skips that matter (see TestWalkDropsSymlinkInsideRoot).
+//
+// The premise can be false. The walk drops parts of the root on its own — a dot-named
+// directory goes with everything under it — so a link at a visible path into one names a
+// file no other path reaches. Dropped as a duplicate of nothing, it landed in neither
+// Assets nor Skipped, which is the one outcome the skip list exists to prevent: the file
+// is missing from the grid and the run reports a clean scan.
+func TestAnInRootLinkToSomethingTheWalkNeverReachesIsReported(t *testing.T) {
+	root, mk := libRoot(t)
+	os.WriteFile(mk("synty", "Pack", ".source", "axe.glb"), []byte("GLBBYTES"), 0o644)
+	// An ordinarily-named link, at a path the user sees, into the pruned directory.
+	link := filepath.Join(root, "synty", "Pack", "axe.glb")
+	if err := os.Symlink(filepath.Join(root, "synty", "Pack", ".source", "axe.glb"), link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	ix, err := Build(Options{Root: root, CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ix.Assets) != 0 {
+		t.Errorf("assets = %v; the dot-directory is still pruned and the link is still dropped", names(ix.Assets))
+	}
+	if len(ix.Skipped) != 1 {
+		t.Fatalf("skipped = %v, want one entry naming the link; in neither list, the file is gone with nothing said", ix.Skipped)
+	}
+	if got := ix.Skipped[0].RelPath; got != "synty/Pack/axe.glb" {
+		t.Errorf("skip names %q, want the link's own path synty/Pack/axe.glb", got)
+	}
+	if !strings.Contains(ix.Skipped[0].Reason, ".source") {
+		t.Errorf("reason %q does not name the target the link points at", ix.Skipped[0].Reason)
+	}
+}
+
+// And a link to a directory inside the root is the same question over a subtree: it is a
+// duplicate while the walk indexed something in there, and a dead end otherwise.
+func TestAnInRootDirectoryLinkIsJudgedOnWhatTheWalkReached(t *testing.T) {
+	for _, tc := range []struct {
+		name, dir             string
+		wantAssets, wantSkips int
+	}{
+		{"covered", "Real", 1, 0},
+		{"pruned", ".work", 0, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root, mk := libRoot(t)
+			os.WriteFile(mk("synty", "Pack", tc.dir, "axe.glb"), []byte("GLBBYTES"), 0o644)
+			link := filepath.Join(root, "synty", "Pack", "Alias")
+			if err := os.Symlink(filepath.Join(root, "synty", "Pack", tc.dir), link); err != nil {
+				t.Skipf("symlinks unavailable: %v", err)
+			}
+			ix, err := Build(Options{Root: root, CacheDir: t.TempDir()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(ix.Assets) != tc.wantAssets {
+				t.Errorf("assets = %v, want %d", names(ix.Assets), tc.wantAssets)
+			}
+			if len(ix.Skipped) != tc.wantSkips {
+				t.Errorf("skipped = %v, want %d", ix.Skipped, tc.wantSkips)
+			}
+		})
+	}
+}
+
+// A sidecar is excluded by what it is, not by where it sits: the same rule would drop
+// the link under its own name, so the drop is not a false premise and there is nothing
+// to report. The skip list is what a user reads to find what went wrong.
+func TestAnInRootLinkToASidecarIsStillSilent(t *testing.T) {
+	root, mk := libRoot(t)
+	os.WriteFile(mk("synty", "Pack", "axe.glb"), []byte("GLBBYTES"), 0o644)
+	os.WriteFile(mk("synty", "Pack", "axe.glb.meta"), []byte("guid: 1"), 0o644)
+	link := filepath.Join(root, "synty", "Pack", "alias.glb.meta")
+	if err := os.Symlink(filepath.Join(root, "synty", "Pack", "axe.glb.meta"), link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	ix, err := Build(Options{Root: root, CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ix.Skipped) != 0 {
+		t.Errorf("skipped = %v; a sidecar is not indexed under any name, linked or not", ix.Skipped)
+	}
+	if len(ix.Assets) != 1 {
+		t.Errorf("assets = %v, want the model only", names(ix.Assets))
+	}
+}

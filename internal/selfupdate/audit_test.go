@@ -1143,19 +1143,38 @@ func swapExecutable(t *testing.T, fn func() (string, error)) func() {
 // Nothing installs a signal handler on the update path, so Ctrl-C during a download kills
 // the process before installTo's defer and strands its staging directory beside the
 // binary — one more per interrupted attempt, forever, since nothing else looks there.
+//
+// Driven inside a directory whose name holds glob metacharacters, because the sweep runs
+// wherever the user put the binary and that name is not quarry's to choose. Joined into a
+// glob pattern, as this once was, the directory was itself read as one: an unterminated
+// "[" returns ErrBadPattern, which the sweep swallows, so it did nothing for the life of
+// the process with no error anywhere, and a "*" in the path reached across sibling
+// installs to delete staging dirs belonging to another copy.
 func TestAnAbandonedStagingDirectoryIsSweptByAge(t *testing.T) {
-	dir := t.TempDir()
-	old := filepath.Join(dir, ".quarry-update-oldone")
-	fresh := filepath.Join(dir, ".quarry-update-running")
+	// The prefix comes from the constant the unpack creates with, so the sweep and the
+	// unpack cannot drift apart behind this test.
+	dir := filepath.Join(t.TempDir(), "tools [old]")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	old := filepath.Join(dir, stagingPrefix+"oldone")
+	fresh := filepath.Join(dir, stagingPrefix+"running")
 	mine := filepath.Join(dir, "my-notes")
 	for _, d := range []string{old, fresh, mine} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			t.Fatal(err)
 		}
 	}
-	aged := time.Now().Add(-safewrite.StaleTempAge - time.Hour)
-	if err := os.Chtimes(old, aged, aged); err != nil {
+	// A file carrying the prefix is not a staging directory, and the sweep removes trees.
+	notADir := filepath.Join(dir, stagingPrefix+"notes.txt")
+	if err := os.WriteFile(notADir, []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
+	}
+	aged := time.Now().Add(-safewrite.StaleTempAge - time.Hour)
+	for _, p := range []string{old, notADir} {
+		if err := os.Chtimes(p, aged, aged); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	sweepStaleStaging(dir)
@@ -1168,9 +1187,28 @@ func TestAnAbandonedStagingDirectoryIsSweptByAge(t *testing.T) {
 	if _, err := os.Stat(fresh); err != nil {
 		t.Errorf("a staging dir young enough to be someone's running update was removed: %v", err)
 	}
-	// The sweep is over one glob in a directory the user owns — often ~/.local/bin.
+	// The sweep runs in a directory the user owns — often ~/.local/bin.
 	if _, err := os.Stat(mine); err != nil {
 		t.Errorf("the sweep removed something that is not quarry's: %v", err)
+	}
+	if _, err := os.Stat(notADir); err != nil {
+		t.Errorf("the sweep removed a file rather than a staging directory: %v", err)
+	}
+}
+
+// The name the sweep looks for has to be the name the unpack writes. Spelled twice they
+// drift silently: the unpack keeps working and the sweep quietly stops matching anything.
+func TestTheStagingSweepLooksForWhatTheUnpackCreates(t *testing.T) {
+	src, err := os.ReadFile("selfupdate.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lit := regexp.MustCompile(`"\.quarry-update-[^"]*"`).FindAllString(string(src), -1)
+	if len(lit) != 1 {
+		t.Errorf("found %d spellings of the staging prefix in selfupdate.go (%v), want exactly one — the stagingPrefix constant", len(lit), lit)
+	}
+	if !strings.HasPrefix(stagingPrefix, ".") {
+		t.Errorf("stagingPrefix = %q; a staging dir beside the binary has to be hidden, or PATH lookup finds what is inside it", stagingPrefix)
 	}
 }
 

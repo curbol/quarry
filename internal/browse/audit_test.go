@@ -1296,13 +1296,21 @@ func TestCardsSerializeEmptySetsAsArraysOnBothPaths(t *testing.T) {
 	if blank.Fingerprint != "" {
 		t.Fatal("this test needs an asset with no fingerprint")
 	}
+	// The same rule over the card the library is mostly made of: one fingerprint, no
+	// tags. Both cases above take unionTagsLocked's general branch, which ends in
+	// sortedSet right here; a single fingerprint takes the fast path instead, and its
+	// non-nil answer comes from tagstore.sortedKeys — another package, a dozen lines from
+	// Store.Related, which returns a bare nil for the same kind of miss.
+	one := assetindex.Asset{Name: "Y.fbx", Size: 3, Fingerprint: "crc32:1:3"}
 	empty := &server{store: tagstore.New()}
 	for _, c := range []struct {
 		name string
 		dto  assetDTO
+		want []string
 	}{
-		{"ungrouped", toDTO(blank)},
-		{"grouped", groupItems([]assetindex.Asset{blank}, []int32{0})[0]},
+		{"ungrouped", toDTO(blank), []string{`"fingerprints":[]`, `"tags":[]`}},
+		{"grouped", groupItems([]assetindex.Asset{blank}, []int32{0})[0], []string{`"fingerprints":[]`, `"tags":[]`}},
+		{"one untagged fingerprint", toDTO(one), []string{`"fingerprints":["crc32:1:3"]`, `"tags":[]`}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			d := c.dto
@@ -1311,7 +1319,7 @@ func TestCardsSerializeEmptySetsAsArraysOnBothPaths(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			for _, want := range []string{`"fingerprints":[]`, `"tags":[]`} {
+			for _, want := range c.want {
 				if !bytes.Contains(b, []byte(want)) {
 					t.Errorf("missing %s in %s", want, b)
 				}
@@ -2094,4 +2102,103 @@ func TestASuppressedSiblingIsNotCountedAsContentThisLibraryLacks(t *testing.T) {
 // derives it rather than restated, so a change to the scheme fails here loudly.
 func crcPrint(content string) string {
 	return fmt.Sprintf("crc32:%x:%d", crc32.ChecksumIEEE([]byte(content)), len(content))
+}
+
+// The strip beside the lightbox opens whatever card /api/related names, by id. A card
+// groups copies that share a name and a size, so a file shipped in two archives of one
+// pack is one card with two fingerprints and two ids — and which of them the response
+// carries decides the bytes the strip previews and the path it copies.
+//
+// computeResults hands groupItems a selection built by walking the index in order, so
+// the grid's answer is fixed. /api/related built its selection by ranging a map, and
+// groupItems keeps the first position it saw whenever the copies tie on thumb rank, so
+// the same request answered with a different file from one call to the next: the
+// preview loaded other geometry, with nothing on screen to say so.
+func TestRelatedNamesTheSameCopyTheGridDoes(t *testing.T) {
+	srv, _ := taggedLibrary(t, func(mk func(...string) string) {
+		// One card, two fingerprints (a zip crc32 and a unitypackage guid), two ids, and
+		// different bytes behind each so a flip is observable as content, not just as a
+		// path. Same name and size, which is what makes them one card.
+		writeZip(t, mk("synty", "Foo_Pack", "Foo_Pack_SourceFiles_v3.zip"), map[string]string{
+			"SourceFiles/Heart.fbx": "FBXHEART",
+		})
+		writeUnity(t, mk("synty", "Foo_Pack", "Foo_Pack_Unity_2022_3_v1_0_0.unitypackage"), []unityMember{
+			{guid: "aaa", pathname: "Assets/Foo/Heart.fbx", asset: "HEARTFBX"},
+		})
+		// A single-copy card on the other end of the link.
+		writeZip(t, mk("synty", "Bar_Pack", "Bar_Pack_SourceFiles_v1.zip"), map[string]string{
+			"SourceFiles/Anchor.fbx": "ANCHORBYTES",
+		})
+	})
+
+	var heart, anchor taggedItem
+	for _, it := range taggedAssets(t, srv, "limit=50").Items {
+		switch it.Name {
+		case "Heart.fbx":
+			heart = it
+		case "Anchor.fbx":
+			anchor = it
+		}
+	}
+	if len(heart.Fingerprints) != 2 || len(anchor.Fingerprints) != 1 {
+		t.Fatalf("fixture: Heart has %d fingerprints and Anchor %d; this test needs 2 and 1",
+			len(heart.Fingerprints), len(anchor.Fingerprints))
+	}
+	// The id the grid reports for that card, which the strip has to agree with.
+	var want string
+	for _, it := range getAssets(t, srv, "limit=50").Items {
+		if it.Name == "Heart.fbx" {
+			want = it.ID
+		}
+	}
+	if want == "" {
+		t.Fatal("the grid reports no Heart.fbx card")
+	}
+
+	fps := append(append([]string{}, heart.Fingerprints...), anchor.Fingerprints...)
+	doJSON(t, "POST", srv.URL+"/api/link", map[string]any{"fingerprints": fps, "on": true}).Body.Close()
+
+	q := url.Values{}
+	for _, fp := range anchor.Fingerprints {
+		q.Add("fingerprint", fp)
+	}
+	// Repeated, because the order that decided this was a map's: one call agrees with the
+	// grid by chance roughly four times in five.
+	for i := 0; i < 40; i++ {
+		var out assetsResp
+		decode(t, doJSON(t, "GET", srv.URL+"/api/related?"+q.Encode(), nil), &out)
+		if len(out.Items) != 1 {
+			t.Fatalf("call %d: /api/related returned %d cards, want 1", i, len(out.Items))
+		}
+		if out.Items[0].ID != want {
+			t.Fatalf("call %d: /api/related names id %q (%s), but the grid names %q for that card; the strip would preview a different file",
+				i, out.Items[0].ID, out.Items[0].RelPath, want)
+		}
+	}
+}
+
+// resultKey leaves offset and limit out, which is the whole reason scrolling a large
+// library is linear: every page of one query shares one computation over the index.
+// Folded back in, each page recomputes the full result set and nothing anywhere fails —
+// the answers stay correct and the cost stops being visible in a test.
+func TestPagingSharesOneComputationAndNothingElseDoes(t *testing.T) {
+	base := url.Values{"q": {"sword"}, "type": {"model"}, "limit": {"60"}, "offset": {"0"}}
+	page2 := url.Values{"q": {"sword"}, "type": {"model"}, "limit": {"60"}, "offset": {"60"}}
+	if resultKey(base) != resultKey(page2) {
+		t.Errorf("two pages of one query key differently (%q vs %q); each page would rebuild the whole result set",
+			resultKey(base), resultKey(page2))
+	}
+	// Everything that does shape the set has to separate, or a query serves another's
+	// results. Derived from the base rather than listed, so a parameter added to the
+	// query language is covered by adding it here alone.
+	for _, k := range []string{"q", "type", "vendor", "variant", "guid", "group", "tag", "tagmode", "includeRelated", "sort"} {
+		other := url.Values{}
+		for bk, bv := range base {
+			other[bk] = bv
+		}
+		other.Set(k, "something-else")
+		if resultKey(other) == resultKey(base) {
+			t.Errorf("%s does not reach the key, so two queries differing only in it share one memoized result set", k)
+		}
+	}
 }

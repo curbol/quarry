@@ -118,6 +118,7 @@ func walkLibrary(absRoot string, follow bool) ([]libEntry, []SkippedFile, []stri
 	w.visited[start] = true
 	err := w.tree(start, "")
 	w.dropCoveredLinks()
+	w.reportUnreachedLinks()
 	return w.entries, w.skipped, w.linkRoots, err
 }
 
@@ -133,6 +134,10 @@ type walker struct {
 	// linked records the file symlinks this walk indexed, so the decision can be
 	// re-made once every directory link has been followed. See dropCoveredLinks.
 	linked []linkedFile
+	// inRoot records the links into the library dropped as duplicates, so the premise
+	// behind dropping them can be checked once the walk is done. See
+	// reportUnreachedLinks.
+	inRoot []inRootLink
 	// visited holds the resolved roots of the walks already made, so a link back into
 	// a tree already covered — or into one covering it — terminates instead of
 	// looping. A link is refused by containment (see covered); an ordinary descent
@@ -186,6 +191,61 @@ func (w *walker) dropCoveredLinks() {
 	}
 	w.entries = compact(w.entries, dropEntry)
 	w.linkRoots = compact(w.linkRoots, dropRoot)
+}
+
+// inRootLink is a symlink into the library, dropped on the reading that it duplicates
+// a file the walk reaches by its real path.
+type inRootLink struct {
+	rel    string
+	target string
+}
+
+// reportUnreachedLinks says so when that reading turns out to be wrong. The walk drops
+// parts of the root on its own — a dot-directory goes with everything under it, and a
+// sidecar goes alone — so a link at a visible path into one of those names a file no
+// other path reaches. Dropped as a duplicate of nothing, it lands in neither Assets nor
+// Skipped, which is the one outcome the skip list exists to prevent.
+//
+// An ordinary in-root alias still says nothing: its target is indexed, which is exactly
+// what the drop claims.
+func (w *walker) reportUnreachedLinks() {
+	if len(w.inRoot) == 0 {
+		return
+	}
+	// Entry paths are already resolved: WalkDir never descends a link, so every
+	// directory a walk enters is real and every walk starts at a resolved root.
+	reached := make(map[string]bool, len(w.entries))
+	for _, e := range w.entries {
+		reached[e.path] = true
+	}
+	for _, l := range w.inRoot {
+		if reached[l.target] || w.reachedUnder(l.target) {
+			continue
+		}
+		// A sidecar is excluded by what it is rather than by where it sits, and the same
+		// rule would drop the link under its own name. Reporting it would be noise in a
+		// list the user reads to find what went wrong.
+		if isSidecar(strings.ToLower(strings.TrimPrefix(filepath.Ext(l.target), "."))) {
+			continue
+		}
+		w.skip(l.rel, fmt.Errorf("symlink to %s, which is inside the library but excluded from the walk, so nothing indexes it under any name", l.target))
+	}
+}
+
+// reachedUnder reports whether the walk indexed anything inside target, which is what
+// makes a link to a directory the duplicate the drop takes it for. Asked only once the
+// exact match has failed, since a link to a file is the common shape and answers there.
+func (w *walker) reachedUnder(target string) bool {
+	if fi, err := os.Stat(target); err != nil || !fi.IsDir() {
+		return false
+	}
+	rt := resolve(target)
+	for _, e := range w.entries {
+		if contains(rt, e.path) {
+			return true
+		}
+	}
+	return false
 }
 
 func compact[T any](s []T, drop map[int]bool) []T {
@@ -318,6 +378,7 @@ func (w *walker) symlink(p, r string) error {
 		return nil
 	}
 	if underRootPath(w.root, target) {
+		w.inRoot = append(w.inRoot, inRootLink{rel: r, target: target})
 		return nil
 	}
 	if !w.follow {

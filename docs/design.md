@@ -202,8 +202,9 @@ back rather than dropping it: a key it does not recognize (the store travels bet
 machines that need not run the same quarry, and that is exactly when a newer version's
 field would otherwise be destroyed by an older version's next edit), a color it cannot
 parse, a tag id defined twice, where the second row would silently win, and a row half
-written by hand — a `[[tag]]` with no id, an assignment with an empty fingerprint or tag —
-which is not a row a save keeps either. A group of fewer than two members is the one
+written by hand — a `[[tag]]` with no id, an assignment with an empty fingerprint, no tags
+at all, or an empty tag, a group member with an empty fingerprint — which is not a row a
+save keeps either. A group of fewer than two real members is the one
 documented drop, because that is not a partial row but a group that means nothing. The one
 thing a save cannot preserve is comments, so it writes a header line saying so. quarry is otherwise read-only over the library; this is its
 one write surface, guarded by a mutex and written atomically. Because there is no session,

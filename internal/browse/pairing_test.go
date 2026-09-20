@@ -464,3 +464,56 @@ func TestOneArchivesLayoutDoesNotDecideAnothers(t *testing.T) {
 		}
 	}
 }
+
+// dirAffinity is the second place the platform enters pairing, and the one with no
+// behavioural cover: both existing Windows tests decide before affinity is consulted,
+// so splitting a loose directory on "/" alone passed them.
+//
+// This is the loose-file twin of TestAMirroredRootMotionTreePairsEachCharacterWithItsOwn.
+// Read with the wrong separator set, each Windows directory becomes one opaque segment,
+// every affinity is 0, bestClaim is 0, and the score collapses to the archive bit, which
+// is equal for every candidate: the first RM in order wins for both cards. Orc's card
+// then plays Goblin's travel on Orc's body — a file that loads, clips that play — and
+// orcRM is never suppressed, so it also shows as a stray card. Nothing on a Unix CI host
+// notices.
+func TestAMirroredRootMotionTreePairsEachCharacterWithItsOwnOnWindows(t *testing.T) {
+	windowsPaths(t)
+	at := func(id string, parts ...string) assetindex.Asset {
+		return looseAnim(id, "acme", "Chars", strings.Join(parts, `\`), "")
+	}
+	// Goblin's RM first, so a broken split hands it to the orc card too.
+	sibling, suppressed := buildRootMotionPairs([]assetindex.Asset{
+		at("goblinRM", "RootMotion", "Goblin", "Walk_RM.fbx"),
+		at("orcRM", "RootMotion", "Orc", "Walk_RM.fbx"),
+		at("goblin", "Anims", "Goblin", "Walk.fbx"),
+		at("orc", "Anims", "Orc", "Walk.fbx"),
+	})
+	for card, want := range map[string]string{"goblin": "goblinRM", "orc": "orcRM"} {
+		if got := sibling[card]; got != want {
+			t.Errorf("%s paired with %q, want %q: the shared path segment is what tells them apart", card, got, want)
+		}
+	}
+	for _, rm := range []string{"goblinRM", "orcRM"} {
+		if !suppressed[rm] {
+			t.Errorf("%s was not suppressed, so it shows as a stray card beside the one that plays it", rm)
+		}
+	}
+}
+
+// The same-directory probe narrows to animations as well as to a format and an archive.
+// A group holds every kind sharing a canonical base, so a model can sit in the same group
+// as the clips and in the same folder as their RM candidate. Counted as an in-place asset
+// with an RM beside it, it answers "this pack pairs by directory" on the clips' behalf,
+// and every clip whose own folder ships no RM then gets no sibling at all.
+func TestOnlyAnimationsAnswerTheSameDirectoryProbe(t *testing.T) {
+	sibling, _ := buildRootMotionPairs([]assetindex.Asset{
+		// The only RM candidate, and the model that happens to share its folder.
+		looseAnim("rm", "acme", "P", "/lib/Shared/Sword_RM.fbx", ""),
+		as(looseAnim("model", "acme", "P", "/lib/Shared/Sword.fbx", ""), assetindex.CategoryModel),
+		// The clip, in a folder of its own, which is the card that needs the sibling.
+		looseAnim("anim", "acme", "P", "/lib/Anims/Sword.fbx", ""),
+	})
+	if got := sibling["anim"]; got != "rm" {
+		t.Errorf("anim paired with %q, want rm; the model beside the RM answered the directory probe for the clip, and the clip lost its toggle", got)
+	}
+}

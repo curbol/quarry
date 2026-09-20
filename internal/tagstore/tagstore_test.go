@@ -639,7 +639,17 @@ func TestLoadRefusesARowTheNextSaveWouldDrop(t *testing.T) {
 	for _, tc := range []struct{ name, body, want string }{
 		{"a tag with no id", "[[tag]]\n  color = \"#e11d48\"\n", "no id"},
 		{"an assignment with no fingerprint", "[[assignment]]\n  fingerprint = \"\"\n  tags = [\"hero\"]\n", "empty fingerprint"},
-		{"an empty tag inside an assignment", "[[assignment]]\n  fingerprint = \"crc32:1:2\"\n  tags = [\"\"]\n", "empty fingerprint or tag"},
+		{"an empty tag inside an assignment", "[[assignment]]\n  fingerprint = \"crc32:1:2\"\n  tags = [\"\"]\n", "empty fingerprint, no tags, or an empty tag"},
+		// A fingerprint with no tags applies nothing, so the next save writes no row for
+		// it and the line the user typed is gone. Both spellings, because the omitted key
+		// and the empty list decode to the same thing and only one of them looks wrong.
+		{"an assignment with no tags key", "[[assignment]]\n  fingerprint = \"crc32:1:2\"\n", "no tags"},
+		{"an assignment with an empty tag list", "[[assignment]]\n  fingerprint = \"crc32:1:2\"\n  tags = []\n", "no tags"},
+		// Link drops an empty member, which is right for the endpoint and silent here:
+		// with two real members beside it the row survives minus a line the user wrote,
+		// and with one it is the whole group that goes.
+		{"an empty member in a group that survives", "[[group]]\n  fingerprints = [\"crc32:1:2\", \"crc32:3:4\", \"\"]\n", "empty fingerprint"},
+		{"an empty member in a group that does not", "[[group]]\n  fingerprints = [\"\", \"crc32:3:4\"]\n", "empty fingerprint"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			p := filepath.Join(t.TempDir(), FileName)
@@ -660,7 +670,7 @@ func TestLoadRefusesARowTheNextSaveWouldDrop(t *testing.T) {
 	}
 	// And a well-formed store still loads, so the refusal is not catching real ones.
 	p := filepath.Join(t.TempDir(), FileName)
-	body := "[[tag]]\n  id = \"hero\"\n  color = \"#e11d48\"\n\n[[assignment]]\n  fingerprint = \"crc32:1:2\"\n  tags = [\"hero\"]\n"
+	body := "[[tag]]\n  id = \"hero\"\n  color = \"#e11d48\"\n\n[[assignment]]\n  fingerprint = \"crc32:1:2\"\n  tags = [\"hero\"]\n\n[[group]]\n  fingerprints = [\"crc32:1:2\", \"crc32:3:4\"]\n"
 	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -670,6 +680,9 @@ func TestLoadRefusesARowTheNextSaveWouldDrop(t *testing.T) {
 	}
 	if got := s.TagsFor("crc32:1:2"); len(got) != 1 || got[0] != "hero" {
 		t.Errorf("TagsFor = %v, want [hero]", got)
+	}
+	if got := s.Related("crc32:1:2"); len(got) != 1 || got[0] != "crc32:3:4" {
+		t.Errorf("Related = %v, want [crc32:3:4]", got)
 	}
 }
 

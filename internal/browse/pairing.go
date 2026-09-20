@@ -3,6 +3,7 @@ package browse
 import (
 	"os"
 	"path"
+	"slices"
 	"strings"
 
 	"github.com/curbol/quarry/internal/assetindex"
@@ -93,6 +94,14 @@ func buildRootMotionPairs(assets []assetindex.Asset) (sibling map[string]string,
 		if len(g.rm) == 0 || len(g.nonRM) == 0 {
 			continue
 		}
+		// Only animations pair (see below), so a group holding none has nothing to decide.
+		// Hoisted to a guard because everything past here is built per group rather than
+		// per card, and would otherwise be built for a group that never reaches pickRM.
+		if !slices.ContainsFunc(g.nonRM, func(ni int) bool {
+			return assets[ni].Category == assetindex.CategoryAnimation
+		}) {
+			continue
+		}
 		// Suppress only the RM files some in-place card actually plays. pickRM picks one
 		// per card (preferring the same container), so hiding the whole group would make
 		// an RM with no in-place counterpart in its own format unreachable in browse
@@ -119,6 +128,15 @@ func buildRootMotionPairs(assets []assetindex.Asset) (sibling map[string]string,
 		// layouts differ, and an answer read across both lets the one that keeps its RM
 		// beside the clip decide that the one that does not has no sibling at all.
 		sameDirFor := map[probeKey]bool{}
+		// What a candidate is claimed at is a property of the group and the candidate, not
+		// of the card being paired, so it is answered once per candidate here. Asked inside
+		// pickRM it was re-walked for every (card, candidate) pair, and each walk compares
+		// directory affinity, which splits two paths into fresh slices per comparison —
+		// cubic in the group over exactly the mirrored-tree layout bestClaim exists for.
+		claims := make(map[int]int, len(g.rm))
+		for _, ri := range g.rm {
+			claims[ri] = bestClaim(assets, g.nonRM, assets[ri])
+		}
 		for _, ni := range g.nonRM {
 			a := assets[ni]
 			if a.Category != assetindex.CategoryAnimation {
@@ -130,7 +148,7 @@ func buildRootMotionPairs(assets []assetindex.Asset) (sibling map[string]string,
 				sameDir = groupPairsByDirectory(assets, g.nonRM, g.rm, k)
 				sameDirFor[k] = sameDir
 			}
-			if rmID := pickRM(assets, g.nonRM, g.rm, a, sameDir); rmID != "" {
+			if rmID := pickRM(assets, g.rm, claims, a, sameDir); rmID != "" {
 				sibling[a.ID] = rmID
 				suppressed[rmID] = true
 			}
@@ -253,7 +271,7 @@ func splitDir(s assetindex.Source, dir string) []string {
 // however distant. So a card is also held to the best any card in the group reaches
 // with that RM — the same "it belongs to someone else" rule the directory filter
 // applies, one rung down and reachable where that filter is not.
-func pickRM(assets []assetindex.Asset, nonRMIdx, rm []int, nonRM assetindex.Asset, sameDirOnly bool) string {
+func pickRM(assets []assetindex.Asset, rm []int, claims map[int]int, nonRM assetindex.Asset, sameDirOnly bool) string {
 	best, bestScore := "", -1
 	nonDir, _ := entryParts(nonRM.Source)
 	for _, ri := range rm {
@@ -265,7 +283,7 @@ func pickRM(assets []assetindex.Asset, nonRMIdx, rm []int, nonRM assetindex.Asse
 			continue
 		}
 		aff := dirAffinity(nonRM.Source, r.Source)
-		if aff < bestClaim(assets, nonRMIdx, r) {
+		if aff < claims[ri] {
 			continue
 		}
 		score := aff << 1

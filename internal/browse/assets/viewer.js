@@ -29,6 +29,9 @@ import { modelThumbs } from '/static/thumbs.js';
 // arrowing through a couple of dozen models would silently blank every 3D thumbnail
 // in the grid for the rest of the session, with nothing logged anywhere.
 let sharedRenderer = null;
+// The viewers currently driving that context, so a loss can reach the one on screen
+// and not just the next open. Populated by startViewer and emptied by its stop().
+const liveViewers = new Set();
 function acquireRenderer() {
   if (sharedRenderer) return sharedRenderer;
   const r = new THREE.WebGLRenderer({ antialias: true });
@@ -37,10 +40,13 @@ function acquireRenderer() {
   r.shadowMap.type = THREE.PCFSoftShadowMap;
   // A context can still be lost for reasons outside our control (GPU reset, tab
   // backgrounded too long). Dropping the reference is what lets the next open build a
-  // working one instead of rendering forever into a dead canvas.
+  // working one; telling the live viewers is what stops the one already on screen from
+  // rendering forever into a dead canvas.
   r.domElement.addEventListener('webglcontextlost', (e) => {
     e.preventDefault();
     if (sharedRenderer === r) sharedRenderer = null;
+    console.warn('quarry: the WebGL context was lost; the next preview will rebuild it');
+    for (const onLost of [...liveViewers]) onLost();
   });
   sharedRenderer = r;
   return r;
@@ -215,6 +221,13 @@ export function startViewer(container, asset, panels) {
     if (text) { const p = document.createElement('p'); p.textContent = text; box.appendChild(p); }
     container.appendChild(box);
   };
+  // Registered for as long as this viewer is driving the shared context. Dropping
+  // sharedRenderer on loss only fixes the *next* open; this viewer holds its own
+  // reference, and loop() stops for nothing but stopped and a detached canvas, so
+  // without this it keeps driving a full scene pass plus the gizmo pass every frame
+  // into a context that renders nothing, looking exactly like a model that froze.
+  const onContextLost = () => showPlaceholder('3D preview unavailable: the graphics context was lost. Reopen to try again.');
+  liveViewers.add(onContextLost);
 
   const playClip = (i) => {
     // Guarded because the root-motion toggle swaps `clips` between two sets that need
@@ -609,6 +622,7 @@ export function startViewer(container, asset, panels) {
   return {
     stop() {
       stopped = true;
+      liveViewers.delete(onContextLost);
       cancelAnimationFrame(raf);
       ro.disconnect();
       controls.dispose();

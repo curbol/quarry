@@ -3429,3 +3429,66 @@ func TestPruneKeepsSweepingPastATreeItCannotRemove(t *testing.T) {
 		t.Errorf("live extractions surviving = %d, want 1", kept)
 	}
 }
+
+// Source.EntryPath and Source.Entry are a pair, and only one half was pinned by
+// behaviour. Every rule that reads an entry as a path reads the normalised spelling;
+// Source.Entry keeps the stored one, because that is the key the central directory
+// resolves. Normalising it at the source, or normalising it again on the way into the
+// lookup, is the obvious tidy-up and it is silent: every entry of an archive written by
+// older Windows tooling stops resolving, openZipEntry reports fs.ErrNotExist, and browse
+// answers 404 for a whole pack that is sitting right there.
+//
+// Kept apart from the enumeration guard, and with no loose twin, so the archive entry is
+// the thing actually served rather than deduped away in favour of a real file.
+func TestABackslashEntryIsServedByItsStoredSpelling(t *testing.T) {
+	root, mk := libRoot(t)
+	archive := mk("v", "Pack", "Pack_A_v1.zip")
+	f, err := os.Create(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := zip.NewWriter(f)
+	// CreateRaw, because Create sanitises the separator away.
+	data := []byte("SWORDBYTES")
+	w, err := zw.CreateRaw(&zip.FileHeader{
+		Name: `SourceFiles\Sword.fbx`, Method: zip.Store,
+		CRC32: crc32.ChecksumIEEE(data), CompressedSize64: uint64(len(data)), UncompressedSize64: uint64(len(data)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.Write(data)
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	ix, err := Build(Options{Root: root, CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back *Asset
+	for i := range ix.Assets {
+		if strings.Contains(ix.Assets[i].Source.Entry, `\`) {
+			back = &ix.Assets[i]
+		}
+	}
+	if back == nil {
+		t.Fatalf("no asset kept the stored backslash spelling; got %d assets", len(ix.Assets))
+	}
+	rc, size, err := ix.Open(*back)
+	if err != nil {
+		t.Fatalf("Open(%q) = %v; the entry the scan indexed cannot be served, so browse 404s the whole pack", back.Source.Entry, err)
+	}
+	defer rc.Close()
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(data) {
+		t.Errorf("Open returned %q, want %q", got, data)
+	}
+	if size != int64(len(data)) {
+		t.Errorf("size = %d, want %d", size, len(data))
+	}
+}

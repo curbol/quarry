@@ -463,12 +463,13 @@ func Load(path string) (*Store, error) {
 		return nil, fmt.Errorf("%s holds %d [[tag]] row(s) with no id; give each one an id, or remove it, rather than let the next edit drop it",
 			path, nameless)
 	}
-	// The same rule over the assignment table: an empty fingerprint names no content and
-	// an empty tag id is not a tag, and neither survives a save. Counted together because
-	// they are one mistake from the user's side — a row half-written by hand.
+	// The same rule over the assignment table: an empty fingerprint names no content, a
+	// row carrying no tag at all applies nothing, and an empty tag id is not a tag. None
+	// of the three survives a save. Counted together because they are one mistake from
+	// the user's side — a row half-written by hand.
 	var emptyAssign int
 	for _, a := range f.Assignments {
-		if a.Fingerprint == "" {
+		if a.Fingerprint == "" || len(a.Tags) == 0 {
 			emptyAssign++
 			continue
 		}
@@ -481,8 +482,25 @@ func Load(path string) (*Store, error) {
 		}
 	}
 	if emptyAssign > 0 {
-		return nil, fmt.Errorf("%s holds %d assignment entr(ies) with an empty fingerprint or tag; fill them in, or remove them, rather than let the next edit drop them",
+		return nil, fmt.Errorf("%s holds %d assignment entr(ies) with an empty fingerprint, no tags, or an empty tag; fill them in, or remove them, rather than let the next edit drop them",
 			path, emptyAssign)
+	}
+	// And over the group table. Link filters an empty member out, which is right for the
+	// endpoint but would make a hand-written one vanish here: silently for a group that
+	// still has two real members, and as the whole row for one that does not. A group of
+	// fewer than two real members is the documented drop; an empty member is a half-written
+	// row like the ones above.
+	var emptyMember int
+	for _, g := range f.Groups {
+		for _, fp := range g.Fingerprints {
+			if fp == "" {
+				emptyMember++
+			}
+		}
+	}
+	if emptyMember > 0 {
+		return nil, fmt.Errorf("%s holds %d group member(s) with an empty fingerprint; fill them in, or remove them, rather than let the next edit drop them",
+			path, emptyMember)
 	}
 	for _, g := range f.Groups {
 		s.Link(g.Fingerprints)

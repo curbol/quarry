@@ -321,6 +321,12 @@ func (ix *Index) refresh() error {
 	ix.LoosePrint = newLoose
 	ix.liveUnpacked = live
 	ix.Skipped = skipped
+	// The previous set is dead here: prevAt, reuse and describes are all inside the loop
+	// above, and everything they kept has been copied into assets. Released before dedup
+	// rather than after, because dedup appends into two fresh slices — so holding it
+	// across the call is a third copy of a 150k-asset library, at the one moment two are
+	// already live.
+	ix.Assets, ix.Suppressed = nil, nil
 	kept, dropped := dedup(assets)
 	ix.setAssets(kept)
 	ix.Suppressed = dropped

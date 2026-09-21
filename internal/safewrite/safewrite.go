@@ -28,6 +28,11 @@ const StaleTempAge = 24 * time.Hour
 // left behind, and without one there is nothing to split, so nothing is ever swept and
 // the failure is invisible.
 //
+// The destination's directory has to exist: it is where the temp file is created, and
+// creating it here would mean guessing a mode for a directory the caller knows the
+// purpose of. Every caller makes it first, and one that forgets gets the CreateTemp
+// error rather than a silently-not-written file.
+//
 // The bytes are fsynced before the rename, because rename atomicity alone only
 // survives a crashing process, not a crashing machine: the rename can reach the
 // journal while the data blocks have not, and the file comes back zero-length. A
@@ -191,17 +196,18 @@ func Stream(dst string, src io.Reader, perm os.FileMode) error {
 // outcome as a pattern with no "*", which Atomic refuses outright, reached by the other
 // half of the same mechanism.
 func sweepStaleTemps(dir, tmpPattern string) {
-	prefix, suffix, ok := strings.Cut(tmpPattern, "*")
-	if !ok {
+	// The last "*", because that is the one os.CreateTemp replaces. Split anywhere
+	// else, a pattern holding several matches no name the writer ever creates.
+	star := strings.LastIndex(tmpPattern, "*")
+	if star < 0 {
 		return // Atomic refuses this; nothing else calls here.
 	}
+	prefix, suffix := tmpPattern[:star], tmpPattern[star+1:]
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return
 	}
 	for _, e := range entries {
-		// os.CreateTemp replaces the last "*", so a pattern holding several matches a
-		// name whose middle is free — the same reading Glob gave, minus the metacharacters.
 		n := e.Name()
 		if e.IsDir() || len(n) < len(prefix)+len(suffix) || !strings.HasPrefix(n, prefix) || !strings.HasSuffix(n, suffix) {
 			continue

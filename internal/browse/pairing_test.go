@@ -385,6 +385,49 @@ func TestAMirroredRootMotionTreePairsEachCharacterWithItsOwn(t *testing.T) {
 	}
 }
 
+// The layout the tail alone cannot read: each character keeps its own RM, one level
+// down in its own folder. No in-place asset sits in an RM's directory, so the
+// same-directory filter never engages — and the last segments being "Goblin" against
+// "RM" means the shared tail is zero for a character's own RM and zero for its
+// neighbour's alike, so bestClaim's floor held nothing back and the first candidate
+// found won for both cards. Orc's toggle played Goblin's travel on Orc's body, and
+// orcRM, claimed by nobody, showed as a stray card beside the pair.
+func TestACharactersOwnRootMotionSubfolderPairsWithIt(t *testing.T) {
+	sibling, suppressed := buildRootMotionPairs([]assetindex.Asset{
+		zipAnim("goblin", "acme", "Chars", "/p.zip", "Anims/Goblin/Walk.fbx"),
+		zipAnim("goblinRM", "acme", "Chars", "/p.zip", "Anims/Goblin/RM/Walk_RM.fbx"),
+		zipAnim("orc", "acme", "Chars", "/p.zip", "Anims/Orc/Walk.fbx"),
+		zipAnim("orcRM", "acme", "Chars", "/p.zip", "Anims/Orc/RM/Walk_RM.fbx"),
+	})
+	for card, want := range map[string]string{"goblin": "goblinRM", "orc": "orcRM"} {
+		if got := sibling[card]; got != want {
+			t.Errorf("%s paired with %q, want %q: the shared path head is what tells them apart here", card, got, want)
+		}
+	}
+	for _, rm := range []string{"goblinRM", "orcRM"} {
+		if !suppressed[rm] {
+			t.Errorf("%s was not suppressed, so it shows as a stray card beside the one that plays it", rm)
+		}
+	}
+}
+
+// The head is only a tie-break, never the ranking. A loose library carries absolute
+// paths, so every candidate in a group shares the whole /lib/vendor/pack prefix: read
+// as the primary term it would tie them all again and hand the mirrored tree back to
+// scan order. The tail still decides, and the head only separates what it leaves equal.
+func TestASharedPathHeadDoesNotOutrankASharedTail(t *testing.T) {
+	sibling, _ := buildRootMotionPairs([]assetindex.Asset{
+		looseAnim("goblin", "acme", "Chars", "/lib/Chars/Anims/Goblin/Walk.fbx", ""),
+		// Deeper under the card's own head, but sharing no trailing segment with it.
+		looseAnim("nearRM", "acme", "Chars", "/lib/Chars/Anims/Goblin/Extra/Deep/Walk_RM.fbx", ""),
+		// Further from the head, and the character's own name at the tail.
+		looseAnim("ownRM", "acme", "Chars", "/lib/Chars/RootMotion/Goblin/Walk_RM.fbx", ""),
+	})
+	if got := sibling["goblin"]; got != "ownRM" {
+		t.Errorf("goblin paired with %q, want ownRM: a shared trailing segment outranks a longer shared prefix", got)
+	}
+}
+
 // One pack, two container formats laid out differently. The same-directory probe is
 // asked per format: read over the group as a whole, the FBX pair — which a GLB clip can
 // never select, since pickRM requires the same extension — answered for the GLB copies

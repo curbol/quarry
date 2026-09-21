@@ -41,11 +41,19 @@ test('scrolling a row does not rebuild the window', () => {
 });
 
 test('a long scroll rebuilds rarely and never leaves a hole', () => {
-  const { rebuilds, holes } = scroll({ fromRow: 0, toRow: 3000, total: BIG });
+  const ROWS = 3000;
+  const { rebuilds, holes } = scroll({ fromRow: 0, toRow: ROWS, total: BIG });
   assert.equal(holes, 0, 'the viewport saw cards outside the live range');
-  // The bound is what makes this a test rather than a description: the broken version
-  // scored one rebuild per row.
-  assert.ok(rebuilds < 100, `${rebuilds} rebuilds over 3000 rows; expected far fewer`);
+  // Derived from the two constants rather than picked, so it stays meaningful if either
+  // is tuned. The window is centred, so a rebuild leaves half of it ahead of the
+  // viewport and is due again once that margin falls to SLACK: each one buys
+  // LIVE/cols/2 - SLACK/cols rows of scroll. A quarter over that is headroom for the
+  // row-snapping; a flat "under a hundred" left room for a near-doubling of the real
+  // rate, which is the regression shape that stays invisible in the UI.
+  const perRebuild = LIVE / COLS / 2 - SLACK / COLS;
+  const budget = Math.ceil((ROWS / perRebuild) * 1.25);
+  assert.ok(rebuilds <= budget,
+    `${rebuilds} rebuilds over ${ROWS} rows, budget ${budget}: the window is being rebuilt far more often than its margins call for`);
 });
 
 test('scrolling back up is as cheap as scrolling down', () => {

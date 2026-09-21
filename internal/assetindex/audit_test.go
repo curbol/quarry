@@ -32,6 +32,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func libRoot(t *testing.T) (root string, mk func(...string) string) {
@@ -3636,5 +3637,285 @@ func TestAnArchiveWithNoRecordedPrintStillServesAndStillRepairs(t *testing.T) {
 	}
 	if string(got) != "FBXBYTES" {
 		t.Errorf("read %q after the repair, want %q", got, "FBXBYTES")
+	}
+}
+
+// A library's locators are whatever bytes its filesystem and its archives happen to
+// hold, and the cache is JSON: encoding/json replaces an invalid UTF-8 byte with
+// U+FFFD and says nothing. Older Windows zip tooling stores entry names in CP437, the
+// same tooling the backslash-separator rule exists for, so this is the ordinary shape
+// rather than a contrived one — and the failure it produced was a card that stays in
+// the grid, resolves by id and is still taggable, whose bytes 404 on every run after
+// the first, with --reindex repairing it for exactly one run.
+//
+// Built twice on purpose. The cache is the only component that changes the bytes, and
+// TestEverySpellingOfOnePackIndexesTheSame — the other whole-index equivalence test —
+// varies separators rather than encodings, so nothing here read a locator back.
+func TestALocatorTheCacheCannotRepresentIsNotCached(t *testing.T) {
+	const raw = "SourceFiles/Caf\xe9.fbx"
+	if utf8.ValidString(raw) {
+		t.Fatal("the fixture name is valid UTF-8; this test is asserting nothing")
+	}
+	data := []byte("FBXBYTES-HELLO")
+
+	root, mk := libRoot(t)
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	// CreateRaw, because Create rejects a name it cannot store as UTF-8 by flagging it
+	// rather than leaving the bytes alone.
+	w, err := zw.CreateRaw(&zip.FileHeader{
+		Name: raw, Method: zip.Store,
+		CRC32: crc32.ChecksumIEEE(data), CompressedSize64: uint64(len(data)), UncompressedSize64: uint64(len(data)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(mk("synty", "POLYGON", "POLYGON_SourceFiles_v1.zip"), buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A loose file of the same shape, whose path is a cache map *key* and mangles the
+	// same way, and a unitypackage whose pathname is what the card is named after.
+	if err := os.WriteFile(mk("synty", "POLYGON", "Caf\xe9.png"), []byte("PNGBYTES"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeUnityPackage(t, mk("synty", "POLYGON", "POLYGON_Unity_2022_3_v1.unitypackage"), []unityGUID{
+		{guid: "aaa", pathname: "Assets/P/Caf\xe9.fbx", asset: "UNITYBYTES"},
+	})
+
+	opt := Options{Root: root, CacheDir: t.TempDir()}
+	for _, run := range []string{"first run, fresh scan", "second run, through the cache"} {
+		ix, err := LoadOrBuild(opt, false, func(string) {})
+		if err != nil {
+			t.Fatalf("%s: LoadOrBuild: %v", run, err)
+		}
+		if len(ix.Assets) != 3 {
+			t.Fatalf("%s: %d assets, want 3", run, len(ix.Assets))
+		}
+		for _, a := range ix.Assets {
+			if !strings.Contains(a.RelPath, "Caf\xe9") {
+				t.Errorf("%s: %q lost its name to the cache", run, a.RelPath)
+			}
+			rc, _, err := ix.Open(a)
+			if err != nil {
+				t.Errorf("%s: Open(%s): %v", run, a.RelPath, err)
+				continue
+			}
+			rc.Close()
+		}
+	}
+}
+
+// A zip writer may leave the CRC field unset, and a zero CRC over non-empty bytes is
+// the absence of a fingerprint rather than one — degrading it to "" is what stops every
+// such entry of one size from sharing a print and tagging together. The entry is still
+// an entry: it indexes, it serves, and it is only untaggable. Nothing exercised that
+// end to end, so a scan that skipped it, or substituted a path-derived print for it,
+// passed the whole suite.
+func TestAZipEntryWithNoRecordedCRCStillIndexesAndServes(t *testing.T) {
+	root, mk := libRoot(t)
+	data := []byte("MODELBYTES")
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	w, err := zw.CreateRaw(&zip.FileHeader{
+		Name: "SourceFiles/Sword.fbx", Method: zip.Store,
+		CRC32: 0, CompressedSize64: uint64(len(data)), UncompressedSize64: uint64(len(data)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(mk("synty", "POLYGON", "POLYGON_SourceFiles_v1.zip"), buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ix, err := Build(Options{Root: root, CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ix.Assets) != 1 {
+		t.Fatalf("%d assets, want the entry indexed despite its missing CRC", len(ix.Assets))
+	}
+	a := ix.Assets[0]
+	if a.Fingerprint != "" {
+		t.Errorf("Fingerprint = %q, want empty: a zero CRC over non-empty bytes is the absence of one, and a constant here tags every such entry of this size together", a.Fingerprint)
+	}
+	rc, size, err := ix.Open(a)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer rc.Close()
+	got, _ := io.ReadAll(rc)
+	if string(got) != string(data) || size != int64(len(data)) {
+		t.Errorf("served %q (%d bytes), want the entry's own content", got, size)
+	}
+}
+
+// A directory this run could not read is not a directory whose packs are gone, and the
+// keep-set cannot tell them apart on its own: it is built from what the walk reached.
+// A drive offline for one run, a permission that slipped, and every extraction beneath
+// it is swept — hundreds of MB per Synty pack, and deleted out from under a second
+// quarry that is still serving them, which --addr exists to allow.
+func TestPruneKeepsWhatTheWalkCouldNotLookAt(t *testing.T) {
+	root, mk := libRoot(t)
+	pkg := mk("synty", "P", "P_Unity_2022_3_v1.unitypackage")
+	writeUnityPackage(t, pkg, []unityGUID{
+		{guid: "aaa", pathname: "Assets/P/Rock.fbx", asset: "ROCKBYTES"},
+	})
+	opt := Options{Root: root, CacheDir: t.TempDir()}
+
+	ix, err := LoadOrBuild(opt, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	live, err := ix.ensureExtracted(pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(live); err != nil {
+		t.Fatalf("the extraction is not there to begin with: %v", err)
+	}
+
+	packDir := filepath.Dir(pkg)
+	if err := os.Chmod(packDir, 0o000); err != nil {
+		t.Skipf("cannot make a directory unreadable here: %v", err)
+	}
+	t.Cleanup(func() { os.Chmod(packDir, 0o755) })
+	if f, err := os.Open(packDir); err == nil { // running as root: the chmod means nothing
+		f.Close()
+		t.Skip("this user can read a 0000 directory; the case cannot be staged")
+	}
+
+	next, err := LoadOrBuild(opt, false, func(string) {})
+	if err != nil {
+		t.Fatalf("a library with one unreadable corner must still index: %v", err)
+	}
+	if len(next.Skipped) == 0 {
+		t.Fatal("the unreadable directory was not recorded as a skip; the retention below has nothing to read")
+	}
+	if err := next.PruneUnpacked(); err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	if _, err := os.Stat(live); err != nil {
+		t.Errorf("the extraction of a pack behind an unreadable directory was swept: %v", err)
+	}
+
+	// And the other direction, which is what keeps this from being "never prune": a
+	// pack genuinely deleted, with the directory readable, still loses its extraction.
+	os.Chmod(packDir, 0o755)
+	if err := os.Remove(pkg); err != nil {
+		t.Fatal(err)
+	}
+	gone, err := LoadOrBuild(opt, false, func(string) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gone.PruneUnpacked(); err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	if _, err := os.Stat(live); !os.IsNotExist(err) {
+		t.Errorf("the extraction of a deleted pack survived the prune (%v)", err)
+	}
+}
+
+// State is keyed by root so two libraries sharing a cache dir cannot prune each other's
+// extractions — which also means a root nobody opens again is consulted by nothing and
+// kept forever: a 100MB index JSON plus every unitypackage extraction under it, stranded
+// by a moved library, a config.toml pointed elsewhere, or one --follow-symlinks flip.
+//
+// Age is the evidence, and the cache dir is whatever the user named, so the bar for
+// deleting a directory under it is that it looks like one quarry wrote.
+func TestAnAbandonedRootsStateIsSweptByAge(t *testing.T) {
+	cacheDir := t.TempDir()
+	roots := filepath.Join(cacheDir, "roots")
+
+	stale := filepath.Join(roots, "0123456789ab")
+	fresh := filepath.Join(roots, "ba9876543210")
+	theirs := filepath.Join(roots, "my own notes")
+	for _, d := range []string{stale, fresh, theirs} {
+		if err := os.MkdirAll(filepath.Join(d, "unpacked", "24", "deadbeef"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(d, "index.json"), []byte(`{"version":25,"root":"/somewhere","assets":[]}`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A directory of the user's that merely sits here, with no index of ours in it.
+	notOurs := filepath.Join(roots, "cafebabe1234")
+	if err := os.MkdirAll(notOurs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(notOurs, "index.json"), []byte("# my notes\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-2 * staleRootAge)
+	for _, d := range []string{stale, theirs, notOurs} {
+		if err := os.Chtimes(filepath.Join(d, "index.json"), old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	root, mk := libRoot(t)
+	os.WriteFile(mk("synty", "P", "Rock.fbx"), []byte("FBX"), 0o644)
+	ix, err := LoadOrBuild(Options{Root: root, CacheDir: cacheDir}, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ix.PruneUnpacked(); err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Errorf("a root untouched for %v survived (%v); its index and extractions are stranded forever", staleRootAge, err)
+	}
+	if _, err := os.Stat(fresh); err != nil {
+		t.Errorf("a root whose index was written recently was swept: %v", err)
+	}
+	if _, err := os.Stat(theirs); err != nil {
+		t.Errorf("a directory not named the way stateDir names one was swept: %v", err)
+	}
+	if _, err := os.Stat(notOurs); err != nil {
+		t.Errorf("a directory holding a file of the user's rather than an index of ours was swept: %v", err)
+	}
+	// This run's own state is still here, whatever its mtime says.
+	if _, err := os.Stat(ix.stateDir()); err != nil {
+		t.Errorf("the running index's own state was swept: %v", err)
+	}
+}
+
+// The cache-dir refusal is about overlap, and overlap has two directions. A link
+// pointing into the cache dir puts the library on top of quarry's own output just as a
+// cache dir inside the library does: the walk indexes every extracted member as a loose
+// file and re-reads the index JSON, whose print moves every time a save rewrites it.
+func TestALinkIntoTheCacheDirIsRefused(t *testing.T) {
+	cacheDir := t.TempDir()
+	inside := filepath.Join(cacheDir, "roots", "0123456789ab", "unpacked")
+	if err := os.MkdirAll(inside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	root, mk := libRoot(t)
+	if err := os.Symlink(inside, mk("lib", "extracted")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	_, err := Build(Options{Root: root, CacheDir: cacheDir, FollowSymlinks: true})
+	if err == nil {
+		t.Fatal("a scan that follows a link into the cache dir was allowed")
+	}
+	if !strings.Contains(err.Error(), "cache dir") {
+		t.Errorf("error = %v, want one naming the cache dir so the user knows what to move", err)
+	}
+	// Not followed, the link is dropped like any other and the scan is fine.
+	if _, err := Build(Options{Root: root, CacheDir: cacheDir}); err != nil {
+		t.Errorf("without --follow-symlinks the link goes nowhere and the scan must still run: %v", err)
 	}
 }

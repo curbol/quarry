@@ -63,7 +63,12 @@ stale caches rebuild themselves rather than serving wrong data. An archive whose
 never changed keeps its fingerprint, so the version is the only thing that can tell an
 extraction made by older code from what the current code would write. Each pack update
 extracts under a new fingerprint, so a prune on startup drops both the extractions the
-current index no longer references and every tree from another version.
+current index no longer references and every tree from another version. Keyed per root,
+that reaches only this library's own tree, so the prune also clears a *sibling* root
+whose state nothing has touched in weeks — every run rewrites its own index JSON at
+startup, so an untouched one belongs to no library anyone still opens, and without this
+a moved library or a `--follow-symlinks` flip strands a 100MB index and every extraction
+under it forever.
 
 All of it lives under `<cache>/roots/<hash of the scan root and follow_symlinks>/`, keyed
 by what the walk covers because an index and its extractions describe one library. `--root`
@@ -77,7 +82,9 @@ one root's index with another's path. The cache dir may not sit inside the scan 
 tree quarry promises not to write to is not somewhere to put the index and every unpacked
 archive, and the next run would index its own output. Under `--follow-symlinks` the library
 is the root *and* every target the walk followed, so the same refusal applies to those —
-checked after the walk, since that is when they are known.
+checked after the walk, since that is when they are known, and asked both ways round,
+because a link pointing *into* the cache dir overlaps exactly as badly as a cache dir
+inside the library.
 
 Reuse is keyed on a file's stat print alone, never on whether it left assets behind — an
 archive whose every entry is deduped away by an extracted twin contributes nothing, and
@@ -87,11 +94,19 @@ rather than of the archive: the loose twin can be deleted while the archive's pr
 not move, and a refresh reusing only the survivors would carry the suppression forward
 and lose the asset with nothing reported. A derivation that failed is
 deliberately *not* cached: the print describes the file, not whether reading it worked, so
-caching one would keep serving the degraded result long after the cause was fixed.
+caching one would keep serving the degraded result long after the cause was fixed. Nor is
+one the cache cannot reproduce: the index is JSON, and `encoding/json` replaces an invalid
+UTF-8 byte with U+FFFD without reporting it, so a locator carrying one — a zip entry name
+older Windows tooling stored in CP437, a file name that is not UTF-8 — would come back
+naming something the archive does not carry, and the card would 404 on every run after the
+first. Such a file is re-derived each run instead, since its path is a cache key and
+mangles the same way.
 
 One unreadable file or directory costs itself, not the run: a damaged archive, a
 directory the user cannot read, a file that disappears mid-walk are all recorded as
-skips and reported, because browse treats a build failure as fatal and would otherwise
+skips and reported, and everything the previous index placed under a directory the walk
+could not look inside keeps its extraction for that run, since a pack that cannot be
+reached is not a pack that is gone, because browse treats a build failure as fatal and would otherwise
 refuse to start over one bad corner of a large library. An unreadable root is still an
 error — that is not a partial library, it is no library.
 

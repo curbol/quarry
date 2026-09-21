@@ -188,12 +188,6 @@ func (s *Store) ensure(id string) {
 	}
 }
 
-// Has reports whether a tag is defined.
-func (s *Store) has(id string) bool { _, ok := s.colors[id]; return ok }
-
-// Color returns a tag's color and whether it is defined.
-func (s *Store) color(id string) (string, bool) { c, ok := s.colors[id]; return c, ok }
-
 // Assign applies a tag to a fingerprint, defining the tag (default color) if new.
 func (s *Store) Assign(fp, id string) {
 	if fp == "" || id == "" {
@@ -264,7 +258,10 @@ func (s *Store) Delete(id string) {
 	}
 }
 
-// TagsFor returns the sorted tag ids applied to a fingerprint.
+// TagsFor returns the sorted tag ids applied to a fingerprint, and an empty slice
+// rather than nil for one carrying none. Never nil, unlike Related: browse serializes
+// what this returns straight into a card, where nil would be a JSON null for an
+// untagged card and [] for a tagged one emptied since.
 func (s *Store) TagsFor(fp string) []string { return sortedKeys(s.assign[fp]) }
 
 // HasGroups reports whether any link group exists, so a caller resolving companions
@@ -353,11 +350,8 @@ func (s *Store) Groups() [][]string {
 	return out
 }
 
-// FingerprintsByTag returns the fingerprints carrying each tag. Counts answers "how
-// many assignments"; a caller that has to fold those onto something else — the cards
-// they land on, or the subset the current index actually holds — needs the
-// fingerprints themselves, and building that per tag from the outside would be a pass
-// over every assignment per tag rather than one pass in total.
+// FingerprintsByTag returns the fingerprints carrying each tag. A tag no fingerprint
+// carries is absent from the map rather than present and empty.
 func (s *Store) FingerprintsByTag() map[string][]string {
 	m := make(map[string][]string, len(s.colors))
 	for fp, set := range s.assign {

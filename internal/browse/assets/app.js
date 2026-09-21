@@ -2,7 +2,7 @@ import { contentURL, thumbURL } from '/static/charstore.js';
 import { lazyWork, modelThumbs, forgetThumbs, ensureFont } from '/static/thumbs.js';
 import { LIVE, wantedRange, visibleRange, needsRebuild, spacerRows, windowDelta } from '/static/gridwindow.js';
 import { iconEl, protoClone } from '/static/icons.js';
-import { nextTags } from '/static/tagedit.js';
+import { foldTagEdit } from '/static/tagedit.js';
 
 const PAGE = 200;
 // How long a failed page waits before a scroll may retry it. Long enough that one
@@ -540,45 +540,14 @@ function unwatchTags(entry) {
   }
 }
 
-// applyTagChange folds one edit into every card that shares a fingerprint with it.
-// What the edit does to a card is nextTags; this is which cards it reaches.
+// applyTagChange folds one edit into the result set and repaints what shows it. Which
+// entries it reaches, and that each is touched once, is foldTagEdit; this is the two
+// indexes and the DOM call. Every watcher's asset is an entry foldTagEdit already
+// folded into — a watcher is registered by card(), which is only ever handed a member
+// of the result set, and both indexes key on the same fingerprints.
 function applyTagChange(fingerprints, tag, on) {
-  // The model first, over every entry in the result set. Folding the edit in here
-  // rather than inside the repaint loop is what reaches an entry whose card the grid
-  // window has recycled out, or never built.
-  const seen = new Set();
-  for (const fp of fingerprints) {
-    for (const a of tagHolders.get(fp) || []) {
-      if (seen.has(a)) continue;
-      seen.add(a);
-      a.tags = nextTags({
-        cardFingerprints: a.fingerprints,
-        cardTags: a.tags,
-        edited: fingerprints,
-        tag,
-        on,
-      });
-    }
-  }
-  // Then the repaints. A card's asset is an entry the loop above already folded into,
-  // except for one the lightbox's related strip built from its own fetch — those are
-  // not in the result set, so they still need the edit applied here.
-  const done = new Set();
-  for (const fp of fingerprints) {
-    for (const e of tagWatchers.get(fp) || []) {
-      if (done.has(e)) continue;
-      done.add(e);
-      if (!seen.has(e.asset)) {
-        e.asset.tags = nextTags({
-          cardFingerprints: e.asset.fingerprints,
-          cardTags: e.asset.tags,
-          edited: fingerprints,
-          tag,
-          on,
-        });
-      }
-      e.repaint();
-    }
+  for (const e of foldTagEdit({ holders: tagHolders, watchers: tagWatchers, fingerprints, tag, on })) {
+    e.repaint();
   }
 }
 
@@ -1204,7 +1173,27 @@ function updateLbNav() {
 // to cover the assignment: arrowing on before it resolves would otherwise leave a viewer
 // running for the previous asset with nothing holding it to stop.
 async function startViewerFor(a, gen) {
-  const { startViewer } = await import('/static/viewer.js');
+  let startViewer;
+  try {
+    ({ startViewer } = await import('/static/viewer.js'));
+  } catch (e) {
+    // A module the browser could not fetch or instantiate — quarry restarted since the
+    // page loaded, or a name viewer.js imports from scene.js stopped existing, which
+    // nothing in the repo would catch because nothing else ever loads either file. The
+    // rejection is the only signal there is, and the module map remembers the failure,
+    // so every later import() of the same specifier rejects at once: unhandled, every
+    // 3D card in the session opens onto an empty pane with nothing said.
+    if (gen !== lbGen) return;
+    console.error('the 3D preview module failed to load', e);
+    const box = document.createElement('div');
+    box.className = 'lb-placeholder';
+    box.appendChild(iconEl(a.category));
+    const p = document.createElement('p');
+    p.textContent = '3D preview unavailable. Reload the page to try again.';
+    box.appendChild(p);
+    lb.view.appendChild(box);
+    return;
+  }
   if (gen !== lbGen) return;
   activeViewer = startViewer(lb.view, a, { character: lb.character });
 }

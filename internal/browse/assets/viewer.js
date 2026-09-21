@@ -275,15 +275,27 @@ export function startViewer(container, asset, panels) {
     motionOf = pairClipsByName(playInPlace, playMotion);
     inPlaceOf = pairClipsByName(playMotion, playInPlace);
     moveBtn.hidden = false;
-    clips = motionOn ? playMotion : playInPlace;
-    if (!motionOn) { syncMoveBtn(); return; }
-    if (ctrls) ctrls.setClips(clips);
+    if (!motionOn) { clips = playInPlace; syncMoveBtn(); return; }
     // curClip indexes the set being replaced — the algorithmically stripped clips, which
     // run parallel to the native ones — so it has to be carried across by name like any
     // other swap. Held as an index it lands wherever that position is in a file the
     // viewer has only just loaded.
-    const next = motionOf[curClip];
-    playClip(next);
+    //
+    // Asked through the same predicate the toggle button is enabled by, rather than
+    // read straight out of the pairing: an unpaired clip pairs to -1, and playClip
+    // falls through that to the sibling's first clip — one animation presented as
+    // another's travel variant, out of a file that loads, with nothing to signal it.
+    // With no counterpart to show, the toggle goes back off rather than guessing.
+    if (!togglePairable(motionOf, curClip)) {
+      motionOn = false;
+      moveBtn.classList.remove('on');
+      clips = playInPlace;
+      syncMoveBtn();
+      return;
+    }
+    clips = playMotion;
+    if (ctrls) ctrls.setClips(clips);
+    playClip(motionOf[curClip]);
   };
 
   const buildPlayback = (mixerRoot, cs, charInfo, rootRest, rmCs) => {

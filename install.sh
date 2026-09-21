@@ -113,9 +113,22 @@ install() {
   local hdr; hdr=$(auth_header)
   if [[ -n "$hdr" ]]; then
     # Private repo: resolve the asset's API URL, then download with the token.
+    # The asset's api url is the last bare "url" seen before its own "name", and a
+    # name that is not the one wanted clears it — so a url can only ever be printed
+    # for the object it was read from, and a field added between the two leaves the
+    # match intact. Position is no good here: GitHub emits url, id, node_id, name,
+    # and this object has grown fields lately, so "three lines above the name" has no
+    # margin at all and going empty fails the install on a release that does carry the
+    # asset. The "_url" exclusion drops html_url, browser_download_url and the rest;
+    # the uploader's own bare "url" sits after the asset's name, so a non-matching
+    # name has already cleared it.
     local url
     url=$(curl_auth "https://api.github.com/repos/${REPO}/releases/tags/v${VERSION}" \
-      | grep -F -B3 "\"name\": \"${file}\"" | grep -F '"url"' | sed -E 's/.*"url": "([^"]+)".*/\1/') || true
+      | awk -v want="\"name\": \"${file}\"" '
+          /"url":[[:space:]]*"/ && $0 !~ /_url":/ { u = $0; next }
+          /"name":[[:space:]]*"/ { if (index($0, want)) { print u; exit } ; u = "" }
+        ' \
+      | sed -E 's/.*"url":[[:space:]]*"([^"]+)".*/\1/') || true
     [[ -n "$url" ]] || { err "asset ${file} not found in release v${VERSION}"; exit 1; }
     curl_auth -H "Accept: application/octet-stream" -o "${tmp}/${file}" "$url"
   else

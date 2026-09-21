@@ -151,8 +151,7 @@ func TestRejectedPatchLeavesNothingBehindInMemory(t *testing.T) {
 		t.Fatalf("patch with a bad color status = %d, want 400", resp.StatusCode)
 	}
 
-	var p paletteResp
-	decode(t, doJSON(t, "GET", srv.URL+"/api/tags", nil), &p)
+	p := palette(t, srv)
 	ids := []string{}
 	for _, tg := range p.Tags {
 		ids = append(ids, tg.ID)
@@ -681,8 +680,7 @@ func TestAnEditRefusedAsStaleLeavesNeitherDiskNorMemoryAhead(t *testing.T) {
 		t.Fatalf("assign over an externally edited store = %d, want 409", resp.StatusCode)
 	}
 
-	var p paletteResp
-	decode(t, doJSON(t, "GET", srv.URL+"/api/tags", nil), &p)
+	p := palette(t, srv)
 	ids := map[string]bool{}
 	for _, tg := range p.Tags {
 		ids[tg.ID] = true
@@ -774,81 +772,288 @@ func frontendSources(t *testing.T) map[string]string {
 func TestEveryMutatingFetchSendsAJSONContentType(t *testing.T) {
 	// A fetch with a method is a mutating one; a bare fetch(url) is a GET.
 	call := regexp.MustCompile(`(?s)fetch\((.{0,400}?)\)\s*[,;)]`)
+	// Both spellings of the property. Matching the literal "method:" saw only the one
+	// that names its verb inline and walked straight past `{ method, headers: … }`,
+	// where the verb is a variable — which is every tag write the page makes.
+	method := regexp.MustCompile(`\bmethod\s*[:,}]`)
+	var mutating int
 	for name, src := range frontendSources(t) {
 		for _, m := range call.FindAllStringSubmatch(src, -1) {
 			args := m[1]
-			if !strings.Contains(args, "method:") {
+			if !method.MatchString(args) {
 				continue
 			}
+			mutating++
 			if !strings.Contains(args, "application/json") {
 				t.Errorf("%s: a fetch with a method does not send an application/json content-type, "+
 					"which is what forces the preflight that protects the write endpoints:\n\tfetch(%s)", name, args)
 			}
 		}
 	}
+	// The frontend makes two mutating fetches, and they duplicate their method, headers
+	// and body verbatim — the obvious thing to fold into a postJSON helper, which this
+	// regex (keyed on `method:` inside a fetch call) would then match none of. Silent,
+	// it would go on passing while nothing checked the rule at all; loud, it has to be
+	// re-pointed at the helper.
+	if mutating < 2 {
+		t.Errorf("found %d mutating fetches in the frontend; this guard has stopped reading it", mutating)
+	}
 }
 
-// Asset names come from a user's filesystem, so a crafted one reaching innerHTML as
+// jsFunc is one named function in a frontend module: where its header sits, and the
+// parameters it takes. Both spellings the frontend uses, because the two hops that
+// carry markup today are one of each — a `function` that assigns the sink, called from
+// an arrow that takes the markup itself.
+type jsFunc struct {
+	name   string
+	params []string
+	at     int
+}
+
+var jsFuncDecl = regexp.MustCompile(`(?m)^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(([^)]*)\)|^\s*(?:export\s+)?const\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?\(([^)]*)\)\s*=>`)
+
+func jsFuncs(src string) []jsFunc {
+	var out []jsFunc
+	for _, m := range jsFuncDecl.FindAllStringSubmatchIndex(src, -1) {
+		name, params := 1, 2
+		if m[2*name] < 0 {
+			name, params = 3, 4
+		}
+		var ps []string
+		for _, p := range strings.Split(src[m[2*params]:m[2*params+1]], ",") {
+			if p = strings.TrimSpace(p); p != "" {
+				ps = append(ps, p)
+			}
+		}
+		out = append(out, jsFunc{name: src[m[2*name]:m[2*name+1]], params: ps, at: m[0]})
+	}
+	return out
+}
+
+// enclosing is the function an offset sits inside: the last header before it.
+func enclosing(fns []jsFunc, off int) (jsFunc, bool) {
+	best, ok := jsFunc{}, false
+	for _, f := range fns {
+		if f.at <= off {
+			best, ok = f, true
+		}
+	}
+	return best, ok
+}
+
+// splitTopLevel breaks a call's argument list on the commas that belong to it, leaving
+// the ones inside a nested call, a literal or a template alone.
+func splitTopLevel(s string) []string {
+	var out []string
+	depth, start := 0, 0
+	var quote rune
+	for i, r := range s {
+		switch {
+		case quote != 0:
+			if r == quote && (i == 0 || s[i-1] != '\\') {
+				quote = 0
+			}
+		case r == '\'' || r == '"' || r == '`':
+			quote = r
+		case r == '(' || r == '[' || r == '{':
+			depth++
+		case r == ')' || r == ']' || r == '}':
+			depth--
+		case r == ',' && depth == 0:
+			out = append(out, strings.TrimSpace(s[start:i]))
+			start = i + 1
+		}
+	}
+	if rest := strings.TrimSpace(s[start:]); rest != "" {
+		out = append(out, rest)
+	}
+	return out
+}
+
+// callSites returns the argument lists of every call to name in src, with the offset
+// of each call so the function it sits inside can be found. The declaration's own
+// header is not a call: counted as one, a function that assigns its parameter to a
+// sink resolves that parameter to itself and the walk never terminates.
+func callSites(src, name string) (args [][]string, at []int) {
+	call := regexp.MustCompile(`\b` + regexp.QuoteMeta(name) + `\s*\(`)
+	decl := regexp.MustCompile(`function\s+$`)
+	for _, m := range call.FindAllStringIndex(src, -1) {
+		if decl.MatchString(src[:m[0]]) {
+			continue
+		}
+		depth, end := 0, -1
+		var quote rune
+		for i, r := range src[m[1]-1:] {
+			if quote != 0 {
+				if r == quote {
+					quote = 0
+				}
+				continue
+			}
+			switch r {
+			case '\'', '"', '`':
+				quote = r
+			case '(':
+				depth++
+			case ')':
+				if depth--; depth == 0 {
+					end = m[1] - 1 + i
+				}
+			}
+			if end >= 0 {
+				break
+			}
+		}
+		if end < 0 {
+			continue
+		}
+		args = append(args, splitTopLevel(src[m[1]:end]))
+		at = append(at, m[0])
+	}
+	return args, at
+}
+
+// Asset names come from a user's filesystem, so a crafted one reaching the DOM as
 // markup is a real, if small, injection. Enforced statically because the dangerous
 // version renders identically to the safe one, and no request-level test can see it.
 //
+// Every sink the DOM offers, not just the one the frontend happens to use today:
+// insertAdjacentHTML and outerHTML parse markup exactly as innerHTML does, and a guard
+// that names one of them reads as though it covers the rule while leaving the others
+// open.
+//
 // The rule is about what gets interpolated, not about the shape of the assignment:
 // every value spliced into markup must either be an ALL-CAPS constant this repo wrote
-// or go through escapeHTML. A bare identifier is resolved to its declaration once, so
-// markup assembled a line earlier is checked rather than waved through.
-func TestNothingUserDerivedReachesInnerHTML(t *testing.T) {
-	assign := regexp.MustCompile(`innerHTML\s*=\s*([^;\n]+)`)
+// or go through escapeHTML. A bare identifier is resolved — to its declaration in the
+// file, or, when it is a parameter, to the arguments every caller passes at that
+// position, in whichever module the call lives. Stopping at the parameter is what left
+// icons.js's exported protoClone(cache, key, markup) unchecked, two hops from a call
+// site anywhere in the page, with the sink itself inside a module holding nothing but
+// constants.
+func TestNothingUserDerivedReachesAnHTMLSink(t *testing.T) {
+	// The sinks, and which capture holds the markup.
+	sinks := []struct {
+		re  *regexp.Regexp
+		arg int // 0 = the whole capture is the value; >0 = that argument of the call
+	}{
+		{regexp.MustCompile(`\.innerHTML\s*=\s*([^;\n]+)`), 0},
+		{regexp.MustCompile(`\.outerHTML\s*=\s*([^;\n]+)`), 0},
+		{regexp.MustCompile(`\.insertAdjacentHTML\s*\(([^;\n]+)\)`), 2},
+		{regexp.MustCompile(`document\.write(?:ln)?\s*\(([^;\n]+)\)`), 1},
+	}
 	interp := regexp.MustCompile(`\$\{([^}]*)\}`)
 	ident := regexp.MustCompile(`^[A-Za-z_$][\w$]*$`)
 	// The root of an expression: the identifier everything else hangs off.
 	root := regexp.MustCompile(`[A-Za-z_$][\w$]*`)
 	allCaps := regexp.MustCompile(`^[A-Z][A-Z0-9_]*$`)
-
 	// Property names and index keys are not values: ICONS[category] yields whatever
 	// ICONS holds no matter what category is, so indexing a constant table stays
 	// constant. Stripping them first leaves only the identifiers whose contents
 	// actually reach the markup.
 	prop := regexp.MustCompile(`\.[A-Za-z_$][\w$]*`)
 	index := regexp.MustCompile(`\[[^\]]*\]`)
-	safeExpr := func(e string) bool {
-		e = strings.TrimSpace(e)
-		if strings.Contains(e, "escapeHTML(") {
-			return true
-		}
-		e = index.ReplaceAllString(e, "")
-		e = prop.ReplaceAllString(e, "")
-		for _, r := range root.FindAllString(e, -1) {
-			if !allCaps.MatchString(r) {
-				return false
-			}
-		}
-		return true
+
+	srcs := frontendSources(t)
+	funcs := map[string][]jsFunc{}
+	for name, src := range srcs {
+		funcs[name] = jsFuncs(src)
 	}
 
-	for name, src := range frontendSources(t) {
-		for _, m := range assign.FindAllStringSubmatch(src, -1) {
-			rhs := strings.TrimSpace(m[1])
-			check := rhs
-			if ident.MatchString(rhs) {
-				// Resolve the identifier to its declaration in this file, if it has one.
-				decl := regexp.MustCompile(`(?:const|let|var)\s+` + regexp.QuoteMeta(rhs) + `\s*=\s*([^;\n]+)`)
-				if d := decl.FindStringSubmatch(src); d != nil {
-					check = d[1]
-				} else {
-					continue // a parameter; its call sites supply the markup
+	var checked int
+	var safeValue func(file, expr string, off, depth int) (bool, string)
+	// safeParam asks what every caller passes at one parameter position.
+	safeParam := func(fn, param string, idx, depth int) (bool, string) {
+		seen := false
+		for caller, src := range srcs {
+			args, at := callSites(src, fn)
+			for i, a := range args {
+				if idx >= len(a) {
+					continue
 				}
-			}
-			for _, e := range interp.FindAllStringSubmatch(check, -1) {
-				if !safeExpr(e[1]) {
-					t.Errorf("%s: innerHTML markup interpolates %q, which is neither an ALL-CAPS constant "+
-						"nor escaped, so a crafted file name would reach the DOM as markup", name, strings.TrimSpace(e[1]))
+				seen = true
+				if ok, why := safeValue(caller, a[idx], at[i], depth+1); !ok {
+					return false, fmt.Sprintf("%s calls %s with %s for %s, and %s", caller, fn, a[idx], param, why)
 				}
-			}
-			if !ident.MatchString(check) && !strings.Contains(check, "${") && !safeExpr(check) &&
-				!strings.HasPrefix(check, "'") && !strings.HasPrefix(check, `"`) {
-				t.Errorf("%s: innerHTML is assigned %q, which is neither a constant nor escaped", name, check)
 			}
 		}
+		if !seen {
+			return false, fmt.Sprintf("nothing calls %s, so what reaches %s is unknown", fn, param)
+		}
+		return true, ""
+	}
+	safeValue = func(file, expr string, off, depth int) (bool, string) {
+		if depth > 6 {
+			return false, "the markup passes through more hops than this guard follows"
+		}
+		expr = strings.TrimSpace(expr)
+		safeExpr := func(e string) bool {
+			e = strings.TrimSpace(e)
+			if strings.Contains(e, "escapeHTML(") {
+				return true
+			}
+			e = index.ReplaceAllString(e, "")
+			e = prop.ReplaceAllString(e, "")
+			for _, r := range root.FindAllString(e, -1) {
+				if !allCaps.MatchString(r) {
+					return false
+				}
+			}
+			return true
+		}
+		if ident.MatchString(expr) {
+			// A declaration in this file resolves it; otherwise it is a parameter, and
+			// the callers decide.
+			decl := regexp.MustCompile(`(?:const|let|var)\s+` + regexp.QuoteMeta(expr) + `\s*=\s*([^;\n]+)`)
+			if d := decl.FindStringSubmatch(srcs[file]); d != nil {
+				return safeValue(file, d[1], off, depth+1)
+			}
+			fn, ok := enclosing(funcs[file], off)
+			if !ok {
+				return false, fmt.Sprintf("%q is neither declared here nor a parameter of anything", expr)
+			}
+			for i, p := range fn.params {
+				if p == expr {
+					return safeParam(fn.name, expr, i, depth)
+				}
+			}
+			return false, fmt.Sprintf("%q is not resolvable to a constant", expr)
+		}
+		for _, e := range interp.FindAllStringSubmatch(expr, -1) {
+			if !safeExpr(e[1]) {
+				return false, fmt.Sprintf("it interpolates %q, which is neither an ALL-CAPS constant nor escaped", strings.TrimSpace(e[1]))
+			}
+		}
+		if strings.Contains(expr, "${") || safeExpr(expr) ||
+			strings.HasPrefix(expr, "'") || strings.HasPrefix(expr, `"`) || strings.HasPrefix(expr, "`") {
+			return true, ""
+		}
+		return false, fmt.Sprintf("%q is neither a constant nor escaped", expr)
+	}
+
+	for name, src := range srcs {
+		for _, sink := range sinks {
+			for _, m := range sink.re.FindAllStringSubmatchIndex(src, -1) {
+				value := src[m[2]:m[3]]
+				if sink.arg > 0 {
+					args := splitTopLevel(value)
+					if len(args) < sink.arg {
+						continue
+					}
+					value = args[sink.arg-1]
+				}
+				checked++
+				if ok, why := safeValue(name, value, m[0], 0); !ok {
+					t.Errorf("%s: markup reaching an HTML sink is not safe: %s", name, why)
+				}
+			}
+		}
+	}
+	// Derived guards go quiet when their parsing stops matching, and this one enforces
+	// a rule nothing else does. The frontend has three sinks today; fewer than that
+	// means the regexes above are reading past them rather than that the page stopped
+	// building markup.
+	if checked < 3 {
+		t.Errorf("inspected %d HTML sinks; this guard has stopped reading the frontend", checked)
 	}
 }
 
@@ -1160,16 +1365,8 @@ func TestTagCountIsCardsAndNamesWhatIsOffIndex(t *testing.T) {
 	}
 	resp.Body.Close()
 
-	type paletteWithOff struct {
-		Tags []struct {
-			ID       string
-			Count    int
-			OffIndex int `json:"offIndex"`
-		}
-	}
-	read := func() paletteWithOff {
-		var p paletteWithOff
-		decode(t, doJSON(t, "GET", srv.URL+"/api/tags", nil), &p)
+	read := func() paletteResp {
+		p := palette(t, srv)
 		if len(p.Tags) != 1 || p.Tags[0].ID != "hero" {
 			t.Fatalf("palette = %+v, want one hero tag", p.Tags)
 		}
@@ -1250,14 +1447,7 @@ func TestTagCountsAreReachableInBothGroupingModes(t *testing.T) {
 	}
 	resp.Body.Close()
 
-	var p struct {
-		Tags []struct {
-			ID     string
-			Count  int
-			Assets int
-		}
-	}
-	decode(t, doJSON(t, "GET", srv.URL+"/api/tags", nil), &p)
+	p := palette(t, srv)
 	if len(p.Tags) != 1 || p.Tags[0].ID != "hero" {
 		t.Fatalf("palette = %+v, want one hero tag", p.Tags)
 	}
@@ -1875,10 +2065,21 @@ func TestRelatedDoesNotSurfaceASuppressedRootMotionSibling(t *testing.T) {
 	// The RM sibling is hidden from the grid, so its fingerprint is not reachable
 	// through /api/assets at all — which is the whole point. It is the content print of
 	// the bytes, so it is derivable here the same way the index derives it.
-	rmFP := crcFingerprintForTest([]byte("GLBBYTESRM"))
+	rmFP := crcPrint("GLBBYTESRM")
 	jump := itemByName(t, srv, "q=Jump", "Jump.glb")
 	if len(jump.Fingerprints) == 0 {
 		t.Fatal("the fixture card carries no fingerprint to link")
+	}
+	// The derived print has to be one the index actually holds, or the link below joins
+	// two strings nothing resolves, /api/related finds no suppressed card because there
+	// is none to find, and the whole test passes having exercised nothing. Tagging it is
+	// how that is asked: the palette counts an assignment the index does not hold as
+	// OffIndex rather than as a card.
+	doJSON(t, "POST", srv.URL+"/api/assign", map[string]any{"fingerprints": []string{rmFP}, "tag": "probe", "on": true}).Body.Close()
+	for _, tg := range palette(t, srv).Tags {
+		if tg.ID == "probe" && tg.OffIndex != 0 {
+			t.Fatalf("the derived root-motion print is off-index (%d), so it names no asset and this guard is asserting against nothing", tg.OffIndex)
+		}
 	}
 	fps := append([]string{rmFP}, jump.Fingerprints...)
 	doJSON(t, "POST", srv.URL+"/api/link", map[string]any{"fingerprints": fps, "on": true}).Body.Close()
@@ -1902,13 +2103,6 @@ func TestRelatedDoesNotSurfaceASuppressedRootMotionSibling(t *testing.T) {
 	if !sawWalk {
 		t.Fatal("/api/related returned no visible companion either; this guard is asserting against an empty response")
 	}
-}
-
-// crcFingerprintForTest mirrors assetindex's loose/zip print for a byte slice. The
-// scheme is asserted in assetindex's own tests; this is only how a test reaches the
-// print of an asset the grid deliberately does not show.
-func crcFingerprintForTest(b []byte) string {
-	return fmt.Sprintf("crc32:%08x:%d", crc32.ChecksumIEEE(b), len(b))
 }
 
 // tagmode is read as `and := mode == "and"`, so every other spelling is OR. That is the
@@ -2076,8 +2270,7 @@ func TestASuppressedSiblingIsNotCountedAsContentThisLibraryLacks(t *testing.T) {
 		}
 	}
 
-	var p paletteResp
-	decode(t, doJSON(t, "GET", srv.URL+"/api/tags", nil), &p)
+	p := palette(t, srv)
 	var hero *paletteTag
 	for i := range p.Tags {
 		if p.Tags[i].ID == "hero" {
@@ -2097,6 +2290,17 @@ func TestASuppressedSiblingIsNotCountedAsContentThisLibraryLacks(t *testing.T) {
 	if r := getAssets(t, srv, "tag=hero"); r.Total != 0 {
 		t.Errorf("?tag=hero returns %d cards, want 0; a count the query cannot reach is the thing being guarded", r.Total)
 	}
+}
+
+// palette reads /api/tags, decoded through the one struct tags_test declares for it:
+// three local copies each held a subset of the numbers a tag carries, so a fourth
+// number added to tagView had to be threaded into four decode targets and the local
+// ones were the ones that would be forgotten.
+func palette(t *testing.T, srv *httptest.Server) paletteResp {
+	t.Helper()
+	var p paletteResp
+	decode(t, doJSON(t, "GET", srv.URL+"/api/tags", nil), &p)
+	return p
 }
 
 // crcPrint is the loose/zip fingerprint of some bytes, derived the way assetindex
@@ -2386,5 +2590,64 @@ func TestThumbLogsAFailureAndStaysQuietAboutAMiss(t *testing.T) {
 	if logged.Len() == 0 {
 		t.Error("a thumbnail that failed for a reason other than having none logged nothing: " +
 			"a full cache disk or a corrupt archive reaches here and leaves a grid of icons with no explanation")
+	}
+}
+
+// The guards in this file that read a source file rather than drive a server all rest
+// on a regex matching something, and every one of them can stop matching without
+// failing: a refactor renames what it keys on, the pattern finds nothing, the loop runs
+// zero times and the test passes having checked nothing. Two in this file had already
+// reached that state — the one holding the CSRF content-type and the one holding the
+// injection rule, which are the two enforcing Tier-1 invariants.
+//
+// So the convention is that such a guard asserts its own parsing found something, and
+// this is what holds the convention. Structural because the rule is about the shape of
+// a test rather than about any behaviour: a new guard written without the sentinel is
+// exactly the one nobody will notice is asleep.
+//
+// It derives the set it checks rather than listing it, so a guard added tomorrow is
+// covered without being named here.
+func TestEveryStaticGuardAssertsItFoundSomething(t *testing.T) {
+	src, err := os.ReadFile("audit_test.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(src)
+	// One entry per top-level func, so a match can be attributed to the test it is in.
+	heads := regexp.MustCompile(`(?m)^func (\w+)`).FindAllStringSubmatchIndex(body, -1)
+	if len(heads) < 40 {
+		t.Fatalf("found %d top-level funcs in audit_test.go; this guard has stopped reading it", len(heads))
+	}
+	// A guard is static when it reads a file of this repo's own source. Reading a file
+	// as such is not the trait — a behavioural test reads the tag store to compare it
+	// before and after — so what counts is that the path is named here rather than
+	// handed in: a helper, a glob, or a literal the read itself carries.
+	reads := regexp.MustCompile(`frontendSources\(|frontendImports\(|filepath\.Glob\(|(?:os|assetsFS)\.ReadFile\(\s*(?:"|filepath\.Join)`)
+	// The sentinel, in any of the shapes the file already uses: something counted,
+	// compared against a floor, and reported. Requiring one exact spelling would only
+	// move the problem.
+	sentinel := regexp.MustCompile(`(?s)if\s+[^\n{]*(?:len\([^)]*\)|\w+)\s*(?:<|<=|==|!=)\s*(?:\d+|len\()[^\n{]*\{\s*\n\s*t\.(?:Fatalf?|Errorf?)\(`)
+	var checked int
+	for i, h := range heads {
+		name := body[h[2]:h[3]]
+		if !strings.HasPrefix(name, "Test") {
+			continue
+		}
+		end := len(body)
+		if i+1 < len(heads) {
+			end = heads[i+1][0]
+		}
+		fn := body[h[0]:end]
+		if !reads.MatchString(fn) {
+			continue
+		}
+		checked++
+		if !sentinel.MatchString(fn) {
+			t.Errorf("%s reads a repo file but never asserts its own parsing matched anything; "+
+				"add a count check that fails loudly, or it stops checking the rule the day its regex stops matching", name)
+		}
+	}
+	if checked < 5 {
+		t.Errorf("found %d static guards in audit_test.go; this guard has stopped recognising them", checked)
 	}
 }

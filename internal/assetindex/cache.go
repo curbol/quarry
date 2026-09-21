@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/curbol/quarry/internal/safewrite"
 )
@@ -21,7 +22,7 @@ import (
 // also keys the unpacked-archive tree, so a change to what extraction writes belongs
 // here too: an archive whose bytes never changed keeps its fingerprint, and only the
 // version tells the old extraction apart from what the current code would produce.
-const indexVersion = 24
+const indexVersion = 25
 
 // SkippedFile records a library file the scan could not read. A damaged archive
 // costs its own contents, not the rest of the library, so the failure is carried
@@ -162,14 +163,23 @@ func checkCacheDir(root, cacheDir string) error {
 // Open serves from as readily as the root, so containment has to be asked again once
 // they are known. Without it a cache dir on the far side of a link is written to, then
 // walked and indexed by the next run, then swept by PruneUnpacked.
+//
+// Asked both ways round. A link whose target sits inside the cache dir overlaps just
+// as badly in the other direction: the walk indexes every extracted member as a loose
+// library file and re-reads the index JSON — hundreds of megabytes, its print moving
+// every time a save rewrites it — on every run.
 func checkCacheDirLinks(cacheDir string, linkRoots []string) error {
 	if cacheDir == "" {
 		return nil
 	}
 	rc := resolve(cacheDir)
 	for _, lr := range linkRoots {
-		if contains(resolve(lr), rc) {
+		rl := resolve(lr)
+		if contains(rl, rc) {
 			return fmt.Errorf("cache dir %s is inside %s, a directory this scan follows a symlink into; pick one outside the library with --cache", cacheDir, lr)
+		}
+		if contains(rc, rl) {
+			return fmt.Errorf("this scan follows a symlink into %s, which is inside the cache dir %s; point the link outside it, or pick another cache dir with --cache", lr, cacheDir)
 		}
 	}
 	return nil
@@ -199,6 +209,35 @@ func Build(opt Options) (*Index, error) {
 	return ix, nil
 }
 
+// cacheable reports whether the cache can reproduce path and these assets byte for
+// byte. The index is JSON, and encoding/json replaces an invalid UTF-8 byte with
+// U+FFFD without reporting it — so a locator carrying one (a zip entry name older
+// Windows tooling stored in CP437, a file name that is not UTF-8 on a filesystem that
+// does not care) comes back from the cache naming something the archive does not
+// carry. The card stays in the grid, resolves by id and is still taggable, and its
+// bytes 404 on every run after the first, which --reindex repairs for exactly one run
+// before writing the same cache again.
+//
+// Declining the print is the same rule a failed derivation follows: the print
+// describes the file, not whether what was read survives the round trip. The cost is
+// that such a file is re-derived every run — its path is a map key and mangles the
+// same way, so there is nothing to look it up by either — and the alternative is a
+// locator that stops being a JSON string, which is a schema change.
+func cacheable(path string, assets []Asset) bool {
+	if !utf8.ValidString(path) {
+		return false
+	}
+	for i := range assets {
+		s := &assets[i].Source
+		if !utf8.ValidString(s.Entry) || !utf8.ValidString(s.FilePath) ||
+			!utf8.ValidString(s.ArchivePath) || !utf8.ValidString(s.Pathname) ||
+			!utf8.ValidString(s.Guid) || !utf8.ValidString(s.Clip) {
+			return false
+		}
+	}
+	return true
+}
+
 // refresh re-walks the library, reusing the cached enumeration of every archive
 // and the cached fingerprint of every loose file whose stat fingerprint is
 // unchanged, re-deriving only changed or new files. This avoids re-decompressing
@@ -223,6 +262,10 @@ func (ix *Index) refresh() error {
 	if err := checkCacheDirLinks(ix.cacheDir, linkRoots); err != nil {
 		return err
 	}
+	// The walk's own skips, before enumeration appends its own. A file the walk reached
+	// and could not read is a different thing from a directory it could not look inside,
+	// and only the second hides archives from the keep-set below.
+	walkSkips := skipped
 	// Positions, not values: an Asset is ~350 bytes, so both mapping the previous set
 	// and flattening it would hold a second copy of a 150k-asset library alongside the
 	// one being rebuilt. The survivors and the suppressed are addressed as one space so
@@ -289,10 +332,11 @@ func (ix *Index) refresh() error {
 			a, skip := looseAssets(e)
 			// A failed derivation is deliberately left out of newLoose: the stat print
 			// describes the file, not whether reading it worked, so caching one would
-			// keep serving the degraded result even after the cause was fixed.
+			// keep serving the degraded result even after the cause was fixed. One the
+			// cache cannot represent is left out on the same ground — see cacheable.
 			if skip != nil {
 				skipped = append(skipped, *skip)
-			} else {
+			} else if cacheable(e.path, a) {
 				newLoose[e.path] = fp
 			}
 			assets = append(assets, a...)
@@ -312,10 +356,42 @@ func (ix *Index) refresh() error {
 		// whether reading it worked. Whatever assets came back are still kept — a
 		// package whose character assembly failed still contributes everything else.
 		if skip != nil {
-			delete(newPrint, e.path)
 			skipped = append(skipped, *skip)
 		}
+		if skip != nil || !cacheable(e.path, a) {
+			delete(newPrint, e.path)
+		}
 		assets = append(assets, a...)
+	}
+	// An archive the walk could not look at is not an archive that is gone, and live
+	// cannot tell the two apart on its own: it holds what the walk reached, so a pack
+	// behind a directory this run could not read loses its extraction — hundreds of MB
+	// per Synty pack, and deleted out from under a second quarry that is still serving
+	// from it, which --addr exists to allow. A skip the walk itself recorded is the
+	// evidence that it could not look, so everything the previous index placed under one
+	// keeps its extraction for this run. An unmounted drive behind a plain directory
+	// leaves no skip and is indistinguishable from a deletion; that case still sweeps.
+	if len(walkSkips) > 0 {
+		reached := make(map[string]bool, len(entries))
+		for _, e := range entries {
+			if e.kind != SourceLoose {
+				reached[e.path] = true
+			}
+		}
+		for path, fp := range ix.ArchivePrint {
+			if reached[path] || len(oldByArchive[path]) == 0 {
+				continue
+			}
+			// The archive's own display rel, which is what a skip is recorded under —
+			// an archive asset's RelPath carries the entry after it.
+			archiveRel, _, _ := strings.Cut(prevAt(oldByArchive[path][0]).RelPath, "::")
+			for _, sk := range walkSkips {
+				if archiveRel == sk.RelPath || strings.HasPrefix(archiveRel, sk.RelPath+"/") {
+					live[fp] = true
+					break
+				}
+			}
+		}
 	}
 	ix.ArchivePrint = newPrint
 	ix.LoosePrint = newLoose
@@ -397,8 +473,13 @@ func stateDir(cacheDir, absRoot string, follow bool) string {
 		key += "\x00follow"
 	}
 	sum := sha256.Sum256([]byte(key))
-	return filepath.Join(cacheDir, "roots", hex.EncodeToString(sum[:6]))
+	return filepath.Join(cacheDir, "roots", hex.EncodeToString(sum[:stateDirNameLen/2]))
 }
+
+// stateDirNameLen is how many hex characters name one root's state directory. Named
+// because sweepAbandonedRoots has to recognise the layout from the outside, and a
+// hand-written second copy of the length is what lets a sweep quietly stop matching.
+const stateDirNameLen = 12
 
 func (ix *Index) stateDir() string { return stateDir(ix.cacheDir, ix.Root, ix.FollowSymlinks) }
 

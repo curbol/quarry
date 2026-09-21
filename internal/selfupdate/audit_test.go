@@ -215,7 +215,15 @@ func TestResolveTokenPrefersGithubToken(t *testing.T) {
 
 // The API error body is echoed to the user; the token must not travel with it.
 func TestFetchReleaseErrorOmitsToken(t *testing.T) {
+	// Over a channel rather than a variable: the handler runs on the server's goroutine
+	// and the assertion on the test's, and a TCP round trip is not a happens-before
+	// edge the detector recognises.
+	auth := make(chan string, 4)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case auth <- r.Header.Get("Authorization"):
+		default:
+		}
 		w.WriteHeader(http.StatusUnauthorized)
 		fmt.Fprintf(w, `{"message":"Bad credentials"}`)
 	}))
@@ -231,6 +239,19 @@ func TestFetchReleaseErrorOmitsToken(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "s3cr3t-token") {
 		t.Errorf("token leaked into the error: %q", err)
+	}
+	// The listing is authenticated too, which nothing asserted: only the asset download
+	// did. This repo is private, so unauthenticated the listing 404s and `quarry update`
+	// answers "no releases found (no GitHub token found…)" — advice that is wrong, to a
+	// user who is authenticated, on the path that is itself the recovery from a broken
+	// install.
+	select {
+	case got := <-auth:
+		if got != "token s3cr3t-token" {
+			t.Errorf("release listing sent Authorization %q, want the resolved token", got)
+		}
+	default:
+		t.Error("the release listing made no request to assert against")
 	}
 }
 
@@ -1160,7 +1181,12 @@ func TestAnAbandonedStagingDirectoryIsSweptByAge(t *testing.T) {
 	old := filepath.Join(dir, stagingPrefix+"oldone")
 	fresh := filepath.Join(dir, stagingPrefix+"running")
 	mine := filepath.Join(dir, "my-notes")
-	for _, d := range []string{old, fresh, mine} {
+	// install.sh stages here too, under its own prefix, and a first install killed
+	// outright leaves one behind with the release zip in it. The script clears them
+	// only at the start of a later run, and after a first install succeeds there is no
+	// reason to run it again — so this is the sweep that has to reach them.
+	install := filepath.Join(dir, installStagingPrefix+"abandoned")
+	for _, d := range []string{old, fresh, mine, install} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -1171,7 +1197,7 @@ func TestAnAbandonedStagingDirectoryIsSweptByAge(t *testing.T) {
 		t.Fatal(err)
 	}
 	aged := time.Now().Add(-safewrite.StaleTempAge - time.Hour)
-	for _, p := range []string{old, notADir} {
+	for _, p := range []string{old, notADir, install} {
 		if err := os.Chtimes(p, aged, aged); err != nil {
 			t.Fatal(err)
 		}
@@ -1193,6 +1219,32 @@ func TestAnAbandonedStagingDirectoryIsSweptByAge(t *testing.T) {
 	}
 	if _, err := os.Stat(notADir); err != nil {
 		t.Errorf("the sweep removed a file rather than a staging directory: %v", err)
+	}
+	if _, err := os.Stat(install); !os.IsNotExist(err) {
+		t.Errorf("an install.sh staging dir abandoned in the binary's own directory survived: %v", err)
+	}
+}
+
+// The prefix install.sh stages under is spelled once here and once in the script, in
+// two languages, and the sweep above is the only thing that clears what the script
+// abandons. Renamed on either side they drift in silence: the install keeps working,
+// and its leftovers accumulate in the directory the binary lives in forever.
+func TestTheInstallStagingPrefixMatchesTheScript(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("..", "..", "install.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// mktemp's template, which is what names the directory.
+	m := regexp.MustCompile(`mktemp\s+-d\s+"\$\{INSTALL_DIR\}/([.\w-]*?)X+"`).FindStringSubmatch(string(b))
+	if m == nil {
+		t.Fatal("install.sh's staging template did not parse; this guard has stopped checking anything")
+	}
+	if m[1] != installStagingPrefix {
+		t.Errorf("install.sh stages under %q, selfupdate sweeps %q", m[1], installStagingPrefix)
+	}
+	// And the script's own sweep looks for what it creates.
+	if !strings.Contains(string(b), "'"+installStagingPrefix+"*'") {
+		t.Errorf("install.sh does not sweep %q itself; the two sweeps have to look for the same name", installStagingPrefix)
 	}
 }
 

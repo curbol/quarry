@@ -497,3 +497,69 @@ func TestAtomicFsyncsTheBytesBeforeTheRenameAndTheDirectoryAfter(t *testing.T) {
 			"the bytes are then durable but the directory entry pointing at them is not, so a crash can restore the previous contents")
 	}
 }
+
+// os.CreateTemp replaces the *last* "*" in a pattern, so that is the one the sweep has
+// to split on to recognise what an interrupted write left behind. Split on the first,
+// a pattern holding several matched nothing at all — the same silent never-sweeps
+// outcome Atomic refuses a pattern with no "*" outright for, reached by the other half
+// of the same mechanism, and in a directory the leftovers are a user's to notice.
+func TestAtomicSweepsATempFromAPatternHoldingSeveralStars(t *testing.T) {
+	const pattern = ".quarry-*-tags-*.tmp"
+	dir := t.TempDir()
+	// Named the way CreateTemp names one, so the sweep is asked the real question.
+	f, err := os.CreateTemp(dir, pattern)
+	if err != nil {
+		t.Fatal(err)
+	}
+	abandoned := f.Name()
+	f.Close()
+	when := time.Now().Add(-2 * StaleTempAge)
+	if err := os.Chtimes(abandoned, when, when); err != nil {
+		t.Fatal(err)
+	}
+	// Something of the user's that merely shares the leading text.
+	mine := filepath.Join(dir, ".quarry-notes")
+	if err := os.WriteFile(mine, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(mine, when, when); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Atomic(filepath.Join(dir, "store.toml"), pattern, func(w io.Writer) error {
+		_, err := io.WriteString(w, "body")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(abandoned); !os.IsNotExist(err) {
+		t.Errorf("an abandoned temp from a multi-star pattern survived (%v); the sweep is splitting on the wrong star", err)
+	}
+	if _, err := os.Stat(mine); err != nil {
+		t.Errorf("the sweep removed a file that only shares the pattern's prefix: %v", err)
+	}
+}
+
+// Atomic does not create the destination's directory, and the contract is worth having
+// a test rather than being whatever CreateTemp happens to do: every caller MkdirAlls
+// first, so nothing here establishes whose job it is, and a caller that started relying
+// on Atomic to do it would find out at the first write to a fresh config dir.
+func TestAtomicRefusesADestinationWithNoDirectory(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "not-made-yet", "store.toml")
+	err := Atomic(missing, ".t-*", func(w io.Writer) error {
+		_, err := io.WriteString(w, "body")
+		return err
+	})
+	if err == nil {
+		t.Fatal("Atomic reported success writing into a directory that does not exist")
+	}
+	if !os.IsNotExist(err) {
+		t.Errorf("err = %v, want one a caller can read as the missing directory it is", err)
+	}
+	if _, statErr := os.Stat(missing); !os.IsNotExist(statErr) {
+		t.Error("something was left at the destination")
+	}
+	if _, statErr := os.Stat(filepath.Dir(missing)); !os.IsNotExist(statErr) {
+		t.Error("Atomic created the destination's directory; the caller decides its mode")
+	}
+}

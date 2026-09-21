@@ -213,22 +213,43 @@ func groupPairsByDirectory(assets []assetindex.Asset, nonRM, rm []int, k probeKe
 	return false
 }
 
-// dirAffinity counts the trailing path segments two directories share. It is what
-// separates candidates the same-directory filter cannot: a pack that mirrors its
-// per-character folders under one root-motion tree has no in-place asset in an RM's
-// own directory, so sameDirOnly is false and every candidate in the archive scores
-// alike — leaving scan order to decide which character's travel each card plays.
-// Anims/Goblin shares one segment with RootMotion/Goblin and none with RootMotion/Orc.
+// dirAffinity scores how closely two directories are related, for the candidates the
+// same-directory filter cannot separate: a pack that mirrors its per-character folders
+// under one root-motion tree has no in-place asset in an RM's own directory, so
+// sameDirOnly is false and without this every candidate in the archive scores alike —
+// leaving scan order to decide which character's travel each card plays.
+//
+// Shared trailing segments first: Anims/Goblin shares one with RootMotion/Goblin and
+// none with RootMotion/Orc. Shared leading segments break the ties that leaves, which
+// is what reads a character's own RM subfolder — Anims/Goblin against Anims/Goblin/RM
+// shares no trailing segment at all, because the last segments are "Goblin" and "RM",
+// and scores the same zero against Anims/Orc/RM. Ranked on the tail alone both cards in
+// that pack took whichever RM came first and the other RM stayed unsuppressed, showing
+// as a stray card beside the pair it belongs to.
+//
+// Packed so the tail dominates and the head only breaks its ties, rather than the two
+// being summed into a tie again. Leading segments cannot be the primary term: a loose
+// library carries absolute paths, so every candidate in a group shares the whole
+// /lib/vendor/pack prefix and the mirrored-tree case collapses back.
 func dirAffinity(a, b assetindex.Source) int {
 	ad, _ := entryParts(a)
 	bd, _ := entryParts(b)
 	as, bs := splitDir(a, ad), splitDir(b, bd)
-	n := 0
-	for n < len(as) && n < len(bs) && as[len(as)-1-n] == bs[len(bs)-1-n] {
-		n++
+	tail := 0
+	for tail < len(as) && tail < len(bs) && as[len(as)-1-tail] == bs[len(bs)-1-tail] {
+		tail++
 	}
-	return n
+	head := 0
+	for head < len(as) && head < len(bs) && as[head] == bs[head] {
+		head++
+	}
+	return tail*affinityTailWeight + head
 }
+
+// affinityTailWeight separates the two terms dirAffinity packs into one score. Larger
+// than any path depth a real library reaches, so a shared head can never outweigh a
+// shared tail — which is the ordering the whole metric rests on.
+const affinityTailWeight = 1 << 16
 
 // splitDir breaks a directory into its segments, by the separators that source's own
 // path uses. Empty segments are dropped so a leading or doubled separator cannot

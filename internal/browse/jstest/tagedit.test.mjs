@@ -3,7 +3,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { nextTags } from '../assets/tagedit.js';
+import { foldTagEdit, nextTags } from '../assets/tagedit.js';
 
 const apply = (o) => nextTags({ tag: 'hero', ...o });
 
@@ -73,4 +73,64 @@ test('a card with no fingerprint field is left alone by someone else\'s removal'
     nextTags({ cardFingerprints: undefined, cardTags: [], edited: ['fp1'], tag: 'hero', on: true }),
     ['hero'],
   );
+});
+
+// foldTagEdit: which cards an edit reaches, and how often each is touched.
+const card = (fingerprints, tags = []) => ({ fingerprints, tags });
+const index = (pairs) => new Map(pairs.map(([fp, items]) => [fp, new Set(items)]));
+
+test('an entry whose card the grid recycled out is still folded into', () => {
+  const offscreen = card(['a'], []);
+  const onscreen = card(['a'], []);
+  const watcher = { asset: onscreen, repaint() {} };
+  const repaint = foldTagEdit({
+    holders: index([['a', [offscreen, onscreen]]]),
+    watchers: index([['a', [watcher]]]),
+    fingerprints: ['a'],
+    tag: 'hero',
+    on: true,
+  });
+  assert.deepEqual(offscreen.tags, ['hero'], 'the entry with no card kept its stale tags');
+  assert.deepEqual(onscreen.tags, ['hero']);
+  assert.deepEqual(repaint, [watcher]);
+});
+
+test('a card is folded once however many of its fingerprints the edit names', () => {
+  // Both of this card's fingerprints are in the edit, so the removal is certain — but
+  // only while the second pass is not deciding against the tags the first pass wrote.
+  const both = card(['a', 'b'], ['hero']);
+  foldTagEdit({
+    holders: index([['a', [both]], ['b', [both]]]),
+    watchers: new Map(),
+    fingerprints: ['a', 'b'],
+    tag: 'hero',
+    on: false,
+  });
+  assert.deepEqual(both.tags, [], 'a card the edit fully covers kept the tag');
+});
+
+test('each watcher is listed once, whatever it is registered under', () => {
+  const asset = card(['a', 'b'], []);
+  const watcher = { asset, repaint() {} };
+  const repaint = foldTagEdit({
+    holders: new Map(),
+    watchers: index([['a', [watcher]], ['b', [watcher]]]),
+    fingerprints: ['a', 'b'],
+    tag: 'hero',
+    on: true,
+  });
+  assert.equal(repaint.length, 1, 'a card sharing two edited fingerprints repaints twice');
+});
+
+test('an edit naming a fingerprint nothing holds changes and repaints nothing', () => {
+  const other = card(['a'], ['hero']);
+  const repaint = foldTagEdit({
+    holders: index([['a', [other]]]),
+    watchers: index([['a', [{ asset: other, repaint() {} }]]]),
+    fingerprints: ['z'],
+    tag: 'hero',
+    on: false,
+  });
+  assert.deepEqual(other.tags, ['hero']);
+  assert.deepEqual(repaint, []);
 });

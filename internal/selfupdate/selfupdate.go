@@ -32,6 +32,14 @@ const binaryName = "quarry"
 // other with nothing reporting it.
 const stagingPrefix = ".quarry-update-"
 
+// installStagingPrefix is what install.sh stages under, in the same directory. A first
+// install killed outright — SIGKILL, a closed terminal mid-download — never reaches the
+// script's EXIT trap and leaves one behind holding the release zip, tens of megabytes,
+// in the directory the binary lives in. install.sh clears them at the start of a later
+// run, and after a successful install there is no reason to run it again: `quarry
+// update` is the upgrade path from then on, so it is the one that has to sweep them.
+const installStagingPrefix = ".quarry-install-"
+
 // releasesAPIURL is a var so tests can point it at a stub server.
 var releasesAPIURL = "https://api.github.com/repos/curbol/quarry/releases"
 
@@ -220,7 +228,7 @@ func platformAsset(rel *release, goos, goarch string) (string, error) {
 // sweepStaleStaging removes staging directories abandoned by an interrupted update.
 // Failures are ignored: this is tidying, not part of the update, and a directory that
 // cannot be removed must not stop the one thing that repairs a broken install.
-// The directory is read rather than globbed, and only the prefix decides what matches.
+// The directory is read rather than globbed, and only the prefixes decide what matches.
 // Joined into a glob, dir was itself read as a pattern: a binary installed under
 // "~/tools [old]" turned the whole thing into a character class matching no real path,
 // an unterminated "[" returned ErrBadPattern, which this swallows, and a "*" in the path
@@ -232,13 +240,19 @@ func sweepStaleStaging(dir string) {
 		return
 	}
 	for _, e := range entries {
-		if !e.IsDir() || !strings.HasPrefix(e.Name(), stagingPrefix) {
+		if !e.IsDir() || !staged(e.Name()) {
 			continue
 		}
 		if fi, err := e.Info(); err == nil && time.Since(fi.ModTime()) > safewrite.StaleTempAge {
 			os.RemoveAll(filepath.Join(dir, e.Name()))
 		}
 	}
+}
+
+// staged reports whether a directory name is one an interrupted install or update left
+// beside the binary.
+func staged(name string) bool {
+	return strings.HasPrefix(name, stagingPrefix) || strings.HasPrefix(name, installStagingPrefix)
 }
 
 // currentExecutable is a seam. os.Executable answers for the test binary, so without

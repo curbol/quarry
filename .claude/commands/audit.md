@@ -164,7 +164,7 @@ each package's doc comment restates its own share.
   embeds a machine-absolute path and a version-bearing archive name, so it is neither
   portable nor stable. *Violation:* any tag or link path that keys on `ID`; any change
   to how a fingerprint is derived, to an indexed field, or to what extraction writes
-  without bumping `assetindex.indexVersion` (`cache.go`, currently 24). *Check:* grep
+  without bumping `assetindex.indexVersion` (`cache.go`, currently 25). *Check:* grep
   `Fingerprint` and `\.ID` through `internal/tagstore/`, `browse/tags.go`,
   `browse/links.go`; confirm `indexVersion` is compared on cache load.
 - **The library is read-only.** The tag store is the only thing quarry may write inside
@@ -323,8 +323,9 @@ each package's doc comment restates its own share.
   up, because the disambiguated label may name no animation in the file. Confirm the
   two are not conflated in either direction, and that two same-named clips cannot
   collide. Tier 1.
-- Root-motion recognition (`assetindex.RootMotionVariant`): verify all four conventions
-  (trailing `_RM`, `_RM_` infix, ` [RM]` bracket suffix, `_RootMotion_` infix) and
+- Root-motion recognition (`assetindex.RootMotionVariant`): verify all five conventions
+  (trailing `_RM`, `_RM_` infix, trailing `_RootMotion`, `_RootMotion_` infix,
+  ` [RM]` bracket suffix) and
   that `stripToken`'s boundaries still leave `Warm`, `Storm`, and `arm` alone. It is the
   one recognizer shared by the GLB-split gate and browse pairing, so a change here moves
   both. Tier 1.
@@ -490,7 +491,9 @@ each package's doc comment restates its own share.
   renamed drive keeps its old name in the grid, in the vendor facet and in `path:` search
   until the file's own size or mtime happens to move. Tier 1.
 - Pruning removes only extractions the current index no longer references, plus trees
-  from another `indexVersion`, and never reaches outside `<cache>/roots/<hash>/`. A prune
+  from another `indexVersion`, and never reaches outside `<cache>/roots/`, where it
+  clears only a sibling root's whole tree, by age, and only one that looks like one
+  quarry wrote. A prune
   that could delete a live extraction, or one another root or a concurrent instance is
   serving, is Tier 1. `PruneUnpacked`'s keep-set is the snapshot `refresh` took of what
   the walk reached (`Index.liveUnpacked`), not a re-derivation from `Assets` — which is

@@ -394,6 +394,47 @@ func TestAFileLinkIntoAFollowedTreeIsNotIndexedTwice(t *testing.T) {
 	}
 }
 
+// The other half of dropCoveredLinks, and the one no walk covers: two aliases pointing
+// at one file outside the root, with no directory link bringing that tree in. Neither
+// target is covered, so the check that has to catch the duplicate is the one asking
+// whether another link already claimed it — and a library carrying both a "current" and
+// a "latest" alias beside each other is the ordinary shape for that. Left in, one file
+// is two cards under two ids over the same bytes, each with its own link root widening
+// what Open accepts.
+func TestTwoAliasesForOneOutsideFileIndexOnce(t *testing.T) {
+	outside := t.TempDir()
+	real := filepath.Join(outside, "v3", "Sword.glb")
+	writeFile(t, real, "GLBBYTES")
+
+	root, mk := libRoot(t)
+	if err := os.Symlink(real, mk("lib", "aa-Current.glb")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if err := os.Symlink(real, mk("lib", "zz-Latest.glb")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	ix, err := Build(Options{Root: root, CacheDir: t.TempDir(), FollowSymlinks: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ix.Assets) != 1 {
+		t.Fatalf("assets = %v, want the file indexed once", names(ix.Assets))
+	}
+	if len(ix.Skipped) != 1 {
+		t.Errorf("skipped = %v, want the second alias reported rather than silently dropped", ix.Skipped)
+	}
+	// One target, one link root: the withdrawn alias took its own with it.
+	if len(ix.LinkRoots) != 1 {
+		t.Errorf("link roots = %v, want one — the dropped alias's was widening Open for a file nothing indexes", ix.LinkRoots)
+	}
+	rc, _, err := ix.Open(ix.Assets[0])
+	if err != nil {
+		t.Fatalf("Open: %v — the surviving card must still serve", err)
+	}
+	rc.Close()
+}
+
 // Two links into overlapping trees (a drive, and a pack inside it) reach the nested
 // tree twice. The link to the inner tree is refused when the outer one was followed
 // first, and the inner tree is pruned from the outer walk when it was not — either

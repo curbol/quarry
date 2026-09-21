@@ -25,3 +25,45 @@ export function nextTags({ cardFingerprints, cardTags, edited, tag, on }) {
   }
   return [...tags].sort();
 }
+
+// foldTagEdit is the other half of the same decision: nextTags says what an edit does
+// to one card, this says which cards it reaches and how often. Pure over two
+// fingerprint indexes — the result set, and the cards currently drawn — so it can be
+// checked without a DOM.
+//
+// Folding over the result set rather than over the drawn cards is what reaches an entry
+// whose card the grid window has recycled out, or never built: two byte-identical files
+// more than a window apart, edit one, and without this the other keeps the tags its page
+// arrived with until the query is re-run.
+//
+// Each side is visited exactly once. An asset carrying several of the edited
+// fingerprints appears under each of them, and nextTags is not idempotent to apply
+// twice in the way that matters: the second pass sees the tags the first wrote, so a
+// removal that needed *every* fingerprint of the card would be decided against a set
+// that has already changed.
+export function foldTagEdit({ holders, watchers, fingerprints, tag, on }) {
+  const folded = new Set();
+  for (const fp of fingerprints) {
+    for (const a of holders.get(fp) || []) {
+      if (folded.has(a)) continue;
+      folded.add(a);
+      a.tags = nextTags({
+        cardFingerprints: a.fingerprints,
+        cardTags: a.tags,
+        edited: fingerprints,
+        tag,
+        on,
+      });
+    }
+  }
+  const repaint = [];
+  const seen = new Set();
+  for (const fp of fingerprints) {
+    for (const e of watchers.get(fp) || []) {
+      if (seen.has(e)) continue;
+      seen.add(e);
+      repaint.push(e);
+    }
+  }
+  return repaint;
+}

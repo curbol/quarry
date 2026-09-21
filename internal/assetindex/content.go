@@ -366,11 +366,18 @@ func (ix *Index) stagingDir() string {
 // to race one.
 const staleStagingAge = 24 * time.Hour
 
-// isLegacyIndex reports whether path is a cache file quarry wrote, rather than a
-// file of the user's that happens to share the name. Only the head is read: the real
-// thing runs to hundreds of megabytes, and the fields that identify it are at the
-// front of the object.
-func isLegacyIndex(path string) bool {
+// staleRootAge is how long a root's own state has to have gone untouched before
+// another root's prune clears it. Every run rewrites its index JSON at startup, so an
+// untouched one is nobody's — but two libraries alternated by hand are an ordinary
+// setup, and the cost of being wrong is a full rescan, so the bar is weeks rather than
+// the hours staleStagingAge can afford.
+const staleRootAge = 30 * 24 * time.Hour
+
+// isIndexJSON reports whether path is a cache file quarry wrote, rather than a file
+// of the user's that happens to share the name. Only the head is read: the real thing
+// runs to hundreds of megabytes, and the fields that identify it are at the front of
+// the object.
+func isIndexJSON(path string) bool {
 	f, err := os.Open(path)
 	if err != nil {
 		return false
@@ -422,12 +429,14 @@ func (ix *Index) PruneUnpacked() error {
 	// index.json is.
 	legacyUnpacked := filepath.Join(ix.cacheDir, "unpacked")
 	legacyIndex := filepath.Join(ix.cacheDir, "index.json")
-	if isLegacyIndex(legacyIndex) {
+	if isIndexJSON(legacyIndex) {
 		if fi, err := os.Stat(legacyUnpacked); err == nil && fi.IsDir() {
 			remove(legacyUnpacked)
 			remove(legacyIndex)
 		}
 	}
+
+	ix.sweepAbandonedRoots(remove)
 
 	// A run killed mid-extraction leaves its staging directory behind, and nothing
 	// else ever clears it. Age is the only thing separating that from an extraction
@@ -470,6 +479,57 @@ func (ix *Index) PruneUnpacked() error {
 		remove(filepath.Join(dir, e.Name()))
 	}
 	return firstErr
+}
+
+// sweepAbandonedRoots clears the state of libraries nothing indexes any more. State is
+// keyed by the scan root and the follow_symlinks setting so that two libraries sharing
+// a cache dir cannot prune each other's extractions — which also means a root nobody
+// passes again is never consulted by anything, and its index JSON (past 100MB on a
+// 150k-asset library) and every extraction under it stay forever. A moved library, a
+// config.toml pointed somewhere new, or one --follow-symlinks flip each strand a whole
+// tree with nothing reporting it.
+//
+// Age is the evidence, as it is for staging: every run rewrites its own index JSON at
+// startup, so a tree whose JSON has not moved in staleRootAge belongs to no library
+// anyone is still opening. All of it is regenerable, so being wrong costs a rescan.
+//
+// Only this layout is swept. The cache dir is whatever --cache or QUARRY_CACHE_DIR
+// named, taken verbatim, so a directory under it has to look like one quarry wrote
+// before it is removed: a "roots" entry named the way stateDir names one, holding an
+// index JSON that sniffs as ours.
+func (ix *Index) sweepAbandonedRoots(remove func(string)) {
+	roots := filepath.Join(ix.cacheDir, "roots")
+	entries, err := os.ReadDir(roots)
+	if err != nil {
+		return
+	}
+	mine := filepath.Base(ix.stateDir())
+	for _, e := range entries {
+		if !e.IsDir() || e.Name() == mine || !isStateDirName(e.Name()) {
+			continue
+		}
+		idx := filepath.Join(roots, e.Name(), "index.json")
+		fi, err := os.Stat(idx)
+		if err != nil || time.Since(fi.ModTime()) <= staleRootAge || !isIndexJSON(idx) {
+			continue
+		}
+		remove(filepath.Join(roots, e.Name()))
+	}
+}
+
+// isStateDirName reports whether a name is one stateDir produces: the hex of a
+// truncated hash, and nothing else.
+func isStateDirName(name string) bool {
+	if len(name) != stateDirNameLen {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // extraction is one archive's single-flighted unpack. Every waiter holds the same

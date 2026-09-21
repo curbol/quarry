@@ -11,6 +11,25 @@ import (
 	"time"
 )
 
+// colorOf answers the two questions the tests ask of the palette — is this tag
+// defined, and what colour did it end up — through Tags(), which is the accessor
+// browse's palette actually reads. Asserting through it means a change that breaks
+// the palette breaks these too.
+func colorOf(s *Store, id string) (string, bool) {
+	for _, t := range s.Tags() {
+		if t.ID == id {
+			return t.Color, true
+		}
+	}
+	return "", false
+}
+
+// hasTag reports whether the palette defines a tag, through the same accessor.
+func hasTag(s *Store, id string) bool {
+	_, ok := colorOf(s, id)
+	return ok
+}
+
 func TestLoadMissingIsEmpty(t *testing.T) {
 	s, err := Load(filepath.Join(t.TempDir(), "nope.tags.toml"))
 	if err != nil {
@@ -38,7 +57,7 @@ func TestDefineAssignRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c, _ := got.color("hero"); c != "#e11d48" {
+	if c, _ := colorOf(got, "hero"); c != "#e11d48" {
 		t.Errorf("hero color = %q, want normalized #e11d48", c)
 	}
 	if !reflect.DeepEqual(got.TagsFor("crc32:abc:10"), []string{"hero", "wip"}) {
@@ -76,13 +95,13 @@ func TestRenameRewritesAssignments(t *testing.T) {
 	if err := s.Rename("wip", "in-progress"); err != nil {
 		t.Fatal(err)
 	}
-	if s.has("wip") {
+	if hasTag(s, "wip") {
 		t.Error("old id still present after rename")
 	}
 	if !reflect.DeepEqual(s.TagsFor("fp1"), []string{"in-progress"}) || !reflect.DeepEqual(s.TagsFor("fp2"), []string{"in-progress"}) {
 		t.Errorf("rename did not rewrite assignments: fp1=%v fp2=%v", s.TagsFor("fp1"), s.TagsFor("fp2"))
 	}
-	if c, _ := s.color("in-progress"); c != "#123456" {
+	if c, _ := colorOf(s, "in-progress"); c != "#123456" {
 		t.Errorf("renamed tag lost its color: %q", c)
 	}
 }
@@ -98,7 +117,7 @@ func TestRenameOntoExistingMerges(t *testing.T) {
 	if err := s.Rename("a", "b"); err != nil {
 		t.Fatal(err)
 	}
-	if s.has("a") {
+	if hasTag(s, "a") {
 		t.Error("merged-away id still present")
 	}
 	// fp1 collapses a+b to a single b; fp2's a becomes b.
@@ -108,7 +127,7 @@ func TestRenameOntoExistingMerges(t *testing.T) {
 	if !reflect.DeepEqual(s.TagsFor("fp2"), []string{"b"}) {
 		t.Errorf("fp2 after merge = %v, want [b]", s.TagsFor("fp2"))
 	}
-	if c, _ := s.color("b"); c != "#bbbbbb" {
+	if c, _ := colorOf(s, "b"); c != "#bbbbbb" {
 		t.Errorf("merge should keep target color, got %q", c)
 	}
 	if n := len(s.FingerprintsByTag()["b"]); n != 2 {
@@ -122,7 +141,7 @@ func TestDeletePurgesAssignments(t *testing.T) {
 	s.Assign("fp1", "stay")
 	s.Assign("fp2", "gone")
 	s.Delete("gone")
-	if s.has("gone") {
+	if hasTag(s, "gone") {
 		t.Error("deleted tag still in palette")
 	}
 	if !reflect.DeepEqual(s.TagsFor("fp1"), []string{"stay"}) {
@@ -137,7 +156,7 @@ func TestUnassignKeepsPaletteEntry(t *testing.T) {
 	s := New()
 	s.Assign("fp1", "solo")
 	s.Unassign("fp1", "solo")
-	if !s.has("solo") {
+	if !hasTag(s, "solo") {
 		t.Error("unassign should keep the tag in the palette")
 	}
 	if len(s.TagsFor("fp1")) != 0 {
@@ -481,7 +500,7 @@ func TestFailedReloadLeavesTheStoreUntouched(t *testing.T) {
 			if err := s.Reload(p); err == nil {
 				t.Fatal("Reload accepted a file Load refuses")
 			}
-			if _, ok := s.color("hero"); !ok {
+			if _, ok := colorOf(s, "hero"); !ok {
 				t.Error("the palette lost a tag to a reload that failed")
 			}
 			if got := s.TagsFor("crc32:aa:1"); len(got) != 1 || got[0] != "hero" {
@@ -538,7 +557,7 @@ func TestLoadGivesAnUndefinedTagItsDefaultColor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, ok := s.color("hero")
+	got, ok := colorOf(s, "hero")
 	if !ok {
 		t.Fatal("hero is assigned but absent from the palette")
 	}
@@ -722,6 +741,54 @@ func TestLinkingNeverChangesTags(t *testing.T) {
 // A save rewrites the file whole, so it must not overwrite an edit made since the load
 // — by hand, by a checkout of a committed store, or by a second quarry sharing the
 // user-wide one. Losing that edit is total and leaves no trace.
+// The zero stamp means two things and the difference matters. Load records it for a
+// file that was not there; stampOf returns it for a file that is not there any more —
+// a branch switched to one that does not carry the store, an rm, a sync tool unlinking
+// it for a moment. Both have to answer ErrStale, because a save of either rewrites a
+// file this store never read, and "a file that does not exist destroys nothing" is the
+// reading that would let a stale palette land on top of what the next checkout
+// restores. Pinned in both directions: the refusal, and what a recovery Reload then
+// leaves behind.
+func TestSaveRefusesAStoreFileThatHasSinceBeenDeleted(t *testing.T) {
+	p := filepath.Join(t.TempDir(), FileName)
+	seed := New()
+	seed.Define("hero", "#112233")
+	seed.Assign("fp-a", "hero")
+	if err := seed.Save(p); err != nil {
+		t.Fatal(err)
+	}
+	mine, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mine.Assign("fp-b", "hero")
+
+	if err := os.Remove(p); err != nil {
+		t.Fatal(err)
+	}
+	if err := mine.Save(p); !errors.Is(err, ErrStale) {
+		t.Fatalf("Save onto a deleted store = %v, want ErrStale", err)
+	}
+	if _, err := os.Stat(p); !os.IsNotExist(err) {
+		t.Error("the refused save wrote the file anyway")
+	}
+	// And the recovery the browse server makes on that refusal: reloading re-homes the
+	// store onto the same path, finds nothing there, and leaves the edit nowhere.
+	if err := mine.Reload(p); err != nil {
+		t.Fatalf("Reload after the refusal: %v", err)
+	}
+	if got := mine.TagsFor("fp-b"); len(got) != 0 {
+		t.Errorf("TagsFor(fp-b) = %v after the reload, want the unsaved edit gone", got)
+	}
+	if len(mine.Tags()) != 0 {
+		t.Errorf("palette = %v after reloading from a file that is gone, want empty", mine.Tags())
+	}
+	// Re-homed, not export: the next save adopts the path it just reloaded from.
+	if err := mine.Save(p); err != nil {
+		t.Errorf("Save after the reload = %v, want the store to have re-homed onto it", err)
+	}
+}
+
 func TestSaveRefusesToClobberAnEditMadeSinceLoad(t *testing.T) {
 	p := filepath.Join(t.TempDir(), FileName)
 	seed := New()
@@ -760,7 +827,7 @@ func TestSaveRefusesToClobberAnEditMadeSinceLoad(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := after.color("villain"); !ok {
+	if _, ok := colorOf(after, "villain"); !ok {
 		t.Error("the other writer's tag is gone from the file")
 	}
 
@@ -772,7 +839,7 @@ func TestSaveRefusesToClobberAnEditMadeSinceLoad(t *testing.T) {
 	if got := mine.TagsFor("fp-a"); len(got) != 0 {
 		t.Errorf("TagsFor(fp-a) = %v after a reload, want the unsaved edit gone", got)
 	}
-	if _, ok := mine.color("villain"); !ok {
+	if _, ok := colorOf(mine, "villain"); !ok {
 		t.Error("Reload did not pick up the other writer's tag")
 	}
 	if err := mine.Save(p); err != nil {
@@ -809,7 +876,7 @@ func TestSaveRefusesAFileCreatedSinceAMissingLoad(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := after.color("villain"); !ok {
+	if _, ok := colorOf(after, "villain"); !ok {
 		t.Error("the other writer's store was overwritten by one that had read nothing")
 	}
 	// And the recovery still works from here, so the refusal is not a dead end.
@@ -845,7 +912,7 @@ func TestRenameReportsAMissingTag(t *testing.T) {
 				t.Fatalf("Rename(%q, %q) = %v, wantErr %v", tc.old, tc.neu, err, tc.wantErr)
 			}
 			if tc.wantErr && tc.neu != "" {
-				if _, ok := s.color(tc.neu); ok {
+				if _, ok := colorOf(s, tc.neu); ok {
 					t.Errorf("%q was defined despite the source not existing", tc.neu)
 				}
 			}
@@ -1177,7 +1244,7 @@ func TestAnUnassignedPaletteEntrySurvivesTheRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, ok := got.color("unused")
+	c, ok := colorOf(got, "unused")
 	if !ok {
 		t.Fatal("the unassigned tag is gone after a reload; the user's new tag disappears on restart")
 	}
@@ -1265,7 +1332,7 @@ func TestLoadGeneratesAColorForARowThatOmitsOne(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load on a row with no color: %v — the error for a bad color tells the user to write exactly this", err)
 	}
-	got, ok := s.color("hero")
+	got, ok := colorOf(s, "hero")
 	if !ok || got != DefaultColor("hero") {
 		t.Errorf("color(hero) = %q (defined %v), want the generated %q", got, ok, DefaultColor("hero"))
 	}

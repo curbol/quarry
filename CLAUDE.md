@@ -114,8 +114,11 @@ packages, each with a package doc comment stating its contract:
   tree, so stale state on either side rebuilds.
 - **The library is read-only.** The tag store is the only thing quarry writes inside
   a user's tree; everything else it writes is regenerable state under the cache dir,
-  in `<cache>/roots/<hash of the scan root>/` — keyed by root so two roots sharing a
-  cache dir do not prune each other's extractions away. A cache dir inside the scan
+  in `<cache>/roots/<hash of the scan root and follow_symlinks>/` — keyed by what the
+  walk covers, so two libraries sharing a cache dir do not prune each other's
+  extractions away. `follow_symlinks` is in the key because under it the library is the
+  root *and* every followed target, so a run without it would sweep everything reached
+  through a link. A cache dir inside the scan
   root is refused by `assetindex` itself, since that is the package that does the
   writing — comparing paths resolved to their deepest existing ancestor, because the
   run that has to be caught is the first one, when the cache dir does not exist yet.

@@ -402,6 +402,10 @@ header select:hover { border-color: var(--edge-hi); color: var(--text); }
 .lb-copyicon.failed::after { content: '✕'; font-size: 14px; }
 
 .lb-related { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
+/* An author display beats the UA [hidden] rule whatever its specificity, so a box
+   with one of its own needs this or .hidden = true does nothing to it. Every other
+   element the page hides carries the same pair. */
+.lb-related[hidden] { display: none; }
 .lb-related-head { color: var(--muted); font-size: 12px; }
 .lb-related-strip { display: flex; flex-wrap: wrap; gap: 8px; }
 .lb-related-item { display: flex; flex-direction: column; gap: 4px; width: 72px; padding: 0; background: none; border: 0; color: var(--muted); cursor: pointer; font: inherit; }

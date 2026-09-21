@@ -20,6 +20,15 @@ func TestRootMotionVariant(t *testing.T) {
 		{"A_Dodge_L_Sword", "A_Dodge_L_Sword", false},                                         // the in-place sibling
 		{"Warm_Idle", "Warm_Idle", false},                                                     // "arm"/"rm" substrings are not the token
 		{"Storm", "Storm", false},
+		// The two above are rejected by case alone, so they say nothing about the left
+		// boundary the doc credits for them. These carry the token's own spelling with
+		// no "_" in front of it, which only the boundary can turn down — and they are
+		// the names it has to turn down: Sidekick part meshes are all-caps slot codes,
+		// and an arm slot read as a root-motion variant is hidden from the grid behind
+		// an unrelated card, by a recognizer whose answer the cache then freezes.
+		{"SK_ELVN_BASE_01_05ARM_HU01", "SK_ELVN_BASE_01_05ARM_HU01", false},                         // uppercase ARM infix
+		{"SK_ELVN_BASE_01_05ARM", "SK_ELVN_BASE_01_05ARM", false},                                   // uppercase ARM suffix
+		{"A_Dodge_L_ROOTMOTION", "A_Dodge_L_ROOTMOTION", false},                                     // the token is spelled, not cased
 		{"A_Jump_Running_RootMotionVertical_Femn", "A_Jump_Running_RootMotionVertical_Femn", false}, // deliberately unmatched: ambiguous in-place target
 		// The bracket spelling carries its own boundary, so unlike the "_" tokens it is
 		// read wherever it sits rather than only as a suffix.

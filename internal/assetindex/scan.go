@@ -214,12 +214,29 @@ func (w *walker) reportUnreachedLinks() {
 	}
 	// Entry paths are already resolved: WalkDir never descends a link, so every
 	// directory a walk enters is real and every walk starts at a resolved root.
-	reached := make(map[string]bool, len(w.entries))
+	//
+	// Each entry's ancestors go in beside it, so a link to a *directory* answers from
+	// the map like a link to a file does. Asked one target at a time against the entry
+	// list instead, every directory link scanned it from the front until something
+	// inside the target turned up — and a link to a directory the walk never reached,
+	// which is precisely the one being reported, scanned all of it. A library using
+	// per-pack "latest" aliases paid that on every scan, cached refresh included.
+	// Depth is bounded by the tree, so this costs entries × depth once.
+	reached := make(map[string]bool, len(w.entries)*2)
 	for _, e := range w.entries {
 		reached[e.path] = true
+		for d := filepath.Dir(e.path); ; d = filepath.Dir(d) {
+			if reached[d] {
+				break
+			}
+			reached[d] = true
+			if parent := filepath.Dir(d); parent == d {
+				break
+			}
+		}
 	}
 	for _, l := range w.inRoot {
-		if reached[l.target] || w.reachedUnder(l.target) {
+		if reached[l.target] || reached[resolve(l.target)] {
 			continue
 		}
 		// A sidecar is excluded by what it is rather than by where it sits, and the same
@@ -230,22 +247,6 @@ func (w *walker) reportUnreachedLinks() {
 		}
 		w.skip(l.rel, fmt.Errorf("symlink to %s, which is inside the library but excluded from the walk, so nothing indexes it under any name", l.target))
 	}
-}
-
-// reachedUnder reports whether the walk indexed anything inside target, which is what
-// makes a link to a directory the duplicate the drop takes it for. Asked only once the
-// exact match has failed, since a link to a file is the common shape and answers there.
-func (w *walker) reachedUnder(target string) bool {
-	if fi, err := os.Stat(target); err != nil || !fi.IsDir() {
-		return false
-	}
-	rt := resolve(target)
-	for _, e := range w.entries {
-		if contains(rt, e.path) {
-			return true
-		}
-	}
-	return false
 }
 
 func compact[T any](s []T, drop map[int]bool) []T {
@@ -501,11 +502,12 @@ func clipAsset(e libEntry, clip string, index int, fileFP string) Asset {
 // clip, all sharing the file's bytes; its root-motion (_RM) sibling is left whole.
 // Everything else (including single-animation GLBs) is one asset.
 //
-// A non-nil skip means the derivation did not fully succeed. Any assets returned
-// alongside it are still usable — a GLB whose clip list could not be read still
-// previews whole — but the caller must not cache them against the file's stat
-// print, or one transient read failure would be frozen in until the next
-// --reindex, long after the cause was fixed.
+// A non-nil skip is returned instead of assets, never beside them, and means the file
+// could not be read at all: the caller reports it and must not cache anything against
+// the file's stat print, or one transient read failure would be frozen in until the
+// next --reindex, long after the cause was fixed. A .glb whose container will not
+// parse is not that case and is not reported — it becomes one whole asset, which is
+// the right answer for every ordinary model, and its print is cached.
 func looseAssets(e libEntry) ([]Asset, *SkippedFile) {
 	skip := func(err error) *SkippedFile {
 		return &SkippedFile{RelPath: e.rel, Reason: err.Error()}

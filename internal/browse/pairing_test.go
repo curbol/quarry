@@ -517,3 +517,29 @@ func TestOnlyAnimationsAnswerTheSameDirectoryProbe(t *testing.T) {
 		t.Errorf("anim paired with %q, want rm; the model beside the RM answered the directory probe for the clip, and the clip lost its toggle", got)
 	}
 }
+
+// bestClaim holds a root-motion candidate to the best directory affinity any card in
+// the group reaches with it, and it asks that across the whole group — including the
+// other archives in it — because pickRM ranks across them too, with the archive only
+// the low bit of the score. Narrowed to one archive it would still be a filter, and
+// every existing multi-archive case would keep passing, because in each of those the
+// affinity term already separates the cards on its own.
+//
+// This is the case where it does not. Orc ships no root motion of its own, and the
+// only candidate in its group belongs to Goblin, in another archive. Ranking alone
+// hands it over — the archive bit is all Orc scores on — and the grid's toggle plays
+// a goblin's travel animation on an orc: a file that loads, clips that play, nothing
+// anywhere to say the body is wrong.
+func TestARootMotionIsNotClaimedAcrossArchivesByAWorseMatch(t *testing.T) {
+	sibling, _ := buildRootMotionPairs([]assetindex.Asset{
+		zipAnim("orc", "acme", "Chars", "/a.zip", "Anims/Orc/Walk.fbx"),
+		zipAnim("goblin-rm", "acme", "Chars", "/a.zip", "RootMotion/Goblin/Walk_RM.fbx"),
+		zipAnim("goblin", "acme", "Chars", "/b.zip", "Anims/Goblin/Walk.fbx"),
+	})
+	if got := sibling["orc"]; got != "" {
+		t.Errorf("orc paired with %q, want nothing: the only candidate is Goblin's, matched better by a card in another archive", got)
+	}
+	if got := sibling["goblin"]; got != "goblin-rm" {
+		t.Errorf("goblin paired with %q, want goblin-rm: the card the candidate belongs to still gets it", got)
+	}
+}

@@ -19,7 +19,7 @@ import {
 test('the toggle lands on the counterpart, and holds position when there is none', () => {
   assert.equal(clipAcross([2, 0, 1], 0), 2);
   assert.equal(clipAcross([2, -1, 1], 1), 1, 'no counterpart: stay where we are rather than fall to the first');
-  assert.equal(clipAcross([], 3), 3, 'an unsplit sibling is reachable at the same index');
+  assert.equal(clipAcross([], 3), 3, 'no mapping to cross by: hold the index rather than move');
   assert.equal(clipAcross(undefined, 3), 3);
   assert.equal(clipAcross([0, 1, 2], 9), 9, 'a clip past the end of the mapping');
 });
@@ -27,8 +27,9 @@ test('the toggle lands on the counterpart, and holds position when there is none
 test('the toggle is offered only where the other side has the clip', () => {
   assert.equal(togglePairable([2, -1, 1], 0), true);
   assert.equal(togglePairable([2, -1, 1], 1), false, 'a clip with no travel variant must not offer one');
-  // An empty mapping is a whole animation file on the other side — nothing was split,
-  // so every clip is reachable and the toggle stands.
+  // The mapping is from the side being left, so an empty one means this side holds no
+  // clips to cross from and curClip indexes nothing. Nothing can be got wrong, so the
+  // toggle stands. The viewer never builds one from an empty list; this is the floor.
   assert.equal(togglePairable([], 0), true);
   assert.equal(togglePairable(undefined, 0), true);
   assert.equal(togglePairable([0, 1], 5), false, 'past the end is not a counterpart');

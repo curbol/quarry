@@ -58,16 +58,18 @@ func writeFile(t *testing.T, path, content string) {
 	}
 }
 
-// cacheFileFor is where LoadOrBuild keeps one root's index. Tests that reach for the
-// cache file go through this rather than assembling a path, so the layout stays a
-// single decision inside the package.
-func cacheFileFor(t *testing.T, cacheDir, root string) string {
+// cacheFileFor is where LoadOrBuild keeps one library's index. Tests that reach for
+// the cache file go through this rather than assembling a path, so the layout stays a
+// single decision inside the package. follow is part of the address, not a detail: a
+// following run and a non-following one over the same root are two libraries and keep
+// two trees.
+func cacheFileFor(t *testing.T, cacheDir, root string, follow bool) string {
 	t.Helper()
 	abs, err := filepath.Abs(root)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return cacheFile(cacheDir, abs)
+	return cacheFile(cacheDir, abs, follow)
 }
 
 // A personal library is big and accumulates the odd partial copy. One unreadable
@@ -211,7 +213,7 @@ func TestLoadOrBuildRejectsStaleCache(t *testing.T) {
 	if ix.Version != indexVersion {
 		t.Fatalf("built index has version %d", ix.Version)
 	}
-	cachePath := cacheFileFor(t, cacheDir, root)
+	cachePath := cacheFileFor(t, cacheDir, root, false)
 
 	var raw map[string]any
 	b, err := os.ReadFile(cachePath)
@@ -242,7 +244,7 @@ func TestLoadOrBuildRebuildsFromCorruptCache(t *testing.T) {
 	root, mk := libRoot(t)
 	os.WriteFile(mk("v", "p", "Sword.glb"), []byte("GLBBYTES"), 0o644)
 	cacheDir := t.TempDir()
-	cachePath := cacheFileFor(t, cacheDir, root)
+	cachePath := cacheFileFor(t, cacheDir, root, false)
 	if err := os.MkdirAll(filepath.Dir(cachePath), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -2047,7 +2049,7 @@ func TestAnUnwritableCacheWarnsAndKeepsServing(t *testing.T) {
 	cacheDir := t.TempDir()
 	// A directory where the index JSON goes: the write fails for every user, including
 	// root, without needing a permission bit.
-	if err := os.MkdirAll(cacheFile(cacheDir, mustAbs(t, root)), 0o755); err != nil {
+	if err := os.MkdirAll(cacheFile(cacheDir, mustAbs(t, root), false), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	var warnings []string
@@ -3089,33 +3091,51 @@ func TestARewrittenArchiveDoesNotCloseAStreamOverTheOldBytes(t *testing.T) {
 // the invariant is a 50ms spin-loop race that can pass without ever producing the
 // interleaving. The structure is what can be asserted outright.
 func TestNothingReachesAnExtractionOutsideTheArchiveLock(t *testing.T) {
-	src, err := os.ReadFile("content.go")
+	// Both callees are package-internal, so the call this guard exists to catch can be
+	// written in any file here — a prefetch in scan.go reaches ensureExtracted exactly
+	// as content.go does. Read the whole package: scoped to one file, the guard reports
+	// a clean sweep of the only file that was never going to be the problem.
+	files, err := filepath.Glob("*.go")
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Split into top-level funcs so a call can be attributed to the one it sits in.
-	funcs := regexp.MustCompile(`(?m)^func (?:\([^)]*\) )?(\w+)`).FindAllStringSubmatchIndex(string(src), -1)
-	if len(funcs) < 10 {
-		t.Fatalf("parsed %d functions out of content.go; this guard has stopped reading it", len(funcs))
-	}
-	callers := func(callee string) []string {
-		var out []string
+	type fn struct{ file, name, body string }
+	var all []fn
+	var read int
+	for _, file := range files {
+		if strings.HasSuffix(file, "_test.go") {
+			continue
+		}
+		src, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		read++
+		// Split into top-level funcs so a call can be attributed to the one it sits in.
+		funcs := regexp.MustCompile(`(?m)^func (?:\([^)]*\) )?(\w+)`).FindAllStringSubmatchIndex(string(src), -1)
 		for i, m := range funcs {
 			end := len(src)
 			if i+1 < len(funcs) {
 				end = funcs[i+1][0]
 			}
-			name := string(src[m[2]:m[3]])
-			body := string(src[m[1]:end])
-			if name != callee && strings.Contains(body, callee+"(") {
-				out = append(out, name)
+			all = append(all, fn{file, string(src[m[2]:m[3]]), string(src[m[1]:end])})
+		}
+	}
+	if read < 8 || len(all) < 40 {
+		t.Fatalf("globbed %d non-test files holding %d functions; this guard has stopped reading the package", read, len(all))
+	}
+	callers := func(callee string) []string {
+		var out []string
+		for _, f := range all {
+			if f.name != callee && strings.Contains(f.body, callee+"(") {
+				out = append(out, f.file+":"+f.name)
 			}
 		}
 		return out
 	}
 	for callee, allowed := range map[string][]string{
-		"ensureExtracted": {"unpackedEntry"},
-		"unpackedEntry":   {"openUnpackedMember"},
+		"ensureExtracted": {"content.go:unpackedEntry"},
+		"unpackedEntry":   {"content.go:openUnpackedMember"},
 	} {
 		got := callers(callee)
 		if len(got) == 0 {
@@ -3130,9 +3150,16 @@ func TestNothingReachesAnExtractionOutsideTheArchiveLock(t *testing.T) {
 		}
 	}
 	// And the one way in does take the lock.
-	body := string(src[strings.Index(string(src), "func (ix *Index) openUnpackedMember"):])
-	body = body[:strings.Index(body, "\n}\n")]
-	if !strings.Contains(body, "archiveMu(") || !strings.Contains(body, "RLock()") {
+	var entry string
+	for _, f := range all {
+		if f.name == "openUnpackedMember" {
+			entry = f.body
+		}
+	}
+	if entry == "" {
+		t.Fatal("openUnpackedMember not found; this guard has stopped checking anything")
+	}
+	if !strings.Contains(entry, "archiveMu(") || !strings.Contains(entry, "RLock()") {
 		t.Error("openUnpackedMember no longer takes archiveMu for reading")
 	}
 }
@@ -3490,5 +3517,124 @@ func TestABackslashEntryIsServedByItsStoredSpelling(t *testing.T) {
 	}
 	if size != int64(len(data)) {
 		t.Errorf("size = %d, want %d", size, len(data))
+	}
+}
+
+// Regenerable state is addressed by what the walk covers, and --follow-symlinks is
+// half of that: under it the library is the root and every target the walk followed.
+// Keyed on the root alone, both settings shared one tree, so the run that did not
+// follow saw every extraction reached through a link as unreferenced and swept it —
+// out from under a second instance already serving them, which --addr exists to allow.
+// The sequential half is visible here; the concurrent one is the same delete.
+func TestNotFollowingDoesNotPruneWhatFollowingExtracted(t *testing.T) {
+	outside := t.TempDir()
+	drive := filepath.Join(outside, "drive2")
+	pkg := filepath.Join(drive, "Pack.unitypackage")
+	if err := os.MkdirAll(drive, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeUnityPackage(t, pkg, []unityGUID{
+		{guid: "aaa", pathname: "Assets/M/thing.fbx", asset: "FBXBYTES"},
+	})
+	root, mk := libRoot(t)
+	if err := os.Symlink(drive, mk("v", "Linked")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	cacheDir := t.TempDir()
+
+	following, err := LoadOrBuild(Options{Root: root, CacheDir: cacheDir, FollowSymlinks: true}, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir, err := following.ensureExtracted(pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The second instance: same root, same cache dir, no follow. Its walk never reaches
+	// the drive, so nothing there is in its keep-set.
+	plain, err := LoadOrBuild(Options{Root: root, CacheDir: cacheDir}, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := plain.PruneUnpacked(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Errorf("the non-following run pruned an extraction the following run serves: %v", err)
+	}
+
+	// The two trees being distinct is what makes that true, and it is the thing a
+	// future change to stateDir would lose.
+	if following.stateDir() == plain.stateDir() {
+		t.Errorf("both settings share the state dir %s; each run's prune sweeps the other's extractions",
+			following.stateDir())
+	}
+	// Including the index JSON, which otherwise overwrites the other setting's on every
+	// alternating run.
+	if following.cachePath() == plain.cachePath() {
+		t.Errorf("both settings share the index at %s", following.cachePath())
+	}
+}
+
+// reshipped asks whether the archive on disk is the one the scan described, and
+// answers no only when it has a print to compare. The "no print recorded" half is not
+// bookkeeping: refresh drops an archive's print whenever archiveAssets returns a note
+// while keeping its assets (a package whose second pass failed after its first
+// enumerated fine), and those assets stay in the index and stay clickable. Read as a
+// mismatch, ensureExtracted refuses to decompress at all, so every asset in that pack
+// answers 404 for the life of the run with nothing logged — and openUnpacked keeps the
+// repair for the same reason, so a torn member behind a dropped print is still fixed.
+func TestAnArchiveWithNoRecordedPrintStillServesAndStillRepairs(t *testing.T) {
+	root, mk := libRoot(t)
+	pkg := mk("v", "Pack", "Pack.unitypackage")
+	writeUnityPackage(t, pkg, []unityGUID{
+		{guid: "aaa", pathname: "Assets/M/thing.fbx", asset: "FBXBYTES"},
+	})
+	ix, err := Build(Options{Root: root, CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ix.Assets) != 1 {
+		t.Fatalf("assets = %v, want the one member", names(ix.Assets))
+	}
+	// The state a degraded pass leaves behind: assets kept, print dropped.
+	delete(ix.ArchivePrint, pkg)
+
+	rc, _, err := ix.Open(ix.Assets[0])
+	if err != nil {
+		t.Fatalf("Open: %v — an archive the index describes but has no print for is unreachable", err)
+	}
+	got, err := io.ReadAll(rc)
+	rc.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "FBXBYTES" {
+		t.Fatalf("read %q, want %q", got, "FBXBYTES")
+	}
+
+	// And the repair is still available to it, which is the reason this case keeps it:
+	// with no print there is nothing to prove the archive was re-shipped, so a short
+	// member can only be a torn extraction.
+	dir, err := ix.ensureExtracted(pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	member := filepath.Join(dir, "aaa", "asset")
+	if err := os.WriteFile(member, []byte("FBX"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rc, _, err = ix.Open(ix.Assets[0])
+	if err != nil {
+		t.Fatalf("Open after tearing the member: %v — the rebuild was refused", err)
+	}
+	got, err = io.ReadAll(rc)
+	rc.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "FBXBYTES" {
+		t.Errorf("read %q after the repair, want %q", got, "FBXBYTES")
 	}
 }

@@ -5,6 +5,10 @@ import { iconEl, protoClone } from '/static/icons.js';
 import { nextTags } from '/static/tagedit.js';
 
 const PAGE = 200;
+// How long a failed page waits before a scroll may retry it. Long enough that one
+// gesture asks once — a fling's scroll events span a few hundred milliseconds — and
+// short enough that a person who scrolls again after reading the message is answered.
+const RETRY_AFTER_MS = 1000;
 
 const els = {
   q: document.getElementById('q'),
@@ -24,7 +28,7 @@ const els = {
 // "loaded" flag: the server counts cards and rows separately, because one result is
 // not one thing, and a count carried over from the other mode advertises a number
 // clicking it cannot return.
-const state = { gen: 0, offset: 0, total: 0, loading: false, done: false, failed: false, facetsMode: null, items: [] };
+const state = { gen: 0, offset: 0, total: 0, loading: false, done: false, failed: false, failedAt: 0, facetsMode: null, items: [] };
 
 // ---- data ----
 
@@ -109,6 +113,7 @@ async function loadPage() {
     if (gen !== state.gen) return;
     console.error('loading assets failed', e);
     state.failed = true;
+    state.failedAt = performance.now();
     els.error.textContent = 'Could not load assets (' + (e && e.message ? e.message : 'unknown error') + '). Scroll or change a filter to retry.';
     els.error.hidden = false;
   }
@@ -1587,7 +1592,18 @@ addEventListener('scroll', () => {
   syncGridWindow(false);
   // The sentinel stays intersecting after a failed page, so the IntersectionObserver
   // never fires again. A scroll is the gesture the error message asks for.
-  if (state.failed) { state.failed = false; fetchPage(); }
+  //
+  // Gated on elapsed time rather than on the event, because one gesture is not one
+  // event: an inertial fling emits a scroll per frame for several hundred
+  // milliseconds, and against a quarry that has stopped a fetch rejects in about a
+  // millisecond — well inside a frame. Read per event, a single flick cleared the
+  // latch sixty times a second, so the retry the message promises became a request
+  // storm at frame rate, with a console error for each. scrollend is the gesture
+  // itself, but Safari does not have it.
+  if (state.failed && performance.now() - state.failedAt > RETRY_AFTER_MS) {
+    state.failed = false;
+    fetchPage();
+  }
 }, { passive: true });
 // A resize changes the column count and the row height, so the cached geometry is
 // stale and the spacers have to be remeasured outright. Coalesced like scroll: dragging

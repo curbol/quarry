@@ -116,3 +116,60 @@ func TestLinkDisabled(t *testing.T) {
 		t.Errorf("link while disabled status = %d, want 409", resp.StatusCode)
 	}
 }
+
+// preTag is the same result set with the tag filter relaxed, so it is a superset of
+// the filtered one: every card that is both a tag match and a companion of another
+// tag match appears in both halves of the expansion. Without the suppression it is
+// appended twice, which the case above cannot see because it tags only one end of the
+// link. Tagged at both ends, the grid renders each card twice and every later offset
+// is wrong for the rest of the scroll.
+func TestIncludeRelatedDoesNotRepeatACardThatIsBothAMatchAndACompanion(t *testing.T) {
+	srv, _ := enabledServer(t)
+	heart := itemByName(t, srv, "q=Heart", "Heart.fbx")
+	sword := itemByName(t, srv, "q=Sword", "Sword.glb")
+
+	fps := append(append([]string{}, heart.Fingerprints...), sword.Fingerprints...)
+	doJSON(t, "POST", srv.URL+"/api/link", map[string]any{"fingerprints": fps, "on": true}).Body.Close()
+	// Both ends tagged, so each card is its own tag match and the other's companion.
+	doJSON(t, "POST", srv.URL+"/api/assign", map[string]any{"fingerprints": fps, "tag": "love", "on": true}).Body.Close()
+
+	exp := taggedAssets(t, srv, "tag=love&includeRelated=1")
+	seen := map[string]int{}
+	for _, it := range exp.Items {
+		seen[it.Name]++
+	}
+	for name, n := range seen {
+		if n != 1 {
+			t.Errorf("card %s appears %d times in one page", name, n)
+		}
+	}
+	if exp.Total != 2 || len(exp.Items) != 2 {
+		t.Errorf("total = %d over %d items, want 2 distinct cards", exp.Total, len(exp.Items))
+	}
+}
+
+// Store.Link needs two distinct non-empty fingerprints and silently does nothing with
+// fewer, so a bare length check on the request let two shapes through that make no
+// group and still answer success: one fingerprint sent twice, and one paired with the
+// empty print an asset whose content could not be read carries.
+func TestLinkRefusesARequestThatWouldMakeNoGroup(t *testing.T) {
+	srv, tagsPath := enabledServer(t)
+	heart := itemByName(t, srv, "q=Heart", "Heart.fbx")
+	fp := heart.Fingerprints[0]
+
+	for _, fps := range [][]string{{fp, fp}, {fp, ""}} {
+		resp := doJSON(t, "POST", srv.URL+"/api/link", map[string]any{"fingerprints": fps, "on": true})
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("link %v answered %d, want 400: no group is made and the caller is told one was",
+				fps, resp.StatusCode)
+		}
+	}
+	onDisk, err := tagstore.Load(tagsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(onDisk.Groups()) != 0 {
+		t.Errorf("groups = %v, want none", onDisk.Groups())
+	}
+}

@@ -67,9 +67,19 @@ func assetFileBase(s assetindex.Source) string {
 // covers for suppression from the grid (suppressed: RM assetID -> true). Assets are
 // grouped by (vendor, pack, canonical file base); a group with both variants pairs
 // only when its visible side includes an animation, so an unrelated "_RM" file never
-// hijacks a card. Which RM an in-place asset gets is pickRM's decision: same directory
-// first, then same archive. Which clip inside that file plays is not settled here —
-// an RM file is never split, so it arrives whole and the frontend matches the clip.
+// hijacks a card.
+//
+// Which RM an in-place asset gets is settled in two stages, and a card can come out of
+// them with none. Directory is a filter rather than a rank: groupPairsByDirectory asks,
+// per container format inside one archive, whether any card in the group has an RM in
+// its own directory, and if so a card whose directory ships none gets nothing rather
+// than a neighbour's. Where that does not engage, pickRM ranks directory affinity —
+// shared trailing segments — above same-archive, and bestClaim holds each candidate to
+// the best affinity any card in the group reaches with it, since ranking alone still
+// hands the last remaining candidate to a card it does not belong to.
+//
+// Which clip inside the chosen file plays is not settled here — an RM file is never
+// split, so it arrives whole and the frontend matches the clip.
 func buildRootMotionPairs(assets []assetindex.Asset) (sibling map[string]string, suppressed map[string]bool) {
 	type group struct{ nonRM, rm []int }
 	groups := map[string]*group{}

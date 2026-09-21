@@ -1,6 +1,7 @@
 package assetindex
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -319,6 +320,17 @@ func TestFollowedFileSymlinkIsServable(t *testing.T) {
 		t.Errorf("size = %d, want %d", size, len("GLBBYTES"))
 	}
 
+	// The size Open reports comes from its own stat and is right either way. This one
+	// comes from the walk, which has to stat the target rather than the link: a link's
+	// own DirEntry describes the link, whose size is the length of the target path.
+	// Taken from the link, the grid shows that path's byte count, and looseDedupKey —
+	// which is name plus size — stops matching the archive twin this file suppresses,
+	// so the same asset comes back as two cards.
+	if ix.Assets[0].Size != int64(len("GLBBYTES")) {
+		t.Errorf("indexed Size = %d, want %d: the walk statted the link rather than its target",
+			ix.Assets[0].Size, len("GLBBYTES"))
+	}
+
 	// Authorising the file must not authorise its whole directory: a sibling the scan
 	// never saw stays outside what serving will open.
 	sibling := ix.Assets[0]
@@ -569,5 +581,45 @@ func TestAnInRootLinkToASidecarIsStillSilent(t *testing.T) {
 	}
 	if len(ix.Assets) != 1 {
 		t.Errorf("assets = %v, want the model only", names(ix.Assets))
+	}
+}
+
+// The walk's stat of a followed file link and the serving side's are two readings of
+// one file, and the cache pairs them: refresh records ArchivePrint from the walk's
+// size and modTime (fingerprintOf), while openUnpacked recomputes it with its own
+// os.Stat, which follows. Statted from the link instead of the target, the two never
+// agree, reshipped answers true forever, and every asset in the package 404s with a
+// message saying the archive changed since it was indexed — for a file nothing
+// touched. The loose case above catches the size; this is the one that costs a whole
+// pack its contents.
+func TestAFollowedFileLinkToAnArchiveServesItsMembers(t *testing.T) {
+	outside := t.TempDir()
+	target := filepath.Join(outside, "Pack.unitypackage")
+	writeUnityPackage(t, target, []unityGUID{
+		{guid: "aaa", pathname: "Assets/M/thing.fbx", asset: "FBXBYTES"},
+	})
+	root, mk := libRoot(t)
+	if err := os.Symlink(target, mk("v", "Pack", "Pack.unitypackage")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	ix, err := Build(Options{Root: root, CacheDir: t.TempDir(), FollowSymlinks: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ix.Assets) != 1 {
+		t.Fatalf("assets = %v, want the one member of the linked package", names(ix.Assets))
+	}
+	rc, size, err := ix.Open(ix.Assets[0])
+	if err != nil {
+		t.Fatalf("Open: %v — the walk's print and the serving side's disagree about a file neither changed", err)
+	}
+	defer rc.Close()
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "FBXBYTES" || size != int64(len("FBXBYTES")) {
+		t.Errorf("read %q (%d bytes), want %q", got, size, "FBXBYTES")
 	}
 }

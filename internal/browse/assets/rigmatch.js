@@ -102,11 +102,15 @@ export function clipAcross(pairs, curClip) {
   return next >= 0 ? next : curClip;
 }
 
-// togglePairable reports whether the toggle has anywhere to go for this clip. An empty
-// mapping means the other side was never split into clips at all — a whole animation
-// file, where every clip is reachable — so the toggle stands; otherwise it needs a
-// counterpart, because offering one that does not exist is how a clip gets presented as
-// another's travel variant.
+// togglePairable reports whether the toggle has anywhere to go for this clip.
+//
+// The mapping is always from the side being left, so its length is that side's clip
+// count — never the sibling's. An empty one therefore means this side holds no clips
+// to cross from, and curClip indexes nothing; there is nothing to get wrong, so the
+// toggle stands. A non-empty one needs a counterpart at curClip, because offering a
+// toggle that does not have one is how a clip gets presented as another's travel
+// variant. Nothing in the viewer builds a mapping from an empty list, so the first
+// branch is a floor rather than a case that arises.
 export function togglePairable(pairs, curClip) {
   return !(pairs || []).length || (pairs || [])[curClip] >= 0;
 }

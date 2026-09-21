@@ -80,6 +80,10 @@ latest_version() {
 # shipped the wrong artifact, or an error page saved under the binary's name.
 verify_binary() {
   local f="$1" magic
+  # -s is false for a missing file as well as an empty one, and the two are different
+  # problems: a release whose zip stores the binary under another name extracts
+  # nothing here, and "empty" sends the reader to look at an asset whose size is fine.
+  [[ -f "$f" ]] || { err "the release archive did not contain ${BINARY_NAME}"; return 1; }
   [[ -s "$f" ]] || { err "the downloaded binary is empty"; return 1; }
   magic=$(od -An -N4 -tx1 "$f" | tr -d ' \n')
   case "$(uname -s)" in

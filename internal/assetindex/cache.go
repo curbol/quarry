@@ -381,30 +381,40 @@ func (ix *Index) save(cachePath string) error {
 }
 
 // stateDir is where one library's regenerable state lives: its cached index and its
-// unpacked-archive tree. It is keyed by scan root because both describe one library.
-// Sharing a cache dir between roots without this key means each run's PruneUnpacked
-// deletes the other root's extractions — including out from under a second instance
-// already serving them, which `--addr` exists to allow.
-func stateDir(cacheDir, absRoot string) string {
-	sum := sha256.Sum256([]byte(absRoot))
+// unpacked-archive tree. It is keyed by what the walk covers, because both describe
+// one library. Sharing a cache dir between libraries without this key means each
+// run's PruneUnpacked deletes the other's extractions — including out from under a
+// second instance already serving them, which `--addr` exists to allow.
+//
+// The scan root is half of what the walk covers and follow is the other half: under
+// it the library is the root *and* every target the walk followed, which is why
+// LoadOrBuild will not reuse an index built the other way. Keyed on the root alone,
+// the two settings shared one tree, and the run that did not follow pruned every
+// extraction reached through a link as unreferenced.
+func stateDir(cacheDir, absRoot string, follow bool) string {
+	key := absRoot
+	if follow {
+		key += "\x00follow"
+	}
+	sum := sha256.Sum256([]byte(key))
 	return filepath.Join(cacheDir, "roots", hex.EncodeToString(sum[:6]))
 }
 
-func (ix *Index) stateDir() string { return stateDir(ix.cacheDir, ix.Root) }
+func (ix *Index) stateDir() string { return stateDir(ix.cacheDir, ix.Root, ix.FollowSymlinks) }
 
 // cacheFile is where one library's index JSON lives. Empty when there is no cache
-// dir, which is also the state in which nothing is written. It takes the two values
+// dir, which is also the state in which nothing is written. It takes the values
 // rather than an index because LoadOrBuild needs the path before it has one, and the
 // layout is worth keeping a single decision.
-func cacheFile(cacheDir, absRoot string) string {
+func cacheFile(cacheDir, absRoot string, follow bool) string {
 	if cacheDir == "" {
 		return ""
 	}
-	return filepath.Join(stateDir(cacheDir, absRoot), "index.json")
+	return filepath.Join(stateDir(cacheDir, absRoot, follow), "index.json")
 }
 
 // cachePath is where this index's JSON lives.
-func (ix *Index) cachePath() string { return cacheFile(ix.cacheDir, ix.Root) }
+func (ix *Index) cachePath() string { return cacheFile(ix.cacheDir, ix.Root, ix.FollowSymlinks) }
 
 // LoadOrBuild returns a usable index: a fresh build when reindex is set or no valid
 // cache exists for these options, otherwise the cached index refreshed against the
@@ -427,10 +437,12 @@ func LoadOrBuild(opt Options, reindex bool, warn func(string)) (*Index, error) {
 	if err := checkCacheDir(absRoot, opt.CacheDir); err != nil {
 		return nil, err
 	}
-	cachePath := cacheFile(opt.CacheDir, absRoot)
+	cachePath := cacheFile(opt.CacheDir, absRoot, opt.FollowSymlinks)
 	if !reindex && cachePath != "" {
 		// FollowSymlinks is part of the match: it decides what the walk covers, so a
-		// cache built the other way is describing a different library.
+		// cache built the other way is describing a different library. It is also part
+		// of the path, so this re-reads what the name already separated — which is what
+		// catches a file moved or copied between the two trees by hand.
 		if ix, err := load(cachePath, opt.CacheDir); err == nil &&
 			ix.Root == absRoot && ix.Version == indexVersion && ix.FollowSymlinks == opt.FollowSymlinks {
 			if err := ix.refresh(); err != nil {

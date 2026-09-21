@@ -70,3 +70,26 @@ test('the rig search terminates even when the registry cannot persist an evictio
   assert.ok(tries > 0, 'the search never reached a candidate; this fixture proves nothing');
   assert.ok(tries <= 50, 'the search did not terminate');
 });
+
+// The bound the page actually runs under. store.limit is picked at module load from
+// whether localStorage exists, so this is the only process that sees STORED_MAX —
+// charstore.test.mjs runs the no-localStorage branch and pins MEMORY_MAX, ten times
+// larger. Without an assertion here, STORED_MAX is held up by nothing but being
+// smaller than the constant the other file checks, and a change collapsing the two
+// leaves the whole suite green. What it costs is the reason the smaller bound exists:
+// the registry is one localStorage value, and a few hundred skeletons of bone-name
+// arrays grow it until setItem throws, after which every save is silently dropped.
+test('the registry is bounded by the stored limit, not the memory one', async () => {
+  const { STORED_MAX, MEMORY_MAX } = await import('../assets/charstore.js');
+  assert.ok(STORED_MAX < MEMORY_MAX, 'the stored bound must be the tighter of the two');
+
+  CharRegistry.save([]);
+  for (let i = 0; i < STORED_MAX + 10; i++) CharRegistry.add(rig('r' + i));
+
+  const ids = CharRegistry.list().map((e) => e.id);
+  assert.equal(ids.length, STORED_MAX,
+    `the registry holds ${ids.length} entries on the localStorage branch, want ${STORED_MAX}`);
+  // Most recent first, so the newest survive and the oldest are the ones dropped.
+  assert.equal(ids[0], 'r' + (STORED_MAX + 9));
+  assert.ok(!ids.includes('r0'), 'the oldest entry outlived the bound');
+});

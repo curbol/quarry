@@ -65,10 +65,13 @@ extraction made by older code from what the current code would write. Each pack 
 extracts under a new fingerprint, so a prune on startup drops both the extractions the
 current index no longer references and every tree from another version.
 
-All of it lives under `<cache>/roots/<hash of the scan root>/`, keyed by root because an
-index and its extractions describe one library. `--root` indexes somewhere else for a run
-and `--addr` lets two instances serve at once, so without that key each run's prune would
-delete the other root's extractions — including out from under a server still serving them.
+All of it lives under `<cache>/roots/<hash of the scan root and follow_symlinks>/`, keyed
+by what the walk covers because an index and its extractions describe one library. `--root`
+indexes somewhere else for a run and `--addr` lets two instances serve at once, so without
+that key each run's prune would delete the other library's extractions — including out from
+under a server still serving them. The flag is half of the key for the same reason it
+invalidates a cached index: under it the library is the root *and* every followed target,
+so a run without it sees every extraction reached through a link as unreferenced.
 Where the state lives is derived inside `assetindex` from the options, so no caller can pair
 one root's index with another's path. The cache dir may not sit inside the scan root: the
 tree quarry promises not to write to is not somewhere to put the index and every unpacked
@@ -176,7 +179,9 @@ single candidate left a card takes it however distant, which is the ordinary cas
 ships no RM for some clip. So a candidate is also held to the best directory affinity *any* card in
 the group reaches with it — the same "it belongs to someone else" rule the directory filter
 applies, one rung down and reachable where that filter is not. Because a
-result card groups by name and size while pairing groups by pack, a card can span the
+result card groups by name and size (plus the clip label, where there is one — every clip of a
+split GLB carries the file's own size, so the name alone would fold two of them onto one card)
+while pairing groups by pack, a card can span the
 copy that owns the sibling and one that does not, so the card takes the sibling of
 whichever of its copies has one. This is orthogonal to whether the clip has
 a body to preview on: it only decides which file the toggle plays.

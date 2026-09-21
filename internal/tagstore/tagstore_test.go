@@ -438,13 +438,19 @@ func TestSaveFromANeverLoadedStoreRefusesAnExistingPath(t *testing.T) {
 		}
 	})
 
-	t.Run("a directory in the way is an error, not a success", func(t *testing.T) {
+	// A directory at the destination never reaches the write at all: os.Stat succeeds
+	// on it, so it is an existing path like any other and the export rule turns it
+	// down. Asserted as ErrStale rather than as "some error", because a bare non-nil
+	// check passes whether this lands here or in safewrite, and the two are different
+	// claims — the failed-write path is TestFailedSaveLeavesNoTempFile's, which
+	// asserts its error is specifically *not* ErrStale.
+	t.Run("a directory in the way is refused like any other existing path", func(t *testing.T) {
 		blocked := filepath.Join(dir, "sub", FileName)
 		if err := os.MkdirAll(blocked, 0o755); err != nil {
 			t.Fatal(err)
 		}
-		if err := New().Save(blocked); err == nil {
-			t.Error("Save reported success onto a directory")
+		if err := New().Save(blocked); !errors.Is(err, ErrStale) {
+			t.Errorf("Save onto a directory = %v, want ErrStale", err)
 		}
 	})
 }
@@ -1240,5 +1246,79 @@ func TestASavedStoreWarnsThatItIsRewrittenWhole(t *testing.T) {
 	}
 	if got := back.TagsFor("crc32:1:2"); len(got) != 1 || got[0] != "hero" {
 		t.Errorf("TagsFor after a round trip = %v, want [hero]", got)
+	}
+}
+
+// A [[tag]] row with no color is accepted and given a generated one. This is not an
+// incidental branch: the error for an unreadable color tells the user to "use #rrggbb,
+// or remove the color to get a generated one", so it is behavior the store advertises
+// to someone hand-editing the file it just refused. Ordered under the successful
+// NormalizeColor case and above the refusal, it is one reorder away from turning the
+// file quarry just told them to write into a hard Load error that stops the server
+// starting, with a message contradicting the one that sent them there.
+func TestLoadGeneratesAColorForARowThatOmitsOne(t *testing.T) {
+	path := filepath.Join(t.TempDir(), FileName)
+	if err := os.WriteFile(path, []byte("[[tag]]\n  id = \"hero\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load on a row with no color: %v — the error for a bad color tells the user to write exactly this", err)
+	}
+	got, ok := s.color("hero")
+	if !ok || got != DefaultColor("hero") {
+		t.Errorf("color(hero) = %q (defined %v), want the generated %q", got, ok, DefaultColor("hero"))
+	}
+	// And the next save puts the generated color back, so the file round-trips rather
+	// than being refused on the load after it.
+	if err := s.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), DefaultColor("hero")) {
+		t.Errorf("the saved file does not carry the generated color:\n%s", b)
+	}
+	if _, err := Load(path); err != nil {
+		t.Errorf("the file this store wrote does not load back: %v", err)
+	}
+}
+
+// Reload re-homes the store: path becomes the file Save guards from then on. Save's
+// mirror rule — a home is adopted once and never moves — is pinned exhaustively; this
+// half was pinned by nothing, so a second Reload call site reading from a different
+// file (a "revert to the project store", a backup) would move the guard while the
+// server kept saving to s.tagsPath. Every save after that takes the export branch,
+// finds the real file present, and answers ErrStale: the UI 409s on every tag click
+// until restart, and recovery reloads from the wrong file each time.
+func TestReloadRehomesTheStoreOntoThePathItRead(t *testing.T) {
+	dir := t.TempDir()
+	a := filepath.Join(dir, "a.toml")
+	b := filepath.Join(dir, "b.toml")
+	for _, p := range []string{a, b} {
+		s := New()
+		s.Assign("crc32:aa:1", "hero")
+		if err := s.Save(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	s, err := Load(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Reload(b); err != nil {
+		t.Fatal(err)
+	}
+	// b is now the home, so saving to it re-checks the stamp and succeeds.
+	if err := s.Save(b); err != nil {
+		t.Errorf("Save onto the path Reload read = %v, want it to be the home now", err)
+	}
+	// a is no longer guarded by this store, so rewriting it whole is an export onto an
+	// existing file — refused, rather than silently destroying what a never read.
+	if err := s.Save(a); !errors.Is(err, ErrStale) {
+		t.Errorf("Save onto the path this store was loaded from = %v, want ErrStale after a Reload moved the home", err)
 	}
 }

@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -2200,5 +2201,190 @@ func TestPagingSharesOneComputationAndNothingElseDoes(t *testing.T) {
 		if resultKey(other) == resultKey(base) {
 			t.Errorf("%s does not reach the key, so two queries differing only in it share one memoized result set", k)
 		}
+	}
+}
+
+// A split GLB's clips all carry the file's own size, so the normalized name is the
+// only thing left separating them in the group key — and groupNameKey is deliberately
+// lossy, dropping every rune that is not a letter, digit or ".". The clip labels it
+// folds were made distinct by the scan precisely so each clip tags on its own
+// fingerprint, so folding two of them onto one card loses a card under every filter
+// and, because a card's fingerprints are the union, writes a tag the user put on one
+// clip onto the other as well — into a file they commit.
+//
+// The pairs are the three shapes groupNameKey erases: the disambiguator's own output
+// meeting a real name, a separator difference, and a case difference.
+func TestTwoClipsOfOneFileAreTwoCards(t *testing.T) {
+	const size = 4096
+	clip := func(label string) assetindex.Asset {
+		i := 0
+		return assetindex.Asset{
+			Name: label, Size: size, Category: assetindex.CategoryAnimation,
+			Fingerprint: "crc32:dead:4096#" + label,
+			Source: assetindex.Source{
+				Kind: assetindex.SourceLoose, FilePath: "/lib/Anims.glb",
+				Clip: label, ClipIndex: &i,
+			},
+		}
+	}
+	for _, pair := range [][2]string{
+		{"Walk (2)", "Walk 2"},
+		{"Run_01", "Run 01"},
+		{"Walk", "walk"},
+	} {
+		assets := []assetindex.Asset{clip(pair[0]), clip(pair[1])}
+		items := groupItems(assets, []int32{0, 1})
+		if len(items) != 2 {
+			t.Errorf("clips %q and %q of one file grouped into %d card(s), want 2: one clip is unreachable under every filter",
+				pair[0], pair[1], len(items))
+			continue
+		}
+		for i, it := range items {
+			if len(it.Fingerprints) != 1 || it.Fingerprints[0] != assets[i].Fingerprint {
+				t.Errorf("card for clip %q carries fingerprints %v, want only its own %q: a tag on this card lands on the other clip too",
+					pair[i], it.Fingerprints, assets[i].Fingerprint)
+			}
+		}
+	}
+	// The fold groupKey exists for still has to happen: one animation library shipped
+	// in two packs is one card, clip label and all.
+	same := []assetindex.Asset{clip("Walk"), clip("Walk")}
+	same[1].Pack = "Other"
+	if items := groupItems(same, []int32{0, 1}); len(items) != 1 {
+		t.Errorf("the same clip of the same file shipped in two packs made %d cards, want 1", len(items))
+	}
+}
+
+// An author-origin `display` beats the user agent's `[hidden] { display: none }`
+// whatever its specificity, so an element with a display rule of its own needs a
+// matching [hidden] rule or `el.hidden = true` does nothing to it at all. The failure
+// is silent in both directions: nothing throws, nothing logs, and the element simply
+// stays on screen — the related strip kept the previous asset's companions under the
+// next asset's panel, which is what the generation check in renderLbRelated exists to
+// prevent.
+//
+// Derived from the JS rather than listed, so an element hidden by a new call site is
+// covered by adding nothing. Only ids and class literals the page can be traced to a
+// selector by are checked; a local variable naming an element built elsewhere is not
+// resolvable from here and is skipped rather than guessed at.
+func TestEveryElementThePageHidesCanActuallyBeHidden(t *testing.T) {
+	css, err := assetsFS.ReadFile("assets/style.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	html, err := assetsFS.ReadFile("assets/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The elements the page hides, as the selectors they are styled through: an id in
+	// index.html carrying a `hidden` attribute is one the JS toggles, and its class is
+	// what style.css addresses it by.
+	tags := regexp.MustCompile(`<[a-z]+[^>]*\bid="([a-z-]+)"[^>]*\bclass="([^"]*)"[^>]*\bhidden\b`).FindAllStringSubmatch(string(html), -1)
+	if len(tags) < 3 {
+		t.Fatalf("found %d hidden elements in index.html; this guard has stopped reading it", len(tags))
+	}
+	for _, m := range tags {
+		id, classes := m[1], strings.Fields(m[2])
+		for _, c := range classes {
+			// The rule that gives this class a display of its own, if any. A class with
+			// no display rule falls through to the UA sheet and is hidden correctly.
+			decl := regexp.MustCompile(`(?m)^\.` + regexp.QuoteMeta(c) + `\s*\{[^}]*\bdisplay\s*:`)
+			if !decl.Match(css) {
+				continue
+			}
+			guard := regexp.MustCompile(`(?m)^\.` + regexp.QuoteMeta(c) + `\[hidden\]\s*\{[^}]*\bdisplay\s*:\s*none`)
+			if !guard.Match(css) {
+				t.Errorf("#%s is hidden by the page and .%s sets its own display, but there is no `.%s[hidden] { display: none }`: setting .hidden on it does nothing",
+					id, c, c)
+			}
+		}
+	}
+}
+
+// The embedded FS has a zero modtime, so http.FileServerFS sends no Last-Modified and
+// no ETag and the browser is free to cache /static/ heuristically. Drop the wrapper
+// and nothing anywhere fails: the suite stays green, the page keeps working, and the
+// cost lands after `quarry update`, as a UI silently running the previous build's
+// app.js against the new server until someone thinks to hard-refresh.
+func TestStaticAssetsAreNotHeuristicallyCacheable(t *testing.T) {
+	srv := testServer(t)
+	for _, p := range []string{"/static/app.js", "/static/style.css"} {
+		resp, err := http.Get(srv.URL + p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET %s = %d; this guard is not reaching the handler", p, resp.StatusCode)
+		}
+		cc := resp.Header.Get("Cache-Control")
+		if !strings.Contains(cc, "no-cache") {
+			t.Errorf("%s Cache-Control = %q, want no-cache: with no Last-Modified or ETag "+
+				"the browser caches it by guess and keeps the previous build after an update", p, cc)
+		}
+	}
+}
+
+// handleThumb's twin of TestContentSeparatesAMissFromAFailure. Most assets simply have
+// no thumbnail, so both answers are 404 and the split is visible only in the log —
+// which makes both regressions silent. Dropping the errors.Is logs a line for every
+// ordinary thumbnail-less asset, burying the real ones under a grid's worth of noise;
+// dropping the log leaves a full cache disk or a corrupt archive as a grid of category
+// icons with nothing anywhere saying why.
+func TestThumbLogsAFailureAndStaysQuietAboutAMiss(t *testing.T) {
+	var logged bytes.Buffer
+	log.SetOutput(&logged)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	// OpenThumbnail serves one thing — a unitypackage member's own preview.png — so the
+	// library needs both a member carrying one and something that carries none.
+	srv := serverWith(t, func(mk func(...string) string) {
+		writeUnity(t, mk("synty", "Foo_Pack", "Foo_Pack_Unity_2022_3_v1_0_0.unitypackage"), []unityMember{
+			{guid: "aaa", pathname: "Assets/Foo/Heart.prefab", asset: "PREFABBYTES", preview: true},
+		})
+		os.WriteFile(mk("synty", "Foo_Pack", "Plain.mat"), []byte("MATBYTES"), 0o644)
+	})
+	items := getAssets(t, srv, "").Items
+
+	pick := func(want bool) int {
+		t.Helper()
+		for i, it := range items {
+			if it.Source.HasPreview == want {
+				return i
+			}
+		}
+		t.Fatalf("no asset with HasPreview=%v in the fixture; this test is not exercising the branch it claims", want)
+		return -1
+	}
+	thumb := func(i int) int {
+		t.Helper()
+		resp, err := http.Get(srv.URL + "/api/thumb?id=" + url.QueryEscape(items[i].ID))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	// An asset with no thumbnail at all: a miss, and not worth a word.
+	if got := thumb(pick(false)); got != http.StatusNotFound {
+		t.Errorf("an asset with no thumbnail = %d, want 404", got)
+	}
+	if logged.Len() != 0 {
+		t.Errorf("an ordinary thumbnail-less asset logged %q; every card in a grid would", logged.String())
+	}
+
+	// One that has a thumbnail whose archive is gone: still 404 to the grid, because a
+	// broken preview must not fail the cards around it, but the run has to say so.
+	withPreview := pick(true)
+	if err := os.Remove(items[withPreview].Source.ArchivePath); err != nil {
+		t.Fatal(err)
+	}
+	if got := thumb(withPreview); got != http.StatusNotFound {
+		t.Errorf("a thumbnail whose archive is gone = %d, want 404: the grid must not break around it", got)
+	}
+	if logged.Len() == 0 {
+		t.Error("a thumbnail that failed for a reason other than having none logged nothing: " +
+			"a full cache disk or a corrupt archive reaches here and leaves a grid of icons with no explanation")
 	}
 }

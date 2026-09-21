@@ -93,9 +93,21 @@ func (s *server) handleLink(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "missing fingerprints")
 		return
 	}
-	if req.On && len(req.Fingerprints) < 2 {
-		writeErr(w, http.StatusBadRequest, "need at least two fingerprints to link")
-		return
+	// Counted the way Link counts, which drops empties and folds repeats: a request
+	// naming one fingerprint twice, or one alongside an unreadable asset's empty
+	// print, passes a bare length check and then makes no group at all — answered
+	// {"ok":true} for a link that does not exist, with the store rewritten unchanged.
+	if req.On {
+		distinct := map[string]bool{}
+		for _, fp := range req.Fingerprints {
+			if fp != "" {
+				distinct[fp] = true
+			}
+		}
+		if len(distinct) < 2 {
+			writeErr(w, http.StatusBadRequest, "need at least two distinct fingerprints to link")
+			return
+		}
 	}
 	s.writeUnderLock(w, func() (any, error) {
 		if req.On {

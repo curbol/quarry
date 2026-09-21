@@ -225,8 +225,20 @@ func sortItems(items []assetDTO, mode string) {
 // groupKey is the identity a result card is grouped on: same normalized name, same
 // size. Shared with the facet counts so the two cannot disagree about what one card
 // is — a divergence there advertises a total no filter can reach.
+//
+// A split GLB's clips all carry the file's own size, so the normalized name is the
+// only thing left separating them — and it is deliberately lossy, while the clip
+// labels it folds were made distinct exactly so each clip tags on its own
+// fingerprint. Two clips of one file are never the copy of one file that grouping
+// exists to collapse, so the label joins the key whenever there is one: "Walk (2)"
+// and "Walk 2" stay two cards, while the same animation library shipped in two packs
+// still groups on name and size as before.
 func groupKey(a assetindex.Asset) string {
-	return groupNameKey(a.Name) + "\x00" + strconv.FormatInt(a.Size, 10)
+	k := groupNameKey(a.Name) + "\x00" + strconv.FormatInt(a.Size, 10)
+	if a.Source.Clip != "" {
+		k += "\x00" + a.Source.Clip
+	}
+	return k
 }
 
 // groupNameKey folds file names that differ only by separators/case, so the same

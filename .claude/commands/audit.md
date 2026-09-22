@@ -50,7 +50,17 @@ go test -race ./...                              # what CI runs; the whole suite
 go vet ./...
 gofmt -l .                                       # any output = unformatted files
 node --test 'internal/browse/jstest/*.test.mjs'  # needs node on PATH; nothing installed
+bash -n install.sh                               # a parse, not a run: the script installs a release
+for p in darwin/amd64 darwin/arm64 linux/amd64 linux/arm64 windows/amd64; do
+  GOOS=${p%/*} GOARCH=${p#*/} CGO_ENABLED=0 go build -o /dev/null . || echo "FAIL $p"
+done                                             # the release platforms; slowest step on a cold build cache
+d=$(mktemp -d) && go build -ldflags "-X main.version=ci-probe" -o "$d/quarry-stamp" . \
+  && "$d/quarry-stamp" version                   # must print "quarry ci-probe": main.version is still stampable
 ```
+
+The last three mirror `ci.yml` steps that the Go and Node suites cannot see: a
+platform-specific compile error, a moved `main.version` that `-ldflags -X` silently
+ignores, and an `install.sh` syntax error that the text-parsing guard tests pass over.
 
 The whole suite runs in seconds and is fully offline: browse tests run against
 `net/http/httptest` servers over indexes built in temp dirs, selfupdate against a stub
@@ -62,7 +72,10 @@ other frontend module (`app.js`,
 `viewer.js`, `scene.js`, `thumbs.js`, `thumbworker.js`) has no test at all, so a green
 run says nothing about them. There is no Makefile, task runner, or linter config in the
 repo: `go vet` and `gofmt` are the only static analysis, so nothing decides Go style
-beyond them and nothing at all decides JavaScript style.
+beyond them and nothing at all decides JavaScript style. For Go, the cheapest way to
+mechanize a class of findings is therefore usually a guard test in the area's
+`audit_test.go`. Adding a linter is a real proposal, but a larger one. Adding a
+JavaScript ecosystem to a repo that deliberately has none needs the human's decision.
 
 Three packages carry an `audit_test.go` (`internal/assetindex/`,
 `internal/browse/`, `internal/selfupdate/`), holding guard tests accumulated from
@@ -168,10 +181,11 @@ each package's doc comment restates its own share.
   `Fingerprint` and `\.ID` through `internal/tagstore/`, `browse/tags.go`,
   `browse/links.go`; confirm `indexVersion` is compared on cache load.
 - **The library is read-only.** The tag store is the only thing quarry may write inside
-  a user's tree; everything else goes under `<cache>/roots/<hash of the scan root>/`.
-  The cache dir may not sit inside the scan root, and `checkCacheDir` compares paths
-  resolved to their deepest existing ancestor precisely so the first run, when the
-  cache dir does not exist yet, is the one caught. *Violation:* any `os.Create`,
+  a user's tree; everything else goes under
+  `<cache>/roots/<hash of the scan root and follow_symlinks>/`. The cache dir may not
+  sit inside the scan root, and `checkCacheDir` compares paths resolved to their
+  deepest existing ancestor precisely so the first run, when the cache dir does not
+  exist yet, is the one caught. *Violation:* any `os.Create`,
   `WriteFile`, `Rename`, `Remove`, `MkdirAll`, or `Chmod` on a path derived from
   `Options.Root`, `Source.FilePath`, or `Source.ArchivePath`; a containment check that
   compares unresolved strings.
@@ -230,7 +244,7 @@ each package's doc comment restates its own share.
   single reading of `group=`, used by both `computeResults` and the choice between
   `s.facets` and `s.ungroupedFacets`; `buildFacets` returns both sets from one pass
   because a card count under-reports an asset-per-row response by however many copies a
-  pack ships. A tag's `Count` is likewise cards, resolved through `cardOfFP`, with
+  pack ships. A tag's `Count` is likewise cards, resolved through `cardsOfFP`, with
   assignments outside the current index carried separately as `OffIndex` rather than
   folded in. *Violation:* a response pairing one grouping's results with the other's
   facets; a second, independent reading of `group=`; a count folding in fingerprints no
@@ -367,8 +381,8 @@ each package's doc comment restates its own share.
   empty slice rather than nil, so the two paths do not differ in response shape over an
   asset whose content could not be read. Tier 1.
 - Tag palette counting (`tags.go`): `paletteLocked` turns each tag's fingerprints into
-  the set of cards they land on via `cardOfFP`, counting assignments the index does not
-  hold into `OffIndex` instead. `cardOfFP` is built once from the static index and skips
+  the set of cards they land on via `cardsOfFP`, counting assignments the index does not
+  hold into `OffIndex` instead. `cardsOfFP` is built once from the static index and skips
   root-motion-suppressed assets, so it must exclude exactly what the facets exclude.
   Confirm two copies of one file carrying a tag count once, and that an off-index
   assignment is never folded into a number `?tag=` cannot return. Tier 1/2.
@@ -744,7 +758,7 @@ which no single agent could do:
    distinguishable outcomes, that only the torn one rebuilds, that it rebuilds once, and
    that the other two reach the client as 404 rather than 500 or empty 200.
 9. **Counting what a click returns.** Read `buildFacets` and `groupKey` in `cards.go`,
-   `ungrouped()` and `handleAssets` in `server.go`, `cardOfFP` in `newServer`, and
+   `ungrouped()` and `handleAssets` in `server.go`, `cardsOfFP` in `newServer`, and
    `paletteLocked` in `tags.go` together. Confirm every number the page renders beside a
    filter is produced by the same grouping the filter will apply, for `group=1` and
    `group=0` alike, and that root-motion suppression is applied identically in all three.
@@ -769,10 +783,7 @@ For every finding from an area agent or from the cross-cutting analysis:
    decide it, report one automation proposal instead of N findings: enable the
    lint rule, add the check, add a guard test. Check the lint configuration
    first, since a rule that exists but is disabled or not wired into CI is
-   the cheapest fix available. This repo has no linter config at all, so for Go the
-   cheapest mechanization is usually a guard test in the area's `audit_test.go`; adding
-   a linter is a real proposal but a larger one, and adding a JavaScript ecosystem to a
-   repo that deliberately has none needs the human's decision.
+   the cheapest fix available.
 4. **Drop non-actionable observations.** Anything amounting to "noting this
    but it is fine" comes out.
 5. **Deduplicate.** Merge findings that different agents reached from
@@ -794,8 +805,8 @@ Each finding gets:
 - One entry per pattern, with all occurrences grouped under it
 
 **Test quality findings** are a cohesive assessment per area, not a list of
-files. "The tagstore tests cover the transitive merge well but nothing exercises a
-failed save leaving memory ahead of disk" beats "tagstore_test.go:42: missing test".
+files. "The syncer tests cover classify and dedup well but nothing exercises
+the expired-session abort" beats "syncer_test.go:42: missing test".
 
 **Refactor findings** include a sketch of the target structure, or at minimum
 name the functions and types that would result.

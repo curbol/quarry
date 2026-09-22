@@ -231,6 +231,10 @@ type token struct {
 	neg   bool
 	field string
 	value string
+	// declined marks a "(" the tokenizer read something in front of that the grammar
+	// has no place for. The parser skips such a group rather than building it, so what
+	// it could not read narrows the query instead of being answered as something else.
+	declined bool
 }
 
 func isSpace(c rune) bool { return c == ' ' || c == '\t' || c == '\n' || c == '\r' }
@@ -281,7 +285,7 @@ func tokenize(s string) []token {
 				leadingDash = true
 				started = true
 				i++
-			case c == ':' && !split && isSearchField(strings.ToLower(val.String())):
+			case c == ':' && !split && !anyQuote && isSearchField(strings.ToLower(val.String())):
 				field = strings.ToLower(val.String())
 				val.Reset()
 				split = true
@@ -299,16 +303,24 @@ func tokenize(s string) []token {
 			toks = append(toks, token{kind: tokOr})
 			continue
 		}
+		// The term loop stops at "(", so a dash or a field: prefix directly before a
+		// group arrives here with nothing attached.
+		if value == "" && (leadingDash || field != "") && i < n && r[i] == '(' {
+			// A dash negates the group: reading it as a literal "-" instead would AND a
+			// term the user never typed onto the group they meant to exclude, and
+			// "-(a OR b)" would match nothing rather than everything else.
+			//
+			// A field: prefix has no reading at all, because no group carries a scope.
+			// Dropped, "vendor:(a OR b)" became a free-text search over every field, and
+			// "-vendor:(a OR b)" lost the negation along with the scope and answered with
+			// exactly the assets the user asked to exclude. So the group is declined the
+			// way an over-deep one is: one the parser cannot read has to narrow rather
+			// than be reinterpreted as one it can.
+			toks = append(toks, token{kind: tokLParen, neg: leadingDash, declined: field != ""})
+			i++
+			continue
+		}
 		if leadingDash && field == "" && value == "" {
-			// The term loop stops at "(", so a dash directly before a group arrives here
-			// with nothing attached. It negates the group: reading it as a literal "-"
-			// instead would AND a term the user never typed onto the group they meant to
-			// exclude, and "-(a OR b)" would match nothing rather than everything else.
-			if i < n && r[i] == '(' {
-				toks = append(toks, token{kind: tokLParen, neg: true})
-				i++
-				continue
-			}
 			value = "-" // a lone '-' is a literal term, not a negation
 			leadingDash = false
 		}
@@ -415,6 +427,15 @@ func (p *parser) parsePrimary() searchNode {
 	t := p.toks[p.pos]
 	p.pos++
 	if t.kind == tokLParen {
+		if t.declined {
+			// A scoped group: the tokenizer read a "field:" the grammar cannot attach to
+			// one. Skipped and counted exactly as an over-deep group is, so the negation
+			// on "-vendor:(a OR b)" is declined with it rather than complementing a group
+			// that was never read.
+			p.skipGroup()
+			p.declined++
+			return neverNode{}
+		}
 		if p.depth >= maxQueryDepth {
 			// Past the depth cap the group is read but not built: skip to its close so
 			// the rest of the query still parses, rather than recursing without bound.

@@ -114,17 +114,12 @@ func run(args []string) error {
 		}
 		return err
 	}
-	if cmd == "help" {
-		usageTo(stdout)
-		return nil
-	}
-	if cmd == "version" || *showVersion {
-		printVersion()
-		return nil
-	}
-
 	// flag.Parse stops at the first non-flag argument, so an unchecked positional
-	// silently swallows every flag after it.
+	// silently swallows every flag after it. update is the one subcommand that takes
+	// one; every other spelling is rejected here, ahead of the two that answer and
+	// exit, because "quarry version 1.2.3" — the fumble for "quarry update 1.2.3" —
+	// otherwise printed the installed version and exited 0, which a script chaining on
+	// && reads as the version having been checked.
 	if cmd == "update" {
 		if fs.NArg() > 1 {
 			return fmt.Errorf("update takes at most one version argument, got %d", fs.NArg())
@@ -132,7 +127,19 @@ func run(args []string) error {
 		return selfupdate.Run(version, fs.Arg(0))
 	}
 	if fs.NArg() > 0 {
+		if cmd != "" {
+			return fmt.Errorf("%s takes no arguments (got %q)", cmd, fs.Arg(0))
+		}
 		return fmt.Errorf("quarry takes no positional arguments (got %q); to index elsewhere use --root %s", fs.Arg(0), fs.Arg(0))
+	}
+
+	if cmd == "help" {
+		usageTo(stdout)
+		return nil
+	}
+	if cmd == "version" || *showVersion {
+		printVersion()
+		return nil
 	}
 
 	configDir, err := config.ResolveDir(*cfgDir)
@@ -217,6 +224,10 @@ func serve(s settings) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// A run's index JSON is written once, so it records when this one started and never
+	// that it is still going. Another library's prune reads a root nothing has touched
+	// in weeks as abandoned, which for a quarry left serving is its own extractions.
+	go ix.KeepAlive(ctx)
 	return browse.Serve(ctx, s.Addr, ix, s.TagsPath)
 }
 
@@ -229,7 +240,11 @@ func printVersion() {
 func usage() { usageTo(os.Stderr) }
 
 func usageTo(w io.Writer) {
-	fmt.Fprint(w, `quarry - search and 3D-preview a local game-asset library
+	// The one default spelled out here comes from the constant rather than from a copy
+	// of it. This is the only place a user sees the flags — the flag package's own dump
+	// is silenced — so a copy that drifted told everyone the wrong address, with the
+	// build, the vet and the whole suite green.
+	fmt.Fprintf(w, `quarry - search and 3D-preview a local game-asset library
 
 usage:
   quarry [flags]          index the asset root and serve the UI
@@ -239,7 +254,7 @@ usage:
 
 flags:
   -root <dir>         asset scan root (overrides config.toml / QUARRY_ROOT)
-  -addr <host:port>   server address (default: localhost:8788)
+  -addr <host:port>   server address (default: %s)
   -reindex            rebuild the asset index from scratch
   -cache <dir>        index / unpacked-archive cache dir (default: $XDG_CACHE_HOME/quarry)
   -tags <path>        tag store path (default: nearest quarry.tags.toml, else the one in the config dir)
@@ -251,5 +266,5 @@ The scan root is the one setting with no default; set it once in config.toml. Ta
 are stored by content fingerprint, so they survive a pack update, a re-index, and a
 move to another machine. Run from a directory holding a quarry.tags.toml to use that
 project's tags instead of your user-wide ones.
-`)
+`, defaultAddr)
 }

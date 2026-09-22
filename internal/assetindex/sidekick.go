@@ -29,6 +29,15 @@ func parseSidekick(data []byte) (name string, parts []string) {
 		if line == "" {
 			continue
 		}
+		// A comment is not a key, wherever it sits. Read as one at column zero it closed
+		// an open Parts block, and a truncated part list is the one failure here that
+		// looks like success: every name collected still resolves, so the character is
+		// assembled and marked Complete, its byproducts are dropped on both sides, and
+		// what the grid shows is a body missing limbs with no row anywhere holding the
+		// whole of it.
+		if strings.HasPrefix(strings.TrimLeft(line, " \t"), "#") {
+			continue
+		}
 		if c := line[0]; c == ' ' || c == '\t' || c == '-' {
 			if inParts {
 				if col := indentOf(line); strings.HasPrefix(line[col:], "- Name:") {

@@ -2109,6 +2109,11 @@ func TestRelatedDoesNotSurfaceASuppressedRootMotionSibling(t *testing.T) {
 // right fallback — a filter that narrows to nothing for a typo looks like an empty
 // library — but nothing held it, and reading an unknown value as AND is a blank grid
 // for a query the UI can produce by version skew alone.
+//
+// The ordinary readings are here too, on the same fixture: one tag, both under OR, both
+// under AND. They were a second test building the same two-tag library to assert the
+// same two totals, which is a fixture and a pair of assertions to keep in step for
+// nothing.
 func TestAnUnknownTagModeFallsBackToOr(t *testing.T) {
 	srv, _ := enabledServer(t)
 	heart := itemByName(t, srv, "q=Heart", "Heart.fbx")
@@ -2116,9 +2121,15 @@ func TestAnUnknownTagModeFallsBackToOr(t *testing.T) {
 	doJSON(t, "POST", srv.URL+"/api/assign", map[string]any{"fingerprints": heart.Fingerprints, "tag": "a", "on": true}).Body.Close()
 	doJSON(t, "POST", srv.URL+"/api/assign", map[string]any{"fingerprints": sword.Fingerprints, "tag": "b", "on": true}).Body.Close()
 
+	if one := taggedAssets(t, srv, "tag=a"); one.Total != 1 || one.Items[0].Name != "Heart.fbx" {
+		t.Fatalf("a single-tag filter returned %+v, want only the card carrying it", one)
+	}
 	both := "tag=a&tag=b"
 	if got := taggedAssets(t, srv, both).Total; got != 2 {
 		t.Fatalf("the default mode returned %d cards, want both: OR is the default", got)
+	}
+	if got := taggedAssets(t, srv, both+"&tagmode=or").Total; got != 2 {
+		t.Fatalf("tagmode=or returned %d cards, want both", got)
 	}
 	if got := taggedAssets(t, srv, both+"&tagmode=and").Total; got != 0 {
 		t.Fatalf("tagmode=and returned %d, want 0: no card carries both", got)
@@ -2127,6 +2138,48 @@ func TestAnUnknownTagModeFallsBackToOr(t *testing.T) {
 		if got := taggedAssets(t, srv, both+"&tagmode="+mode).Total; got != 2 {
 			t.Errorf("tagmode=%s returned %d cards, want 2: anything but the exact \"and\" is OR", mode, got)
 		}
+	}
+}
+
+// The write surface has three rules, and two of them had a guard that walks every
+// route: a JSON content-type, and a refusal when tagging is off. The third — that a
+// handler goes through writeguard rather than reaching for the store — had none, and
+// it is the one that decides whether an edit survives the process. A handler that
+// mutates the store outside writeUnderLock passes both of the others and is registered
+// in the same list they read, so nothing here would have said anything: it takes no
+// lock, races every concurrent reader, and is gone on restart.
+//
+// Asserted through the file rather than through the response, because the response is
+// rendered from memory either way. This is the positive twin of the malformed-body
+// test below, which already reads the store before and after for the negative case.
+func TestEveryWriteEndpointPersistsAnAcceptedEdit(t *testing.T) {
+	read := func(t *testing.T, p string) []byte {
+		t.Helper()
+		b, err := os.ReadFile(p)
+		if err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		return b
+	}
+	for _, e := range writeEndpoints(t) {
+		t.Run(e.method+" "+e.path, func(t *testing.T) {
+			srv, tagsPath := enabledServer(t)
+			// Every body but the create's edits a tag that has to exist first, or the
+			// request is accepted and correctly changes nothing.
+			if e.method != http.MethodPost || e.path != "/api/tags" {
+				request(t, srv, http.MethodPost, "/api/tags", "application/json", writeBodies["POST /api/tags"]).Body.Close()
+			}
+			before := read(t, tagsPath)
+
+			resp := request(t, srv, e.method, e.path, "application/json", e.body)
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("%s %s = %d, want 200; the body in writeBodies has to be one this route accepts", e.method, e.path, resp.StatusCode)
+			}
+			if after := read(t, tagsPath); bytes.Equal(before, after) {
+				t.Errorf("%s %s answered 200 and the store on disk is unchanged; the edit lives only in memory", e.method, e.path)
+			}
+		})
 	}
 }
 
@@ -2649,5 +2702,52 @@ func TestEveryStaticGuardAssertsItFoundSomething(t *testing.T) {
 	}
 	if checked < 5 {
 		t.Errorf("found %d static guards in audit_test.go; this guard has stopped recognising them", checked)
+	}
+}
+
+// scene.js is shared between the worker and the lightbox, and one decision in it turns
+// on which: loadingManager blanks every texture URL, which the worker must do — a
+// scroll touches thousands of models and every map behind one would stay resident for
+// the life of the page — and the lightbox must not, because the user is looking at one
+// model and its maps are what it looks like. gltfManager is that switch.
+//
+// Collapsing it to the one manager named three lines above is the obvious tidy-up, and
+// nothing in this repo would notice: the Go suite never loads scene.js, node --test
+// cannot (it imports three), and the symptom is a preview that renders fine and flat.
+// So the switch is asserted here, where the frontend's other structural rules are.
+func TestTheLightboxKeepsItsGlTFTextures(t *testing.T) {
+	src, ok := frontendSources(t)["scene.js"]
+	if !ok {
+		t.Fatal("scene.js is not among the frontend sources; this guard has stopped reading it")
+	}
+	// Every glTF load goes through the switch, not through the blanking manager.
+	loaders := regexp.MustCompile(`new GLTFLoader\(\s*([A-Za-z_$][\w$]*)\s*\)`).FindAllStringSubmatch(src, -1)
+	if len(loaders) < 1 {
+		t.Fatal("no `new GLTFLoader(<manager>)` in scene.js; this guard has stopped reading it")
+	}
+	for _, m := range loaders {
+		if m[1] != "gltfManager" {
+			t.Errorf("GLTFLoader built with %s; it has to take gltfManager, or the lightbox loses every glTF texture", m[1])
+		}
+	}
+	// And the switch is chosen at runtime off the realm, not fixed for the module.
+	decl := regexp.MustCompile(`const gltfManager\s*=\s*([^\n;]+)`).FindStringSubmatch(src)
+	if decl == nil {
+		t.Fatal("no `const gltfManager =` in scene.js; this guard has stopped reading it")
+	}
+	if !strings.Contains(decl[1], "inWorker") || !strings.Contains(decl[1], "?") {
+		t.Errorf("gltfManager = %s; it has to be a conditional on inWorker, since the same module serves both realms", decl[1])
+	}
+	inWorker := regexp.MustCompile(`const inWorker\s*=\s*([^\n;]+)`).FindStringSubmatch(src)
+	if inWorker == nil {
+		t.Fatal("no `const inWorker =` in scene.js; this guard has stopped reading it")
+	}
+	if !strings.Contains(inWorker[1], "typeof WorkerGlobalScope") {
+		t.Errorf("inWorker = %s; the realm is what decides this, and thumbworker.js shims document and window but not WorkerGlobalScope", inWorker[1])
+	}
+	// The blanking manager still has to reach the FBX loader in both realms: it is what
+	// revokes the object URLs that loader mints per embedded texture and never revokes.
+	if !regexp.MustCompile(`new FBXLoader\(\s*loadingManager\s*\)`).MatchString(src) {
+		t.Error("FBXLoader no longer takes loadingManager; the object URLs it mints per texture are revoked nowhere else")
 	}
 }

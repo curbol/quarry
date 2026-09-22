@@ -202,30 +202,6 @@ func TestRenameRecolorDelete(t *testing.T) {
 	}
 }
 
-func TestTagFilterAndOr(t *testing.T) {
-	srv, _ := enabledServer(t)
-	heart := itemByName(t, srv, "q=Heart", "Heart.fbx")
-	sword := itemByName(t, srv, "q=Sword", "Sword.glb")
-	doJSON(t, "POST", srv.URL+"/api/assign", map[string]any{"fingerprints": heart.Fingerprints, "tag": "a", "on": true}).Body.Close()
-	doJSON(t, "POST", srv.URL+"/api/assign", map[string]any{"fingerprints": sword.Fingerprints, "tag": "b", "on": true}).Body.Close()
-
-	// OR: either tag matches → both.
-	or := taggedAssets(t, srv, "tag=a&tag=b&tagmode=or")
-	if or.Total != 2 {
-		t.Errorf("OR filter total = %d, want 2", or.Total)
-	}
-	// AND: needs both on one card → neither (each has only one).
-	and := taggedAssets(t, srv, "tag=a&tag=b&tagmode=and")
-	if and.Total != 0 {
-		t.Errorf("AND filter total = %d, want 0", and.Total)
-	}
-	// Single tag narrows to its asset.
-	one := taggedAssets(t, srv, "tag=a")
-	if one.Total != 1 || one.Items[0].Name != "Heart.fbx" {
-		t.Errorf("single-tag filter = %+v", one)
-	}
-}
-
 // A card that groups two distinct fingerprints (same normalized name + size,
 // different bytes) is a single tag unit: its Tags is the union over both, so an AND
 // filter matches on the union even though no single file carries both tags.

@@ -15,6 +15,7 @@ package assetindex
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1015,6 +1016,83 @@ func TestDuplicateZipEntryNamesIndexOnce(t *testing.T) {
 	// describes the bytes a content request actually returns.
 	if want := crcFingerprint(crc32.ChecksumIEEE([]byte("FIRSTBYTES")), 10); things[0].Fingerprint != want {
 		t.Errorf("fingerprint = %q, want %q (the first entry, which is what Open serves)", things[0].Fingerprint, want)
+	}
+}
+
+// "First wins" is only half of the agreement between the scan and the serving reader:
+// they also have to agree on which entries are candidates at all. isDir is the one
+// accept rule that reads something other than the name — the MS-DOS attribute word —
+// so two entries sharing a name can disagree on it, and there the two resolutions came
+// apart. The scan skipped the directory-flagged copy and indexed the file, while the
+// reader's map kept the first entry whatever it was; the card carried the file's
+// fingerprint and size and the response streamed the directory's zero bytes under
+// them, with nothing anywhere reporting a problem.
+func TestADirectoryFlaggedTwinDoesNotShadowTheEntryThatWasIndexed(t *testing.T) {
+	root, mk := libRoot(t)
+	zipPath := mk("vendor", "pack", "shadow.zip")
+
+	const body = "REALBYTES"
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	// The directory-flagged copy, first in the central directory and with no trailing
+	// "/" in its name, so only the attribute word says what it is.
+	dh := &zip.FileHeader{Name: "Models/Thing.fbx"}
+	dh.SetMode(fs.ModeDir | 0o755)
+	if _, err := zw.CreateHeader(dh); err != nil {
+		t.Fatal(err)
+	}
+	w, err := zw.Create("Models/Thing.fbx")
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.Write([]byte(body))
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(zipPath, buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// The fixture is only a fixture while archive/zip still reads the flag off the
+	// attribute word; if it stopped, both copies would be plain files and the test
+	// would pass without asking anything.
+	zr, err := zip.OpenReader(zipPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !zr.File[0].FileInfo().IsDir() {
+		zr.Close()
+		t.Fatal("the first entry is not directory-flagged; the fixture no longer poses the question")
+	}
+	zr.Close()
+
+	ix, err := Build(Options{Root: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var things []Asset
+	for _, a := range ix.Assets {
+		if a.Name == "Thing.fbx" {
+			things = append(things, a)
+		}
+	}
+	if len(things) != 1 {
+		t.Fatalf("indexed %d assets named Thing.fbx, want 1", len(things))
+	}
+	if want := crcFingerprint(crc32.ChecksumIEEE([]byte(body)), int64(len(body))); things[0].Fingerprint != want {
+		t.Errorf("fingerprint = %q, want %q (the file, not the directory-flagged twin)", things[0].Fingerprint, want)
+	}
+	rc, n, err := ix.Open(things[0])
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer rc.Close()
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != body {
+		t.Errorf("served %q (%d bytes reported), want %q", got, n, body)
 	}
 }
 
@@ -3846,7 +3924,7 @@ func TestAnAbandonedRootsStateIsSweptByAge(t *testing.T) {
 		if err := os.MkdirAll(filepath.Join(d, "unpacked", "24", "deadbeef"), 0o755); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(filepath.Join(d, "index.json"), []byte(`{"version":25,"root":"/somewhere","assets":[]}`), 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(d, "index.json"), []byte(`{"version":`+strconv.Itoa(indexVersion)+`,"root":"/somewhere","assets":[]}`), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -3890,6 +3968,158 @@ func TestAnAbandonedRootsStateIsSweptByAge(t *testing.T) {
 	// This run's own state is still here, whatever its mtime says.
 	if _, err := os.Stat(ix.stateDir()); err != nil {
 		t.Errorf("the running index's own state was swept: %v", err)
+	}
+}
+
+// The age bar is read off the later of two marks, because the index JSON only ever
+// says when a run started. A quarry left serving one library past staleRootAge — or
+// any run at all once the clock is corrected forward past it — was read as abandoned
+// by the next run over another library, which swept the extractions it was serving
+// from and the staging dir it was filling.
+func TestARootStillBeingServedIsNotSwept(t *testing.T) {
+	cacheDir := t.TempDir()
+	roots := filepath.Join(cacheDir, "roots")
+
+	serving := filepath.Join(roots, "0123456789ab")
+	abandoned := filepath.Join(roots, "ba9876543210")
+	old := time.Now().Add(-2 * staleRootAge)
+	for _, d := range []string{serving, abandoned} {
+		if err := os.MkdirAll(filepath.Join(d, "unpacked", strconv.Itoa(indexVersion), "deadbeef"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(d, "index.json"), []byte(`{"version":`+strconv.Itoa(indexVersion)+`,"root":"/somewhere","assets":[]}`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		// Both started long enough ago to be swept on the JSON alone. Only one of them
+		// is still running.
+		if err := os.Chtimes(filepath.Join(d, "index.json"), old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(serving, heartbeatName), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	root, mk := libRoot(t)
+	os.WriteFile(mk("synty", "P", "Rock.fbx"), []byte("FBX"), 0o644)
+	ix, err := LoadOrBuild(Options{Root: root, CacheDir: cacheDir}, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ix.PruneUnpacked(); err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+
+	if _, err := os.Stat(serving); err != nil {
+		t.Errorf("a root whose heartbeat is current was swept: %v", err)
+	}
+	if _, err := os.Stat(abandoned); !os.IsNotExist(err) {
+		t.Errorf("a root with no heartbeat and a stale index survived (%v); the mark must not keep every root alive", err)
+	}
+}
+
+// The heartbeat is what makes that possible, so it has to actually move. Written but
+// never refreshed it is one more file recording when the run started, which is the
+// thing the index JSON already was.
+func TestKeepAliveMovesTheMarkForward(t *testing.T) {
+	root, mk := libRoot(t)
+	os.WriteFile(mk("synty", "P", "Rock.fbx"), []byte("FBX"), 0o644)
+	ix, err := LoadOrBuild(Options{Root: root, CacheDir: t.TempDir()}, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mark := filepath.Join(ix.stateDir(), heartbeatName)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); ix.KeepAlive(ctx) }()
+	// KeepAlive marks once before it starts ticking, which is the only part a test can
+	// wait on without waiting out heartbeatInterval.
+	var first time.Time
+	for range 200 {
+		if fi, err := os.Stat(mark); err == nil {
+			first = fi.ModTime()
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	<-done
+	if first.IsZero() {
+		t.Fatal("KeepAlive never wrote the mark")
+	}
+
+	// And a later mark moves it, which is what a tick does. Backdated first, since the
+	// two writes are otherwise the same second on a coarse filesystem.
+	old := time.Now().Add(-2 * staleRootAge)
+	if err := os.Chtimes(mark, old, old); err != nil {
+		t.Fatal(err)
+	}
+	ix.markAlive()
+	fi, err := os.Stat(mark)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fi.ModTime().After(old) {
+		t.Errorf("mark stayed at %v; marking again has to move it forward", fi.ModTime())
+	}
+	if heartbeatInterval >= staleRootAge {
+		t.Errorf("heartbeatInterval %v is not under staleRootAge %v; a serving run would age out between marks", heartbeatInterval, staleRootAge)
+	}
+}
+
+// Age says a root is abandoned; a staging dir with something recent in it says
+// otherwise, and that disagreement is the one place this sweep cannot afford to be
+// wrong. Everything else it removes rebuilds. A tree renamed into place after its
+// staging dir was deleted under it is short by whatever had been written first, cached
+// as complete under a fingerprint that does not move, and read as an ordinary miss
+// rather than as damage — so it is never repaired.
+func TestASweptRootWithAnExtractionInFlightIsLeftAlone(t *testing.T) {
+	cacheDir := t.TempDir()
+	roots := filepath.Join(cacheDir, "roots")
+
+	busy := filepath.Join(roots, "0123456789ab")
+	idle := filepath.Join(roots, "ba9876543210")
+	old := time.Now().Add(-2 * staleRootAge)
+	for _, d := range []string{busy, idle} {
+		if err := os.MkdirAll(filepath.Join(d, stagingName), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(d, "index.json"), []byte(`{"version":`+strconv.Itoa(indexVersion)+`,"root":"/somewhere","assets":[]}`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(filepath.Join(d, "index.json"), old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// An extraction being assembled right now, and one abandoned long enough ago that
+	// nothing is writing it.
+	if err := os.MkdirAll(filepath.Join(busy, stagingName, "unpack-live"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dead := filepath.Join(idle, stagingName, "unpack-dead")
+	if err := os.MkdirAll(dead, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(dead, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	root, mk := libRoot(t)
+	os.WriteFile(mk("synty", "P", "Rock.fbx"), []byte("FBX"), 0o644)
+	ix, err := LoadOrBuild(Options{Root: root, CacheDir: cacheDir}, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ix.PruneUnpacked(); err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(busy, stagingName, "unpack-live")); err != nil {
+		t.Errorf("an extraction in flight under another root was deleted: %v", err)
+	}
+	if _, err := os.Stat(idle); !os.IsNotExist(err) {
+		t.Errorf("a root whose staging holds only an abandoned extraction survived (%v)", err)
 	}
 }
 

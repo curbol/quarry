@@ -65,10 +65,17 @@ extraction made by older code from what the current code would write. Each pack 
 extracts under a new fingerprint, so a prune on startup drops both the extractions the
 current index no longer references and every tree from another version. Keyed per root,
 that reaches only this library's own tree, so the prune also clears a *sibling* root
-whose state nothing has touched in weeks — every run rewrites its own index JSON at
-startup, so an untouched one belongs to no library anyone still opens, and without this
-a moved library or a `--follow-symlinks` flip strands a 100MB index and every extraction
-under it forever.
+whose state nothing has touched in weeks — without this a moved library or a
+`--follow-symlinks` flip strands a 100MB index and every extraction under it forever.
+"Untouched" is read off the later of two marks: the index JSON, written once at startup,
+and an `alive` file a serving run keeps current. The JSON alone says when a run began
+rather than whether one is still going, so a quarry left serving past the bar — or any
+run at all, once the clock is corrected forward past it — had its own extractions swept
+out from under it by the next run over another library. A sibling whose staging dir
+holds anything recent is left whole whatever its marks say: everything else the sweep
+removes rebuilds, while an extraction renamed into place after its staging dir was
+deleted under it is short by whatever was written first, cached as complete under a
+fingerprint that never moves, and read as an ordinary miss rather than as damage.
 
 All of it lives under `<cache>/roots/<hash of the scan root and follow_symlinks>/`, keyed
 by what the walk covers because an index and its extractions describe one library. `--root`
@@ -253,4 +260,9 @@ returns `ErrStale` if not. The file it guards is the one it read: a save elsewhe
 export and does not move the guard, and a store that has read nothing refuses to rewrite a
 file that already exists at all. The store is meant to be hand-edited and committed to source
 control, so an edit arriving from an editor, a `git checkout`, or a second quarry sharing the
-user-wide store is a real possibility, and overwriting it would be total and silent.
+user-wide store is a real possibility, and overwriting it would be total and silent. "Still
+the one it loaded" is a hash of the contents rather than size and mtime: the hand edits this
+file invites are a color, a tag id, or a hex digit of a fingerprint, every one of them the
+same length as what it replaced, which leaves mtime alone to notice them — and an asset
+library on an external drive is exFAT, where mtime moves in whole seconds. The save is
+already reading and writing the file in full, so the hash costs a read of a few kilobytes.

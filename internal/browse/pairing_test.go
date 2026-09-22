@@ -586,3 +586,44 @@ func TestARootMotionIsNotClaimedAcrossArchivesByAWorseMatch(t *testing.T) {
 		t.Errorf("goblin paired with %q, want goblin-rm: the card the candidate belongs to still gets it", got)
 	}
 }
+
+// Where affinity separates the cards, bestClaim's floor holds a candidate to the one
+// it belongs to. Where nothing separates them, there is no floor to hold: a single
+// root-motion file under a tree of its own is equally distant from every character in
+// the group, so every card clears a claim of zero and every card takes it.
+//
+// Pairing rather than going silent is the answer this picks, and it is the same one
+// the single-card case takes: a layout offering nothing to tell the characters apart
+// carries no reason to withhold the only travel animation there is. What this pins is
+// that it is an answer at all. Nothing else in this file reaches an affinity of zero
+// with more than one card, so tightening the claim comparison to "<=", seeding the
+// score at 0 instead of -1, or adding a floor of one shared segment would each change
+// what a real library does here and leave the suite green.
+func TestOneRootMotionNothingCanSeparateGoesToEveryCardInTheGroup(t *testing.T) {
+	assets := []assetindex.Asset{
+		zipAnim("goblin", "acme", "Chars", "/a.zip", "Anims/Goblin/Walk.fbx"),
+		zipAnim("orc", "acme", "Chars", "/a.zip", "Anims/Orc/Walk.fbx"),
+		zipAnim("rm", "acme", "Chars", "/a.zip", "RootMotion/Walk_RM.fbx"),
+	}
+	// The premise: neither card shares a directory segment with the candidate, so the
+	// two mechanisms that would otherwise decide this are both standing down.
+	for _, id := range []string{"goblin", "orc"} {
+		card := assets[0]
+		if id == "orc" {
+			card = assets[1]
+		}
+		if n := dirAffinity(card.Source, assets[2].Source); n != 0 {
+			t.Fatalf("dirAffinity(%s, rm) = %d, want 0; the fixture no longer poses the question", id, n)
+		}
+	}
+
+	sibling, suppressed := buildRootMotionPairs(assets)
+	for _, id := range []string{"goblin", "orc"} {
+		if got := sibling[id]; got != "rm" {
+			t.Errorf("%s paired with %q, want rm: it is the only travel animation in the pack and nothing says it is somebody else's", id, got)
+		}
+	}
+	if !suppressed["rm"] {
+		t.Error("rm was not suppressed; a paired candidate is hidden from the grid, whoever took it")
+	}
+}

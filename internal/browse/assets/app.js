@@ -609,7 +609,13 @@ async function apiTag(method, body) {
     return false;
   }
   const data = await res.json().catch(() => null);
-  if (!res.ok) {
+  // A body that did not parse is not a write that landed, whatever the status line
+  // said: quarry stopped between the two, and applyPalette declines a null so the
+  // palette never learned anything. Reported as success, the callers acted on it —
+  // the swatch kept the colour the store does not have, which is the case this helper
+  // returns a boolean for at all, and a new tag went into the filter selection and was
+  // dropped again by the next setOptions, clearing the filter and flooding the grid.
+  if (!res.ok || !data) {
     reportTagError(data);
     return false;
   }

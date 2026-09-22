@@ -71,6 +71,19 @@ func isDir(f *zip.File, p string) bool {
 	return f.FileInfo().IsDir() || strings.HasSuffix(p, "/")
 }
 
+// indexableEntry reports whether an entry is one this package will index and serve.
+// Enumeration and the serving reader both ask it, because the two resolve a name
+// independently — zipAssets keeps the first entry that passes, zipReaders.acquire
+// builds the name-to-entry map the content API reads — and a rule applied to only one
+// of them silently splits the two apart. A zip may legally repeat a name, and isDir is
+// the one rule that consults something other than the name: two entries spelled the
+// same can disagree on the MS-DOS attribute word, so with the filter on one side only,
+// the card would carry the second entry's fingerprint and size while the response
+// streamed the first entry's zero bytes under it, with nothing reporting a problem.
+func indexableEntry(f *zip.File, p string) bool {
+	return !isDir(f, p) && safeEntry(p) && !skipEntry(p)
+}
+
 // zipAssets enumerates the files inside a .zip as assets. Directory entries and
 // unsafe names are skipped. displayRel is the archive's path relative to the
 // library root (for RelPath); archivePath is absolute (for CopyPath and Open).
@@ -92,14 +105,14 @@ func zipAssets(archivePath, displayRel, vendor, pack, variant string) ([]Asset, 
 		// spelled differently are two distinct members, each retrievable by its own
 		// exact name, and collapsing them would lose one.
 		p := entryPath(f.Name)
-		// isDir asks the normalised path, not the stored name, for the same reason
-		// every other rule on this line does: archive/zip reads a directory off the
+		// indexableEntry asks the normalised path, not the stored name, for the same
+		// reason every other rule in it does: archive/zip reads a directory off the
 		// MS-DOS attribute word or a trailing "/" in the stored name, and neither
 		// fires for the backslash spelling entryPath exists to handle. Such an entry
 		// became a card named for its last segment, sized 0, classified "other", and
 		// fingerprinted crc32:0:0 — the print every genuinely empty entry in the
 		// library shares, so tagging the phantom tagged all of them.
-		if isDir(f, p) || !safeEntry(p) || skipEntry(p) || seen[f.Name] {
+		if !indexableEntry(f, p) || seen[f.Name] {
 			continue
 		}
 		seen[f.Name] = true
@@ -243,18 +256,33 @@ func (c *zipReaders) acquire(path string) (*zipRef, error) {
 
 	zr, openErr := openZip(path)
 	err = openErr
+	var byName map[string]*zip.File
 	if err == nil {
-		byName := make(map[string]*zip.File, len(zr.File))
+		byName = make(map[string]*zip.File, len(zr.File))
 		for _, f := range zr.File {
-			// First wins, matching the order a scan of zr.File would have found them in.
-			if _, dup := byName[f.Name]; !dup {
+			// The same entries zipAssets indexed, resolved the same way: first wins,
+			// matching the order a scan of zr.File found them in, and over the same
+			// accept rule, so a name the scan resolved to one entry cannot resolve to
+			// another here. Built unfiltered, a repeated name whose first copy the scan
+			// skipped served that copy's bytes under the card the second one produced.
+			if _, dup := byName[f.Name]; !dup && indexableEntry(f, entryPath(f.Name)) {
 				byName[f.Name] = f
 			}
 		}
+	}
+	// Published under the mutex the readers hold. refs cannot reach zero while this
+	// open is in flight — the opener holds the first reference until acquire returns
+	// and every waiter takes its own before blocking on ready — so retireLocked and
+	// release never read rc today. That is an invariant of the reference counting
+	// rather than of this assignment, and the one it guards is a descriptor closed
+	// while a response is streaming from it.
+	c.mu.Lock()
+	if err == nil {
 		ref.rc, ref.byName = zr, byName
 	} else {
 		ref.err = err
 	}
+	c.mu.Unlock()
 	close(ref.ready)
 	if err != nil {
 		// Unpublish, so a later request retries rather than inheriting the failure.

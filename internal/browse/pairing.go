@@ -30,6 +30,19 @@ func separatorsFor(sep rune) string {
 	return "/"
 }
 
+// separatorsOf answers which set a source's own path is divided by. Both places that
+// ask — splitting an asset into directory and base, and splitting that directory into
+// segments — have to give the same answer for the same source, and written out twice
+// they only did as long as both copies were remembered. Answered in one place, a kind
+// added later cannot divide a path one way for the pairing key and another for the
+// affinity that ranks candidates within it.
+func separatorsOf(s assetindex.Source) string {
+	if s.Kind == assetindex.SourceLoose {
+		return osSeparators
+	}
+	return "/"
+}
+
 // splitEntry divides a path into the directory holding it and its base name, exactly
 // as path.Split does but over a chosen separator set. dir is "" for a path with no
 // separator in it, so two such paths compare equal — they are in the same place.
@@ -48,11 +61,7 @@ func splitEntry(p, seps string) (dir, base string) {
 // to "", so cross-directory siblings never paired and the directory preference fired
 // for every candidate at once.
 func entryParts(s assetindex.Source) (dir, base string) {
-	seps := "/"
-	if s.Kind == assetindex.SourceLoose {
-		seps = osSeparators
-	}
-	return splitEntry(s.EntryPath(), seps)
+	return splitEntry(s.EntryPath(), separatorsOf(s))
 }
 
 // assetFileBase is the extension-less base name of the file an asset lives in (the
@@ -255,10 +264,7 @@ const affinityTailWeight = 1 << 16
 // path uses. Empty segments are dropped so a leading or doubled separator cannot
 // register as a shared one.
 func splitDir(s assetindex.Source, dir string) []string {
-	seps := "/"
-	if s.Kind == assetindex.SourceLoose {
-		seps = osSeparators
-	}
+	seps := separatorsOf(s)
 	var out []string
 	for _, p := range strings.FieldsFunc(dir, func(r rune) bool { return strings.ContainsRune(seps, r) }) {
 		out = append(out, p)

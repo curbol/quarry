@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -1100,8 +1101,14 @@ func TestRunLeavesAWorkingBinaryWhenTheDownloadFails(t *testing.T) {
 	releasesAPIURL = srv.URL
 	defer func() { releasesAPIURL = old }()
 
-	if err := Run("1.2.3", ""); err == nil {
+	runErr := Run("1.2.3", "")
+	if runErr == nil {
 		t.Fatal("Run over a failed download returned nil")
+	}
+	// Whatever wrapping the failure picked up on the way out, the token must not be in
+	// it: this is the error the user sees, and GITHUB_TOKEN is a real credential.
+	if strings.Contains(runErr.Error(), "test-token") {
+		t.Errorf("the token reached Run's error: %q", runErr)
 	}
 	got, err := os.ReadFile(exe)
 	if err != nil {
@@ -1246,6 +1253,22 @@ func TestTheInstallStagingPrefixMatchesTheScript(t *testing.T) {
 	if !strings.Contains(string(b), "'"+installStagingPrefix+"*'") {
 		t.Errorf("install.sh does not sweep %q itself; the two sweeps have to look for the same name", installStagingPrefix)
 	}
+	// Both sweeps run over the same directory for the same prefix, so they have to
+	// agree on how old is abandoned as well as on what to look for. Only the name was
+	// checked, and the age is spelled in two languages: lower StaleTempAge and the Go
+	// sweep follows while the script's does not, with both guards still green and a
+	// release zip sitting in the user's bin directory for a day.
+	age := regexp.MustCompile(`-mmin\s+\+(\d+)`).FindStringSubmatch(string(b))
+	if age == nil {
+		t.Fatal("install.sh's staging age did not parse; this guard has stopped checking anything")
+	}
+	mins, err := strconv.Atoi(age[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := int(safewrite.StaleTempAge.Minutes()); mins != want {
+		t.Errorf("install.sh sweeps staging older than %d minutes, safewrite.StaleTempAge is %d", mins, want)
+	}
 }
 
 // The name the sweep looks for has to be the name the unpack writes. Spelled twice they
@@ -1352,8 +1375,18 @@ func TestMissingTokenIsNamedOnANotFoundAsset(t *testing.T) {
 	// user to fix something that is not broken.
 	if err := download("a-token", srv.URL+"/assets/1", dst); err == nil {
 		t.Fatal("expected an error")
-	} else if strings.Contains(err.Error(), "GITHUB_TOKEN") {
-		t.Errorf("the missing-token hint is given to a caller that had one: %q", err)
+	} else {
+		if strings.Contains(err.Error(), "GITHUB_TOKEN") {
+			t.Errorf("the missing-token hint is given to a caller that had one: %q", err)
+		}
+		// The asset request is the second one carrying the token, and its error is the
+		// one a user is most likely to paste into a bug report: this message already
+		// quotes the status and the response body, and the token is one field away from
+		// being added to it while debugging exactly this failure. fetchRelease's half
+		// was guarded and this one was not.
+		if strings.Contains(err.Error(), "a-token") {
+			t.Errorf("the token is in the download error, which is terminal scrollback and bug reports: %q", err)
+		}
 	}
 	// And nothing is left behind under the name the caller asked for, or the next step
 	// would unzip a saved error page.

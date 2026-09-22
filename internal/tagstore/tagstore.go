@@ -19,6 +19,7 @@
 package tagstore
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -28,7 +29,6 @@ import (
 	"regexp"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/BurntSushi/toml"
 
@@ -119,19 +119,37 @@ type Store struct {
 	stamp      fileStamp
 }
 
-// fileStamp is the cheap identity of a file on disk. Size and mtime are what a
-// concurrent write changes, and reading them costs one stat.
+// fileStamp identifies the contents of a file on disk, not its metadata. A stat is
+// cheaper, but size and mtime together miss the edit this store is most likely to be
+// given: a color, a tag id, or a hex digit of a fingerprint changed by hand, all of
+// which are the same length as what they replaced. That leaves mtime alone to notice,
+// and mtime granularity is a property of the filesystem — 1 to 2 seconds on exFAT and
+// on SMB, which is what an external drive holding an asset library is formatted as,
+// and where Discover puts the project store. Inside one tick the edit compares equal
+// and the next tag click rewrites the file over it.
+//
+// A save rewrites this file whole, so it is already read and written in full on every
+// edit; hashing it costs a read of a few kilobytes against a loss with no trace.
 type fileStamp struct {
-	size    int64
-	modTime time.Time
+	size int64
+	sum  uint64
 }
 
+// stampOf reads the file. A file that cannot be read stamps as zero, which is also
+// what an absent one stamps as: both fail toward ErrStale, which the caller recovers
+// from by reloading.
 func stampOf(path string) fileStamp {
-	fi, err := os.Stat(path)
+	b, err := os.ReadFile(path)
 	if err != nil {
 		return fileStamp{}
 	}
-	return fileStamp{size: fi.Size(), modTime: fi.ModTime()}
+	return stampOfBytes(b)
+}
+
+func stampOfBytes(b []byte) fileStamp {
+	h := fnv.New64a()
+	h.Write(b)
+	return fileStamp{size: int64(len(b)), sum: h.Sum64()}
 }
 
 // ErrStale reports that the store on disk changed after this one was loaded, so
@@ -387,14 +405,18 @@ func Load(path string) (*Store, error) {
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		return s, nil
 	}
-	// Stamped before the contents are read, not after. A write landing between the two
-	// would otherwise leave this store holding the old file under the new file's stamp,
-	// and the next Save would pass its staleness check and destroy that write with no
-	// trace. Stamping first fails the other way — a spurious ErrStale, which the caller
-	// already recovers from by reloading.
-	stamp := stampOf(path)
+	// One read, stamped and decoded. Stamping separately meant two reads with a window
+	// between them: a write landing inside it left this store holding one version of
+	// the file under the other's stamp, and whichever order they ran in, one of the two
+	// pairings passed the next save's staleness check and destroyed that write with no
+	// trace. Read once and the stamp describes the bytes this store actually holds.
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	stamp := stampOfBytes(b)
 	var f fileTOML
-	md, err := toml.DecodeFile(path, &f)
+	md, err := toml.Decode(string(b), &f)
 	if err != nil {
 		// Named, like every other failure here: a TOML parse error carries a line
 		// number but not a file, and this one surfaces during a save's recovery reload
@@ -534,7 +556,7 @@ const storeHeader = "# quarry tag store. Rewritten whole on every edit, so comme
 // A save rewrites the whole file, so it first checks that the file is still the one
 // Load read and returns ErrStale if not. Without that, an edit made meanwhile — by
 // hand, by a checkout of a committed project store, or by a second quarry sharing
-// the user-wide one — is destroyed with no trace. Stat-then-rename leaves a window
+// the user-wide one — is destroyed with no trace. Read-then-rename leaves a window
 // too small to matter here and too expensive to close: this is one user's file, and
 // the failure being guarded against is measured in minutes, not microseconds.
 // The rule is that only the file this store read may be rewritten. A save anywhere
@@ -579,15 +601,22 @@ func (s *Store) Save(path string) error {
 		f.Groups = append(f.Groups, group{Fingerprints: g})
 	}
 
+	// Encoded into memory first, so the new stamp is taken from the bytes this save
+	// wrote rather than by reading the file back afterwards. Read back, anything
+	// landing between the rename and that read would be recorded as this store's own
+	// contents, and the next save would pass its check and destroy it.
+	var payload bytes.Buffer
+	// The store is meant to be hand-edited and committed, and a save rewrites it whole
+	// from a model that has no place to keep a comment. Saying so in the file is the
+	// only warning a user gets before their first tag click removes what they wrote;
+	// refusing to save over a comment would be worse.
+	payload.WriteString(storeHeader)
+	if err := toml.NewEncoder(&payload).Encode(f); err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
 	if err := safewrite.Atomic(path, ".quarry-tags-*", func(w io.Writer) error {
-		// The store is meant to be hand-edited and committed, and a save rewrites it
-		// whole from a model that has no place to keep a comment. Saying so in the file
-		// is the only warning a user gets before their first tag click removes what
-		// they wrote; refusing to save over a comment would be worse.
-		if _, err := io.WriteString(w, storeHeader); err != nil {
-			return err
-		}
-		return toml.NewEncoder(w).Encode(f)
+		_, err := w.Write(payload.Bytes())
+		return err
 	}); err != nil {
 		return err
 	}
@@ -599,7 +628,7 @@ func (s *Store) Save(path string) error {
 		s.loadedFrom = path
 	}
 	if s.loadedFrom == path {
-		s.stamp = stampOf(path)
+		s.stamp = stampOfBytes(payload.Bytes())
 	}
 	return nil
 }

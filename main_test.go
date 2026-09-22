@@ -436,4 +436,51 @@ func TestHelpDocumentsEveryFlag(t *testing.T) {
 			t.Errorf("help text does not document -%s", n)
 		}
 	}
+	// Naming the flag is not the whole of documenting it. The help text is the only
+	// place a user sees these — the flag package's own dump is silenced — so a default
+	// written out beside a flag has to be the default, and a copy of one drifts with
+	// nothing failing. Read off the flag set rather than restated, so a flag that grows
+	// a default is covered the day it does.
+	var withDefaults int
+	newFlagSet().set.VisitAll(func(f *flag.Flag) {
+		if f.DefValue == "" || f.DefValue == "false" {
+			return
+		}
+		withDefaults++
+		if !strings.Contains(help.String(), f.DefValue) {
+			t.Errorf("help text does not carry -%s's actual default %q", f.Name, f.DefValue)
+		}
+	})
+	if withDefaults == 0 {
+		t.Fatal("no flag on the set carries a default; this half of the guard has stopped checking anything")
+	}
+}
+
+// help and version answer and exit, and they used to do so before anything looked at
+// what else was on the command line. "quarry version 1.2.3" — the fumble for "quarry
+// update 1.2.3" — printed the installed version and exited 0, so a script chaining on
+// && read it as the version having been checked, while the bare "quarry 1.2.3" it is a
+// slip of has always been an error.
+func TestASubcommandThatTakesNoArgumentsRefusesOne(t *testing.T) {
+	for _, cmd := range []string{"version", "help"} {
+		t.Run(cmd, func(t *testing.T) {
+			err := run([]string{cmd, "1.2.3"})
+			if err == nil {
+				t.Fatalf("quarry %s 1.2.3 succeeded; a stray positional is an error everywhere else", cmd)
+			}
+			if !strings.Contains(err.Error(), "1.2.3") {
+				t.Errorf("error %q does not name the argument it refused", err)
+			}
+		})
+	}
+	// And the two still work with nothing after them.
+	for _, cmd := range []string{"version", "help"} {
+		if err := run([]string{cmd}); err != nil {
+			t.Errorf("quarry %s = %v, want success", cmd, err)
+		}
+	}
+	// update keeps its one argument.
+	if err := run([]string{"update", "1", "2"}); err == nil {
+		t.Error("quarry update 1 2 succeeded; update takes at most one version")
+	}
 }

@@ -2,6 +2,7 @@ package assetindex
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -357,7 +358,7 @@ func (ix *Index) unpackedDir() string {
 // removed out from under the run writing it, and the rename then publishes a package
 // missing whatever had not been written yet — cached as complete from then on.
 func (ix *Index) stagingDir() string {
-	return filepath.Join(ix.stateDir(), "staging")
+	return filepath.Join(ix.stateDir(), stagingName)
 }
 
 // staleStagingAge is how old an abandoned staging directory must be before a prune
@@ -489,9 +490,13 @@ func (ix *Index) PruneUnpacked() error {
 // config.toml pointed somewhere new, or one --follow-symlinks flip each strand a whole
 // tree with nothing reporting it.
 //
-// Age is the evidence, as it is for staging: every run rewrites its own index JSON at
-// startup, so a tree whose JSON has not moved in staleRootAge belongs to no library
-// anyone is still opening. All of it is regenerable, so being wrong costs a rescan.
+// Age is the evidence, as it is for staging, and it is read off the later of two
+// marks. The index JSON is written once, at startup, so on its own it says when a run
+// began rather than whether one is still going: a quarry left serving one library for
+// longer than staleRootAge had its extractions swept out from under it by the next run
+// over another, and a clock corrected forward past the bar did the same on the first
+// run after it. markAlive is the second mark, and the one that moves while a library
+// is being served. All of it is regenerable, so being wrong costs a rescan.
 //
 // Only this layout is swept. The cache dir is whatever --cache or QUARRY_CACHE_DIR
 // named, taken verbatim, so a directory under it has to look like one quarry wrote
@@ -508,12 +513,112 @@ func (ix *Index) sweepAbandonedRoots(remove func(string)) {
 		if !e.IsDir() || e.Name() == mine || !isStateDirName(e.Name()) {
 			continue
 		}
-		idx := filepath.Join(roots, e.Name(), "index.json")
+		dir := filepath.Join(roots, e.Name())
+		idx := filepath.Join(dir, "index.json")
 		fi, err := os.Stat(idx)
-		if err != nil || time.Since(fi.ModTime()) <= staleRootAge || !isIndexJSON(idx) {
+		if err != nil || !isIndexJSON(idx) {
 			continue
 		}
-		remove(filepath.Join(roots, e.Name()))
+		if time.Since(lastSeen(fi.ModTime(), filepath.Join(dir, heartbeatName))) <= staleRootAge {
+			continue
+		}
+		// Everything else this sweep removes is regenerable, and losing it costs a
+		// rescan. A staging dir with something recent in it is the exception, and it is
+		// why this takes the whole tree or none of it: the run filling that dir keeps
+		// writing after the delete, recreating its parents member by member, and then
+		// renames a tree missing everything written beforehand into place — cached as
+		// complete under a fingerprint that never moves again, and not repairable, since
+		// a member that is absent rather than short reads as an ordinary miss. That is
+		// the case stagingDir sits outside this index's own swept tree to prevent, and
+		// it arrived here by the one path that reaches another root's.
+		if hasLiveStaging(filepath.Join(dir, stagingName)) {
+			continue
+		}
+		remove(dir)
+	}
+}
+
+// lastSeen is the later of a root's two freshness marks: when its index JSON was
+// written, and when a run last said it was still serving that library. A heartbeat
+// that is missing or unreadable leaves the JSON's own time, which is what every root
+// written before this file existed carries.
+func lastSeen(indexTime time.Time, heartbeat string) time.Time {
+	fi, err := os.Stat(heartbeat)
+	if err != nil || !fi.ModTime().After(indexTime) {
+		return indexTime
+	}
+	return fi.ModTime()
+}
+
+// hasLiveStaging reports an extraction another instance may be assembling right now.
+// It is the same age bar PruneUnpacked applies to its own staging dir, read the other
+// way round: there it says what is safe to clear, here what is not safe to delete
+// around.
+func hasLiveStaging(staging string) bool {
+	entries, err := os.ReadDir(staging)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if fi, err := e.Info(); err == nil && time.Since(fi.ModTime()) <= staleStagingAge {
+			return true
+		}
+	}
+	return false
+}
+
+// heartbeatName is the file a serving quarry touches to say this library is still in
+// use. Only its mtime is ever read, so it stays empty. It lives beside index.json
+// rather than replacing it as the freshness mark, because a root last used by a quarry
+// that predates it has no heartbeat at all and must still read as recently seen.
+const heartbeatName = "alive"
+
+// stagingName is the staging dir's name under a state dir, as sweepAbandonedRoots has
+// to compose it for a root that is not this one.
+const stagingName = "staging"
+
+// heartbeatInterval is how often KeepAlive refreshes the mark. Far enough under
+// staleRootAge that a run has to miss hundreds in a row before a sibling reads it as
+// abandoned, and long enough to cost one touch an hour.
+const heartbeatInterval = time.Hour
+
+// KeepAlive records that this library is being served, until ctx is cancelled. It
+// blocks, so a caller serving alongside it runs it in its own goroutine.
+//
+// Without it a run's only freshness mark is the index JSON it wrote at startup, which
+// says when it began and never that it is still going — see sweepAbandonedRoots.
+func (ix *Index) KeepAlive(ctx context.Context) {
+	if ix.cacheDir == "" {
+		return
+	}
+	ix.markAlive()
+	t := time.NewTicker(heartbeatInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			ix.markAlive()
+		}
+	}
+}
+
+// markAlive moves this root's heartbeat to now. Every failure leaves the mark where it
+// was, which is the behaviour of a quarry that never wrote one: a sibling falls back
+// to the index JSON's time and the sweep is as it was before this existed. There is
+// nothing a user would do about a report of one, and it would arrive hourly.
+func (ix *Index) markAlive() {
+	p := filepath.Join(ix.stateDir(), heartbeatName)
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		return
+	}
+	now := time.Now()
+	if err := os.Chtimes(p, now, now); err == nil {
+		return
+	}
+	if f, err := os.Create(p); err == nil {
+		f.Close()
 	}
 }
 

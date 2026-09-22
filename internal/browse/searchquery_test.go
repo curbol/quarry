@@ -80,6 +80,12 @@ func TestSearchQueryMatch(t *testing.T) {
 		{`pack:"RPG Combat"`, dash, true},
 		{"-vendor:synty", dash, true},
 		{"-vendor:explosive", dash, false},
+
+		// A quoted span is literal text, including a field name inside it: tokenize says
+		// so and read the colon after one as a scope anyway, so `"vendor":kevdev` searched
+		// the vendor field for an asset the user had asked for that exact string in.
+		{`"vendor":kevdev`, anim, false},
+		{`vendor:"kevdev"`, anim, true},
 	}
 
 	for _, c := range cases {
@@ -280,6 +286,18 @@ func TestADeclinedQueryNarrowsRatherThanMatchingEverything(t *testing.T) {
 		// dropUnmatchedClose erases every one of them.
 		{"overlong with every term past the cut", strings.Repeat(" ", maxQueryBytes) + "sword"},
 		{"overlong and nothing but unmatched closes", strings.Repeat(")", maxQueryBytes) + "sword"},
+		// A group carries no field scope, and "field:(a OR b)" is what every other search
+		// box the user has ever typed into accepts. Dropping the prefix left the group as
+		// a free-text search over every field, so the scope was not narrowed but removed;
+		// with a "-" in front the negation went with it and the query came back with
+		// exactly the assets the user had asked to exclude. Both spellings are here
+		// because they failed in opposite directions off one missing branch.
+		{"scoped group", "pack:(nature)"},
+		{"negated scoped group", "-pack:(nature)"},
+		{"negated scoped group matching on another field", "-vendor:(rock)"},
+		// The empty one is the plainest case: nothing to read inside, nothing to negate,
+		// and it answered with the library.
+		{"negated scoped empty group", "-pack:()"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			q := parseQuery(tc.q)

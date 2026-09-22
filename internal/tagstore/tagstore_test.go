@@ -1,6 +1,7 @@
 package tagstore
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"path/filepath"
@@ -786,6 +787,66 @@ func TestSaveRefusesAStoreFileThatHasSinceBeenDeleted(t *testing.T) {
 	// Re-homed, not export: the next save adopts the path it just reloaded from.
 	if err := mine.Save(p); err != nil {
 		t.Errorf("Save after the reload = %v, want the store to have re-homed onto it", err)
+	}
+}
+
+// Size and mtime were what the guard compared, and the edit this file is most likely
+// to be given by hand changes neither: a color, a tag id, or a hex digit of a
+// fingerprint swapped for another of the same length. That leaves mtime alone to
+// notice, and an external drive holding an asset library is exFAT — 2-second mtime
+// granularity, and Discover puts the project store right there. Inside one tick the
+// two stamps compared equal and the next tag click rewrote the file over the edit.
+//
+// The clock is not raced here, it is removed: the edit is written and then stamped
+// back to exactly the time Load saw, which is what a coarse-granularity filesystem
+// hands you for free.
+func TestSaveRefusesAnEditThatKeptTheFilesSizeAndTime(t *testing.T) {
+	p := filepath.Join(t.TempDir(), FileName)
+	seed := New()
+	seed.Define("hero", "#112233")
+	if err := seed.Save(p); err != nil {
+		t.Fatal(err)
+	}
+
+	mine, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mine.Assign("fp-a", "hero")
+
+	before, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A hand edit of one color: the same bytes, one digit different.
+	edited := bytes.Replace(original, []byte("#112233"), []byte("#445566"), 1)
+	if bytes.Equal(edited, original) {
+		t.Fatal("the fixture no longer holds the color this edit rewrites")
+	}
+	if len(edited) != len(original) {
+		t.Fatalf("edit changed the file size (%d to %d); it has to be size-preserving to pose the question", len(original), len(edited))
+	}
+	if err := os.WriteFile(p, edited, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(p, before.ModTime(), before.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := mine.Save(p); !errors.Is(err, ErrStale) {
+		t.Fatalf("Save = %v, want ErrStale: the hand-edited color was about to be rewritten with nothing said", err)
+	}
+	// And the file still holds what the user typed, which is the whole point.
+	after, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, edited) {
+		t.Error("the refused save wrote anyway")
 	}
 }
 

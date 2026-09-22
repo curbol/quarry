@@ -16,12 +16,15 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
 	"io/fs"
+	"net"
 	"os"
 	"path"
 	"path/filepath"
@@ -476,7 +479,7 @@ func TestOpenRejectsSymlinkEscapingRoot(t *testing.T) {
 	}
 	// The path is lexically inside the root; only resolving it reveals the escape.
 	bad := Asset{Source: Source{Kind: SourceLoose, FilePath: link}}
-	if _, _, err := ix.Open(bad); err != ErrOutsideRoot {
+	if _, _, err := ix.Open(bad); !errors.Is(err, ErrOutsideRoot) {
 		t.Errorf("Open through a symlink out of the root err = %v, want ErrOutsideRoot", err)
 	}
 }
@@ -1264,32 +1267,61 @@ func TestPruneLeavesAUserDirectoryThatMerelyLooksLegacy(t *testing.T) {
 }
 
 // A cache dir an older quarry did write is still swept, so an upgrade does not
-// strand the whole pre-per-root tree.
-func TestPruneSweepsARealLegacyCache(t *testing.T) {
-	root, mk := libRoot(t)
-	os.WriteFile(mk("v", "Pack", "Sword.glb"), []byte("GLBBYTES"), 0o644)
-	cacheDir := t.TempDir()
-
-	old := filepath.Join(cacheDir, "unpacked", "16", "deadbeef")
-	if err := os.MkdirAll(old, 0o755); err != nil {
-		t.Fatal(err)
+// strand the whole pre-per-root tree — but only once it is as old as any other root
+// this sweep removes. The age bar is the whole question of whether something is still
+// using it: `--addr` leaves an older quarry serving, and an update replaces the binary
+// underneath it, so "recognised the layout" is not on its own evidence that nobody is
+// reading from it. Both sides, because an age bar that never lets go strands the tree
+// it exists to reclaim.
+func TestPruneSweepsARealLegacyCacheOnlyOnceItIsStale(t *testing.T) {
+	seed := func(t *testing.T, age time.Duration) (cacheDir, legacyIndex string) {
+		t.Helper()
+		cacheDir = t.TempDir()
+		old := filepath.Join(cacheDir, "unpacked", "16", "deadbeef")
+		if err := os.MkdirAll(old, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		os.WriteFile(filepath.Join(old, "asset"), []byte("old"), 0o644)
+		legacyIndex = filepath.Join(cacheDir, "index.json")
+		os.WriteFile(legacyIndex, []byte(`{"version":16,"root":"/somewhere","assets":[]}`), 0o644)
+		when := time.Now().Add(-age)
+		if err := os.Chtimes(legacyIndex, when, when); err != nil {
+			t.Fatal(err)
+		}
+		return cacheDir, legacyIndex
 	}
-	os.WriteFile(filepath.Join(old, "asset"), []byte("old"), 0o644)
-	legacyIndex := filepath.Join(cacheDir, "index.json")
-	os.WriteFile(legacyIndex, []byte(`{"version":16,"root":"/somewhere","assets":[]}`), 0o644)
-
-	ix, err := Build(Options{Root: root, CacheDir: cacheDir})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := ix.PruneUnpacked(); err != nil {
-		t.Fatal(err)
-	}
-	for _, p := range []string{filepath.Join(cacheDir, "unpacked"), legacyIndex} {
-		if _, err := os.Stat(p); !os.IsNotExist(err) {
-			t.Errorf("%s survived; an older quarry's tree is regenerable state nothing will consult again", p)
+	prune := func(t *testing.T, cacheDir string) {
+		t.Helper()
+		root, mk := libRoot(t)
+		os.WriteFile(mk("v", "Pack", "Sword.glb"), []byte("GLBBYTES"), 0o644)
+		ix, err := Build(Options{Root: root, CacheDir: cacheDir})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := ix.PruneUnpacked(); err != nil {
+			t.Fatal(err)
 		}
 	}
+
+	t.Run("stale", func(t *testing.T) {
+		cacheDir, legacyIndex := seed(t, 2*staleRootAge)
+		prune(t, cacheDir)
+		for _, p := range []string{filepath.Join(cacheDir, "unpacked"), legacyIndex} {
+			if _, err := os.Stat(p); !os.IsNotExist(err) {
+				t.Errorf("%s survived; an older quarry's tree is regenerable state nothing will consult again", p)
+			}
+		}
+	})
+
+	t.Run("recent", func(t *testing.T) {
+		cacheDir, legacyIndex := seed(t, 0)
+		prune(t, cacheDir)
+		for _, p := range []string{filepath.Join(cacheDir, "unpacked"), legacyIndex} {
+			if _, err := os.Stat(p); err != nil {
+				t.Errorf("%s was swept while it was still fresh: %v", p, err)
+			}
+		}
+	})
 }
 
 // The refusal has to hold on the run that matters — the first one, when the cache dir
@@ -3348,6 +3380,85 @@ func TestTheRootMotionDocTableIsTrue(t *testing.T) {
 	}
 }
 
+// The walk took any directory entry that was neither a directory nor a symlink,
+// whatever its mode, so a device node or FIFO became an ordinary loose file and the
+// fingerprint pass opened it. That is not a read that fails: opening a FIFO blocks
+// until a writer appears and a character device streams without end, so one such
+// entry anywhere under the root — or, under --follow-symlinks, anywhere a link
+// reaches — hung the whole scan with no assets, no skip and nothing printed. It is
+// the one input that breached "one unreadable file costs itself, not the run" by
+// costing the run, and in the shape nothing recovers from.
+//
+// Driven with a unix socket rather than a FIFO precisely because a regression must
+// fail rather than wedge: os.Open on a socket returns ENXIO, so the old code indexed
+// it and then reported a skip. Either way this asserts the condition whose absence is
+// the hang — a non-regular file is not an asset, and not a skip either, because it is
+// not something the user is missing.
+func TestANonRegularFileIsDroppedRatherThanRead(t *testing.T) {
+	root, mk := libRoot(t)
+	os.WriteFile(mk("synty", "Pack", "axe.glb"), []byte("GLBBYTES"), 0o644)
+	sock := filepath.Join(filepath.Dir(mk("synty", "Pack", "axe.glb")), "live.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Skipf("unix sockets unavailable: %v", err)
+	}
+	defer ln.Close()
+
+	ix, err := Build(Options{Root: root, CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ix.Assets) != 1 {
+		t.Errorf("assets = %v, want the model only", names(ix.Assets))
+	}
+	if len(ix.Skipped) != 0 {
+		t.Errorf("skipped = %v; a socket is not an asset the user is missing", ix.Skipped)
+	}
+}
+
+// The doc-table guard above makes the conventions executable, but it only ever adds:
+// teach RootMotionVariant a sixth spelling, or narrow one it already had, edit the
+// table to match, and it passes with indexVersion untouched. Its own doc comment says
+// why that is not allowed — the split gate's answer is frozen into the cache while
+// browse pairs live over whatever the cache handed back, so a loose .glb whose stat
+// print has not moved keeps the old gate's clips while the new recognizer reads the
+// file as an RM variant of its own base. Each in-place clip then claims one stale clip
+// of the same file and hides exactly that one: the rest stay visible, one card is
+// silently missing, and the toggle points at a clip the RM file need not contain.
+//
+// A digest of the answers rather than a count of the bullets, because a narrowing
+// changes no bullet. The corpus is fixed here on purpose: derived from the doc table
+// it would move with the very edit this exists to catch.
+//
+// No version is stored alongside. Pinning the indexVersion that was in force would let
+// this pass vacuously after any unrelated bump, so the digest is absolute: every
+// change to what RootMotionVariant answers fails here, and the message is where the
+// bump is named.
+func TestRootMotionAnswersCannotChangeWithoutNoticing(t *testing.T) {
+	corpus := []string{
+		// The five conventions.
+		"Walk_RM", "Walk_RM_Fwd", "Walk_RootMotion", "Walk_RootMotion_Fwd", "Walk [RM]",
+		// Not root motion, and the ones a looser boundary would claim.
+		"Walk", "Warm", "Storm", "arm", "Walk_RMX", "RM", "Walk_RootMotionVertical",
+		"SK_Char_05ARM", "SK_Char_05ARM_HU01", "Walk_rm", "WalkRM", "Walk[RM]",
+		// The precondition: the extension is the caller's to strip.
+		"Walk_RM.glb", "",
+	}
+	h := sha256.New()
+	for _, in := range corpus {
+		base, isRM := RootMotionVariant(in)
+		fmt.Fprintf(h, "%q -> %q %v\n", in, base, isRM)
+	}
+	got := hex.EncodeToString(h.Sum(nil))
+	const want = "9b1cd6a82a32fcbf7a81f3474e91052f18601e2f6b8f5c3fd60bb2d5933d36ca"
+	if got != want {
+		t.Errorf("RootMotionVariant now answers the probe corpus differently (digest %s, was %s).\n"+
+			"Teaching it a convention, or narrowing one, changes what the GLB-split gate froze into every\n"+
+			"cached index: bump indexVersion (currently %d) so those are rebuilt, then set want to the new digest.",
+			got, want, indexVersion)
+	}
+}
+
 // An archive entry and an extracted tree are read as paths, not as names, and the
 // spellings a real library ships are not canonical: older Windows zip tooling writes
 // "\" separators, some writers prefix every entry with "./", and a pack is commonly
@@ -3996,7 +4107,7 @@ func TestARootStillBeingServedIsNotSwept(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := os.WriteFile(filepath.Join(serving, heartbeatName), nil, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(serving, HeartbeatName), nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -4028,7 +4139,7 @@ func TestKeepAliveMovesTheMarkForward(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mark := filepath.Join(ix.stateDir(), heartbeatName)
+	mark := filepath.Join(ix.stateDir(), HeartbeatName)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})

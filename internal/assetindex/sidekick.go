@@ -5,6 +5,8 @@ import (
 	"io"
 	"path"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 // parseSidekick reads a Synty Sidekick character definition (.sk): a top-level
@@ -151,13 +153,7 @@ func applySidekick(archivePath string, assets []Asset) ([]Asset, *SkippedFile) {
 		if a.Source.Kind != SourceUnityPackage || a.Ext != "sk" {
 			continue
 		}
-		p := a.Source.Pathname
-		chars = append(chars, sidekickChar{
-			tree:   path.Dir(p) + "/",
-			base:   strings.TrimSuffix(path.Base(p), path.Ext(p)),
-			vendor: a.Vendor,
-			pack:   a.Pack,
-		})
+		chars = append(chars, charScope(a))
 		// The claim is appended before the upgrade is attempted, and stands whether or
 		// not it succeeds: an unassembled character still has to hold its own name, or
 		// the assembled character whose name prefixes it takes the byproducts that are
@@ -300,9 +296,6 @@ func withinPackPath(a Asset) string {
 // upgrade renames and re-categorises them, it does not replace them — and Source
 // carries what the scope is made of: the pathname the .sk sits at, and whether every
 // part it named resolved.
-//
-// The base is the .sk's own file name, never Asset.Name, which assembly overwrites
-// with the character name the file declares. Byproducts are named after the file.
 func sidekickChars(assets []Asset) []sidekickChar {
 	var chars []sidekickChar
 	for i := range assets {
@@ -310,16 +303,33 @@ func sidekickChars(assets []Asset) []sidekickChar {
 		if a.Source.Kind != SourceUnityPackage || a.Ext != "sk" {
 			continue
 		}
-		p := a.Source.Pathname
-		chars = append(chars, sidekickChar{
-			tree:      path.Dir(p) + "/",
-			base:      strings.TrimSuffix(path.Base(p), path.Ext(p)),
-			assembled: a.Source.Complete,
-			vendor:    a.Vendor,
-			pack:      a.Pack,
-		})
+		c := charScope(a)
+		c.assembled = a.Source.Complete
+		chars = append(chars, c)
 	}
 	return chars
+}
+
+// charScope is what a .sk entry claims: the directory it sits in and its own file
+// name, within its own vendor and pack. One definition, because the archive side and
+// the loose side have to apply the *same* scope — applySidekick drops byproducts
+// inside the package it read the .sk out of, dedup drops the loose copies a pack
+// unpacked beside itself leaves, and a normalisation applied to one reading and not
+// the other is a byproduct dropped on one side and kept on the other.
+//
+// assembled is left to the caller: the archive pass knows it from the parse it just
+// did, and the library pass reads it back off Source.Complete.
+//
+// The base is the .sk's own file name, never Asset.Name, which assembly overwrites
+// with the character name the file declares. Byproducts are named after the file.
+func charScope(a *Asset) sidekickChar {
+	p := a.Source.Pathname
+	return sidekickChar{
+		tree:   path.Dir(p) + "/",
+		base:   strings.TrimSuffix(path.Base(p), path.Ext(p)),
+		vendor: a.Vendor,
+		pack:   a.Pack,
+	}
 }
 
 // claimsOver reports whether c is the closer claim on a byproduct both characters
@@ -338,6 +348,11 @@ func (c sidekickChar) claimsOver(best sidekickChar) bool {
 // namedFor reports whether stem names a byproduct of base: base itself, or base
 // followed by a separator. Requiring the separator is what stops "Base" from
 // claiming "BaseSkeleton".
+//
+// The rune, not the byte. Every byte of a multi-byte rune is outside the ASCII
+// alphanumerics, so reading one as a separator made a character named "戦士" claim
+// "戦士郎.prefab" — the very shape this check exists to refuse, and in the direction
+// that drops a file from the index with no other row showing it.
 func namedFor(stem, base string) bool {
 	if stem == base {
 		return true
@@ -345,12 +360,8 @@ func namedFor(stem, base string) bool {
 	if !strings.HasPrefix(stem, base) {
 		return false
 	}
-	c := stem[len(base)]
-	return !isAlnum(c)
-}
-
-func isAlnum(c byte) bool {
-	return c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
+	r, _ := utf8.DecodeRuneInString(stem[len(base):])
+	return !unicode.IsLetter(r) && !unicode.IsDigit(r)
 }
 
 // readUnityAssetBytes streams a .unitypackage once and returns the `asset` payload of

@@ -236,6 +236,22 @@ func TestSidekickByproductSuppression(t *testing.T) {
 			gone: []string{"Warrior_01"},
 		},
 		{
+			// The separator after the base is a rune, not a byte. Every byte of a
+			// multi-byte rune is outside the ASCII alphanumerics, so reading one byte
+			// deep made the character claim a longer name that merely starts with it —
+			// the "BaseSkeleton" shape namedFor exists to refuse, and the file is gone
+			// from the index with nothing else showing it.
+			name: "a character does not claim a name continuing in a non-ASCII letter",
+			entries: []unityGUID{
+				{guid: "sk1", pathname: "Assets/S/Characters/戦士.sk", asset: "Name: 戦士\nParts:\n- Name: SK_HEAD\n"},
+				head,
+				{guid: "pf1", pathname: "Assets/S/Characters/戦士.prefab", asset: "PREFAB", preview: true},
+				{guid: "pf2", pathname: "Assets/S/Characters/戦士郎.prefab", asset: "PREFAB2", preview: true},
+			},
+			kept: []string{"戦士", "SK_HEAD.fbx", "戦士郎.prefab"},
+			gone: []string{"戦士.prefab"},
+		},
+		{
 			// Two characters in one directory: scoping the claim by directory alone let
 			// the one that assembled take the other's byproducts.
 			name: "an assembled character does not claim its neighbour's byproducts",

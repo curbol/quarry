@@ -342,7 +342,16 @@ func (w *walker) tree(dir, prefix string) error {
 
 // file records one browseable file. info is passed in because a symlinked file's own
 // DirEntry describes the link, whose size is the length of the target path.
+//
+// Only a regular file. A device node or FIFO is not an asset a user is missing, so it
+// is dropped as silently as a sidecar — but it is dropped here rather than left to the
+// reader, because reading one does not fail. Opening a FIFO blocks until a writer
+// appears and a character device streams without end, so the fingerprint pass hangs
+// the whole walk with no assets, no skip and nothing printed.
 func (w *walker) file(p, r, name string, info os.FileInfo) {
+	if !info.Mode().IsRegular() {
+		return
+	}
 	ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(name), "."))
 	if isSidecar(ext) {
 		return

@@ -402,15 +402,21 @@ func (s *Store) Tags() []TagDef {
 func Load(path string) (*Store, error) {
 	s := New()
 	s.loadedFrom = path
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		return s, nil
-	}
 	// One read, stamped and decoded. Stamping separately meant two reads with a window
 	// between them: a write landing inside it left this store holding one version of
 	// the file under the other's stamp, and whichever order they ran in, one of the two
 	// pairings passed the next save's staleness check and destroyed that write with no
 	// trace. Read once and the stamp describes the bytes this store actually holds.
+	//
+	// Absence is read off that same read rather than a stat ahead of it, which was a
+	// second syscall with a window of its own: a store unlinked between the two — a
+	// checkout onto a branch without one — came back as an error where it should have
+	// come back empty, refusing to start, or naming a failed reload inside a save's
+	// recovery.
 	b, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return s, nil
+	}
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}

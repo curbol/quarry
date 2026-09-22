@@ -696,6 +696,60 @@ func TestAnEditRefusedAsStaleLeavesNeitherDiskNorMemoryAhead(t *testing.T) {
 	}
 }
 
+// applyEdit bumps the generation before it looks at the error, not after the save, and
+// the comment there says why: a rejected edit still reloads the store, so the reload
+// can bring in an outside edit the memoized result set was built without. Nothing held
+// that. Moving the bump below the successful save left all 585 tests green, because
+// the one test that reaches a refused write fires a successful one first, which bumps
+// the generation and makes its later read miss the memo whatever the rejected path did.
+//
+// Membership, not decoration: decorate re-reads a card's tags from the store on every
+// request, so a stale memo cannot show stale tags. What it can show is a stale
+// *answer* to ?tag=, which is the set computeResults filtered and the memo holds.
+func TestARefusedWriteInvalidatesTheMemoizedResultSet(t *testing.T) {
+	srv, tagsPath := enabledServer(t)
+
+	heart := itemByName(t, srv, "q=Heart", "Heart.fbx")
+	if len(heart.Fingerprints) == 0 {
+		t.Fatal("fixture gave Heart.fbx no fingerprint")
+	}
+	// Warms the memo for this exact query at the current generation. Nothing is
+	// assigned to "theirs" yet, so the answer is empty.
+	if n := len(getAssets(t, srv, "tag=theirs").Items); n != 0 {
+		t.Fatalf("tag=theirs returned %d items before the tag exists", n)
+	}
+
+	// Someone else defines the tag and assigns it, out from under the running server.
+	external, err := tagstore.Load(tagsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := external.Define("theirs", "#0ea5e9"); err != nil {
+		t.Fatal(err)
+	}
+	external.Assign(heart.Fingerprints[0], "theirs")
+	if err := external.Save(tagsPath); err != nil {
+		t.Fatal(err)
+	}
+
+	// Any write now: the mutation lands in memory, the save is refused as stale, and
+	// recoverLocked reloads the store from disk — which is where the external edit is.
+	resp := doJSON(t, "POST", srv.URL+"/api/tags", map[string]any{"id": "mine", "color": "#e11d48"})
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("write over an externally edited store = %d, want 409", resp.StatusCode)
+	}
+
+	items := getAssets(t, srv, "tag=theirs").Items
+	if len(items) != 1 || items[0].Name != "Heart.fbx" {
+		names := make([]string, len(items))
+		for i, it := range items {
+			names[i] = it.Name
+		}
+		t.Errorf("tag=theirs after the refused write = %v, want [Heart.fbx]; the memo was not invalidated", names)
+	}
+}
+
 // Expansion relaxes only the tag filter. Every other facet and the text search still
 // apply, so a companion the query itself excludes must not be folded back in.
 func TestIncludeRelatedStillHonoursTheNonTagFilters(t *testing.T) {
@@ -1741,6 +1795,43 @@ func TestTheGridDoesNotLoadThreeToRenderItself(t *testing.T) {
 	}
 }
 
+// The two caches thumbs.js drives both hand back what they stopped pointing at, and
+// neither releases it: ThumbCache returns object URLs for the caller to revoke and
+// FontCache returns FontFaces for the caller to unregister, because what a value has
+// to be handed to is not something a module that can be tested without a document can
+// reach. Both contracts are checked exhaustively on the cache side by the Node tests
+// and nowhere on the caller side, which is thumbs.js and needs a DOM.
+//
+// So it is checked as text. Every remember() in thumbs.js has to release what it is
+// given back within the statement that consumes it: drop the loop and the return
+// value goes on the floor, which is an object URL or a registered typeface retained
+// for the life of the page, outside any bound, with nothing to notice it.
+func TestEveryCacheHandbackInThumbsIsReleased(t *testing.T) {
+	src, err := assetsFS.ReadFile("assets/thumbs.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(string(src), "\n")
+	releases := regexp.MustCompile(`URL\.revokeObjectURL|document\.fonts\.delete`)
+	found := 0
+	for i, line := range lines {
+		if !strings.Contains(line, ".remember(") {
+			continue
+		}
+		found++
+		// The statement that consumes it: the call's own line and the short block a
+		// multi-line for-of body occupies.
+		end := min(i+4, len(lines))
+		if !releases.MatchString(strings.Join(lines[i:end], "\n")) {
+			t.Errorf("thumbs.js:%d consumes a cache handback without releasing it:\n%s",
+				i+1, strings.Join(lines[i:end], "\n"))
+		}
+	}
+	if found < 2 {
+		t.Fatalf("found %d remember() call sites in thumbs.js; this guard has stopped reading it", found)
+	}
+}
+
 // A query string the server cannot read has to narrow, never answer. url.URL.Query()
 // discards its parse error and drops only the pair it failed on, so a bad percent
 // escape or a bare semicolon in `q` left the text search empty — the all-match — while
@@ -2011,6 +2102,61 @@ func TestAssetsDefaultSortIsAscendingAndCaseInsensitive(t *testing.T) {
 	want := []string{"apple.fbx", "Banana.fbx", "cherry.fbx"}
 	if !slices.Equal(got, want) {
 		t.Errorf("default order = %v, want %v (ascending, case-folded)", got, want)
+	}
+}
+
+// The default arm folds each name once and sorts a permutation, so the reordering is
+// no longer something sort.Slice does for itself: permute has to apply that
+// permutation, and getting it inverted reorders every result with nothing failing —
+// the three-name guard above happens to be a fixed point under several wrong answers.
+// Driven over enough names, in an order chosen so nothing is already in place, that a
+// wrong permutation cannot come out right by accident.
+func TestTheDefaultSortAppliesThePermutationItComputed(t *testing.T) {
+	names := []string{
+		"Zebra.fbx", "apple.fbx", "Mango.png", "banana.fbx", "Cherry.glb", "date.fbx",
+		"Elder.fbx", "fig.fbx", "Grape.fbx", "honeydew.fbx", "Iris.fbx", "jade.fbx",
+		"Kiwi.fbx", "lemon.fbx", "Melon.fbx", "nectar.fbx", "Olive.fbx", "plum.fbx",
+		"Quince.fbx", "rasp.fbx", "Sloe.fbx", "tamar.fbx", "Ugli.fbx", "vine.fbx",
+	}
+	items := make([]assetDTO, len(names))
+	for i, n := range names {
+		items[i] = assetDTO{Name: n, RelPath: "v/Pack/" + n}
+	}
+	want := make([]assetDTO, len(items))
+	copy(want, items)
+	// The reference: the comparator as it was before the fold moved out of it.
+	slices.SortFunc(want, func(a, b assetDTO) int {
+		if c := strings.Compare(strings.ToLower(a.Name), strings.ToLower(b.Name)); c != 0 {
+			return c
+		}
+		return strings.Compare(a.RelPath, b.RelPath)
+	})
+
+	sortItems(items, "")
+
+	for i := range items {
+		if items[i].RelPath != want[i].RelPath {
+			gotNames := make([]string, len(items))
+			for j := range items {
+				gotNames[j] = items[j].Name
+			}
+			t.Fatalf("default sort = %v\nfirst mismatch at %d: %q, want %q", gotNames, i, items[i].Name, want[i].Name)
+		}
+	}
+}
+
+// Two assets whose folded names are equal fall back to RelPath, and the fold is now
+// read out of a parallel slice while the RelPath is read out of the one being
+// permuted. Indexing either with the wrong one of the two positions sort.Slice hands
+// the comparator puts these in the wrong order or leaves them unordered.
+func TestTheDefaultSortStillBreaksAFoldTieOnPath(t *testing.T) {
+	items := []assetDTO{
+		{Name: "SWORD.fbx", RelPath: "v/Pack/z/SWORD.fbx"},
+		{Name: "sword.fbx", RelPath: "v/Pack/a/sword.fbx"},
+	}
+	sortItems(items, "")
+	if items[0].RelPath != "v/Pack/a/sword.fbx" || items[1].RelPath != "v/Pack/z/SWORD.fbx" {
+		t.Errorf("fold tie broke as %q then %q, want the a/ path first", items[0].RelPath, items[1].RelPath)
 	}
 }
 

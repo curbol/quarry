@@ -1,6 +1,7 @@
 package assetindex
 
 import (
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -167,7 +168,7 @@ func TestFollowSymlinksStillRefusesAnUncoveredPath(t *testing.T) {
 	}
 	stray := filepath.Join(t.TempDir(), "elsewhere.glb")
 	os.WriteFile(stray, []byte("GLBBYTES"), 0o644)
-	if _, _, err := ix.Open(Asset{Source: Source{Kind: SourceLoose, FilePath: stray}}); err != ErrOutsideRoot {
+	if _, _, err := ix.Open(Asset{Source: Source{Kind: SourceLoose, FilePath: stray}}); !errors.Is(err, ErrOutsideRoot) {
 		t.Errorf("Open on a path under no link root = %v, want ErrOutsideRoot", err)
 	}
 }
@@ -622,6 +623,39 @@ func TestAnInRootLinkToASidecarIsStillSilent(t *testing.T) {
 	}
 	if len(ix.Assets) != 1 {
 		t.Errorf("assets = %v, want the model only", names(ix.Assets))
+	}
+}
+
+// The followed-file branch records a LinkRoot only when w.file actually produced an
+// entry, and nothing exercised the other side of that condition: the in-root case
+// above never reaches w.file at all, so it says nothing about it. The tidy-up the
+// guard invites is hoisting the two appends above the call — "the link was followed,
+// record its root" reads as unconditional — and then a Unity project synced across
+// drives, which carries a .meta beside every asset, authorises one path per symlinked
+// sidecar. Those roots are persisted, resolved once, and walked linearly on every
+// Open, which a grid page does a hundred of; and Open starts accepting paths no asset
+// in the index names, which is the whole point of the containment check.
+func TestAFollowedLinkToASidecarWidensNothing(t *testing.T) {
+	outside := t.TempDir()
+	writeFile(t, filepath.Join(outside, "axe.glb.meta"), "guid: 1")
+	root, mk := libRoot(t)
+	os.WriteFile(mk("synty", "Pack", "axe.glb"), []byte("GLBBYTES"), 0o644)
+	link := filepath.Join(root, "synty", "Pack", "alias.glb.meta")
+	if err := os.Symlink(filepath.Join(outside, "axe.glb.meta"), link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	ix, err := Build(Options{Root: root, CacheDir: t.TempDir(), FollowSymlinks: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ix.LinkRoots) != 0 {
+		t.Errorf("link roots = %v; the sidecar became no asset, so nothing should have been authorised", ix.LinkRoots)
+	}
+	if len(ix.Assets) != 1 {
+		t.Errorf("assets = %v, want the model only", names(ix.Assets))
+	}
+	if len(ix.Skipped) != 0 {
+		t.Errorf("skipped = %v; a sidecar is not indexed under any name, linked or not", ix.Skipped)
 	}
 }
 

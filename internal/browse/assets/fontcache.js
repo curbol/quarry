@@ -51,13 +51,19 @@ export class FontCache {
   }
 
   // remember records a value, making room for it first, and returns the values it
-  // evicted so the caller can release them.
+  // stopped pointing at so the caller can release them — the ones it evicted, and the
+  // one already held under this id, which is displaced just as finally. Handing that
+  // one back rather than dropping it is what keeps "every value this cache lets go of
+  // comes back" true of the whole method, so a caller cannot register a FontFace the
+  // document then holds forever with nothing left naming it.
   //
   // Room is made before the insert, never after: an entry inserted first is last in
   // eviction order, so a walk that skips every live holder ahead of it arrives at the
   // entry that was just added — and evicts it if it came with no holder.
   remember(id, value, holder) {
     const dropped = this.makeRoom();
+    const prev = this.entries.get(id);
+    if (prev && prev.value !== value) dropped.push(prev.value);
     this.entries.delete(id);
     this.entries.set(id, { value, holder });
     return dropped;

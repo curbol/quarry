@@ -1042,7 +1042,9 @@ function fontSample(a) {
   }
   wrap.append(name, pangram, glyphs, ramp);
   ensureFont(a).then((fam) => { wrap.style.fontFamily = `"${fam}"`; })
-    .catch(() => { const p = document.createElement('p'); p.className = 'fs-fail'; p.textContent = 'Could not load this font.'; wrap.prepend(p); });
+    // Named in the console as well as on screen: a corrupt font file and a 500 from a
+    // torn extraction read identically to the user.
+    .catch((e) => { console.warn('font specimen failed', a.relPath, e); const p = document.createElement('p'); p.className = 'fs-fail'; p.textContent = 'Could not load this font.'; wrap.prepend(p); });
   return wrap;
 }
 
@@ -1249,7 +1251,12 @@ function openLightbox(a) {
   // Kept as well as the index, because the index is a position into a list a tag edit
   // can rebuild while this stays open. See reanchorLightbox.
   lb.asset = a;
-  lb.index = state.items.indexOf(a);
+  // By id, not by identity: the linked-companions strip hands openLightbox an object
+  // parsed from its own /api/related response, which is never the state.items entry
+  // for that card even when the card is loaded. indexOf answered -1 there, and the
+  // arrows stayed dead for the rest of the lightbox session, because the only thing
+  // that re-anchors is a page load and navLightbox is itself gated on the index.
+  lb.index = state.items.findIndex((x) => x.id === a.id);
   updateLbNav();
   lb.name.textContent = a.name;
   // The metadata carries the shared file properties; every location (one or many)

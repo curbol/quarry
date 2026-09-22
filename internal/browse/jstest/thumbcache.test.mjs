@@ -143,3 +143,22 @@ test('draining hands back every waiting holder and leaves nothing pending', () =
   assert.equal(c.pending.size, 0);
   assert.equal(c.claim('x', 1), null, 'a result arriving afterwards finds nothing waiting');
 });
+
+// Draining is about requests in flight, so it must leave both memos alone. A drain
+// that also cleared the cache would drop every resident URL without handing one back
+// to be revoked, which is a leak the bound cannot see; one that cleared noRender
+// would re-ask the worker for every mesh-less clip on the next scroll. Neither shows
+// up in the DOM, and the current implementation touches neither only by omission.
+test('draining leaves the rendered and no-render memos untouched', () => {
+  const c = new ThumbCache();
+  c.remember('rendered', 'blob:rendered');
+  c.markNoRender('empty');
+  c.route('inflight', holder('h'));
+
+  assert.equal(c.drainPending().length, 1);
+
+  assert.deepEqual(c.route('rendered', holder('h2')), { kind: 'cached', url: 'blob:rendered' },
+    'a resident URL survives the drain');
+  assert.deepEqual(c.route('empty', holder('h3')), { kind: 'settled' },
+    'a settled answer survives the drain');
+});

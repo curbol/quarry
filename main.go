@@ -15,6 +15,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 
 	"github.com/curbol/quarry/internal/assetindex"
@@ -98,6 +99,14 @@ func run(args []string) error {
 	switch cmd {
 	case "", "update", "version", "help":
 	default:
+		// `quarry ~/Assets` is the likeliest first-contact mistake for a tool whose
+		// whole job is indexing a directory, and it lands here rather than on the
+		// positional check below, which only sees a token a flag preceded. Reported as
+		// the command name it was read as, it tells the user their library path is not
+		// a command and nothing about what to type instead.
+		if looksLikePath(cmd) {
+			return positionalRootError(cmd)
+		}
 		usage()
 		return fmt.Errorf("unknown subcommand %q", cmd)
 	}
@@ -130,7 +139,7 @@ func run(args []string) error {
 		if cmd != "" {
 			return fmt.Errorf("%s takes no arguments (got %q)", cmd, fs.Arg(0))
 		}
-		return fmt.Errorf("quarry takes no positional arguments (got %q); to index elsewhere use --root %s", fs.Arg(0), fs.Arg(0))
+		return positionalRootError(fs.Arg(0))
 	}
 
 	if cmd == "help" {
@@ -176,6 +185,27 @@ func run(args []string) error {
 		Reindex:        *reindex,
 		FollowSymlinks: cfg.FollowSymlinks,
 	})
+}
+
+// positionalRootError names the flag that does what a bare path was reaching for.
+// Shared by the two places a path can arrive: before any flag, where the dispatcher
+// has already taken it for a subcommand, and after one, where flag.Parse stopped on
+// it.
+func positionalRootError(arg string) error {
+	return fmt.Errorf("quarry takes no positional arguments (got %q); to index elsewhere use --root %s", arg, arg)
+}
+
+// looksLikePath reports whether a token the dispatcher took for a subcommand is more
+// plausibly the library the user meant to index. A separator, a leading ~ or ., or a
+// directory of that name actually being there; a bare misspelling like "verison" is
+// none of those and still reads as a subcommand.
+func looksLikePath(s string) bool {
+	if strings.ContainsRune(s, '/') || strings.ContainsRune(s, os.PathSeparator) ||
+		s == "." || s == ".." || strings.HasPrefix(s, "~") {
+		return true
+	}
+	fi, err := os.Stat(s)
+	return err == nil && fi.IsDir()
 }
 
 // isFlag reports whether an argument is a flag rather than a subcommand, so that a

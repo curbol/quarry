@@ -1,6 +1,7 @@
 package assetindex
 
 import (
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -98,7 +99,7 @@ func TestOpenThumbnail(t *testing.T) {
 
 	// An asset without a preview has no thumbnail.
 	rock := find(t, ix, "Rock.fbx", SourceUnityPackage)
-	if _, _, err := ix.OpenThumbnail(rock); err != ErrNoThumbnail {
+	if _, _, err := ix.OpenThumbnail(rock); !errors.Is(err, ErrNoThumbnail) {
 		t.Errorf("Rock.fbx thumbnail err = %v, want ErrNoThumbnail", err)
 	}
 }
@@ -144,7 +145,7 @@ func TestOpenRejectsOutsideRoot(t *testing.T) {
 	outside := filepath.Join(filepath.Dir(root), "escape.txt")
 	os.WriteFile(outside, []byte("SECRET"), 0o644)
 	bad := Asset{Source: Source{Kind: SourceLoose, FilePath: outside}}
-	if _, _, err := ix.Open(bad); err != ErrOutsideRoot {
+	if _, _, err := ix.Open(bad); !errors.Is(err, ErrOutsideRoot) {
 		t.Errorf("Open outside root err = %v, want ErrOutsideRoot", err)
 	}
 }

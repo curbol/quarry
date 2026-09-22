@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/curbol/quarry/internal/assetindex"
 	"github.com/curbol/quarry/internal/tagstore"
@@ -18,6 +19,31 @@ func TestRunUnknownSubcommand(t *testing.T) {
 	err := run([]string{"bogus"})
 	if err == nil || !strings.Contains(err.Error(), "unknown") {
 		t.Errorf("got %v, want unknown-subcommand error", err)
+	}
+}
+
+// The dispatcher takes any leading non-flag token as the subcommand, so `quarry
+// ~/Assets` — the likeliest first-contact mistake for a tool whose whole job is
+// indexing a directory — was reported as an unknown subcommand named after the user's
+// library. The message written for exactly that mistake sat behind the positional
+// check, which only sees a token some flag preceded. Both spellings now reach it, and
+// an ordinary typo still reads as a subcommand.
+func TestABareLibraryPathNamesTheRootFlag(t *testing.T) {
+	dir := t.TempDir()
+	for _, arg := range []string{dir, "~/Assets", "./lib", ".", "some/where"} {
+		err := run([]string{arg})
+		if err == nil {
+			t.Errorf("run(%q) succeeded; want the --root hint", arg)
+			continue
+		}
+		if !strings.Contains(err.Error(), "--root "+arg) {
+			t.Errorf("run(%q) = %v, want the --root hint naming it", arg, err)
+		}
+	}
+	// A misspelled subcommand is not a path and must still say so, or the hint
+	// swallows every typo and points the user at --root for "verison".
+	if err := run([]string{"verison"}); err == nil || !strings.Contains(err.Error(), "unknown") {
+		t.Errorf("run(\"verison\") = %v, want unknown-subcommand error", err)
 	}
 }
 
@@ -306,6 +332,25 @@ func TestServeIndexesAndPreparesTheTagStore(t *testing.T) {
 	tagsPath := filepath.Join(t.TempDir(), "nested", tagstore.FileName)
 	cacheDir := t.TempDir()
 
+	// A sibling root nothing has touched in a year, for the prune to find. Its state
+	// dir has to look like one quarry wrote — a hex name of the right length holding an
+	// index.json with the two fields isIndexJSON reads — or the sweep leaves it alone,
+	// which would make this assert nothing. Backdated past staleRootAge by a margin
+	// wide enough that the constant can move without rewriting the test.
+	const abandonedName = "0123456789ab"
+	abandoned := filepath.Join(cacheDir, "roots", abandonedName)
+	if err := os.MkdirAll(abandoned, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	abandonedIndex := filepath.Join(abandoned, "index.json")
+	if err := os.WriteFile(abandonedIndex, []byte(`{"version":1,"root":"/gone","assets":[]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	longAgo := time.Now().Add(-365 * 24 * time.Hour)
+	if err := os.Chtimes(abandonedIndex, longAgo, longAgo); err != nil {
+		t.Fatal(err)
+	}
+
 	// browse.Serve blocks until interrupted, so the run is stopped at the listen with an
 	// address that cannot bind. Everything under test happens before that point.
 	//
@@ -343,11 +388,43 @@ func TestServeIndexesAndPreparesTheTagStore(t *testing.T) {
 	if readErr != nil {
 		t.Fatalf("no per-root cache state was written: %v", readErr)
 	}
-	if len(entries) != 1 {
-		t.Errorf("cache roots = %d, want one for this scan root", len(entries))
+	// Named rather than taken as entries[0]: the abandoned root planted above sorts
+	// first, so reading position zero would follow the prune's own outcome around and
+	// report the wrong directory when it fails.
+	var mine string
+	for _, e := range entries {
+		if e.Name() != abandonedName {
+			mine = e.Name()
+		}
 	}
-	if _, statErr := os.Stat(filepath.Join(cacheDir, "roots", entries[0].Name(), "index.json")); statErr != nil {
+	if mine == "" {
+		t.Fatalf("no state dir for this scan root; roots = %v", entries)
+	}
+	if _, statErr := os.Stat(filepath.Join(cacheDir, "roots", mine, "index.json")); statErr != nil {
 		t.Errorf("the index cache was not written: %v", statErr)
+	}
+
+	// serve's two post-index statements. Both had only their definitions under test:
+	// deleting either call site left the whole suite green, and neither failure is
+	// visible from the UI — the prune stops reclaiming and every stale extraction
+	// stays forever, and the heartbeat stops being written so another library's prune
+	// reads a quarry that is still serving as abandoned and sweeps its extractions.
+	if _, statErr := os.Stat(abandoned); !os.IsNotExist(statErr) {
+		t.Errorf("the abandoned sibling root survived: %v; PruneUnpacked did not run", statErr)
+	}
+	// KeepAlive marks once before it ticks, but it is a goroutine and run returns as
+	// soon as the listen fails, so the mark can land after this point.
+	mark := filepath.Join(cacheDir, "roots", mine, assetindex.HeartbeatName)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, statErr := os.Stat(mark); statErr == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Errorf("no heartbeat at %s; KeepAlive was never started", mark)
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 

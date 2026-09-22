@@ -96,3 +96,32 @@ test('with no liveness predicate nothing is pinned', () => {
   c.remember('a', 'face:a', card('a'));
   assert.deepEqual(c.remember('b', 'face:b', card('b')), ['face:a']);
 });
+
+// The sibling cache hands back a value its key displaced, and this one silently did
+// not: an id re-registered under a new FontFace left the old one on document.fonts
+// with nothing naming it. Unreachable from ensureFont today, which hits before it
+// remembers, so this is the rule rather than the current call graph.
+test('re-remembering an id hands back the value it displaced', () => {
+  const c = new FontCache({ max: 4, live: liveHolder });
+  c.remember('a', 'face:a', card('a'));
+  assert.deepEqual(c.remember('a', 'face:a2', card('a')), ['face:a']);
+  assert.equal(c.size, 1, 'one id, one entry');
+  assert.equal(c.hit('a'), 'face:a2');
+});
+
+// Re-remembering the value already stored is not a displacement: handing it back
+// would have the caller unregister the FontFace the cache is still serving.
+test('re-remembering the same value releases nothing', () => {
+  const c = new FontCache({ max: 4, live: liveHolder });
+  c.remember('a', 'face:a', card('a'));
+  assert.deepEqual(c.remember('a', 'face:a', card('a')), []);
+  assert.equal(c.hit('a'), 'face:a');
+});
+
+// An id evicted to make room for its own replacement comes back once, not twice: the
+// caller would otherwise delete a FontFace it had already let go of.
+test('a displaced value evicted for its own replacement is returned once', () => {
+  const c = new FontCache({ max: 1 });
+  c.remember('a', 'face:a', card('a'));
+  assert.deepEqual(c.remember('a', 'face:a2', card('a')), ['face:a']);
+});

@@ -55,11 +55,11 @@ func (s *server) applyEdit(mutate func() (any, error)) ([]byte, int) {
 	// a memoized result set carries the tags it was built with either way.
 	s.tagsGeneration++
 	if err != nil {
-		status := http.StatusBadRequest
-		if errors.Is(err, tagstore.ErrStale) {
-			status = http.StatusConflict
-		}
-		return errBody(s.recoverLocked(err.Error())), status
+		// A mutate closure only ever rejects its input — an empty id, an unparseable
+		// color, a rename of a tag that is not there. Persisting is this function's
+		// job, below, and store.Save has no other call site in the package, so nothing
+		// a closure returns can be a staleness refusal.
+		return errBody(s.recoverLocked(err.Error())), http.StatusBadRequest
 	}
 	if err := s.store.Save(s.tagsPath); err != nil {
 		// Handlers mutate the store and then persist, so a failed save would otherwise

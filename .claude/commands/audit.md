@@ -164,7 +164,7 @@ each package's doc comment restates its own share.
   embeds a machine-absolute path and a version-bearing archive name, so it is neither
   portable nor stable. *Violation:* any tag or link path that keys on `ID`; any change
   to how a fingerprint is derived, to an indexed field, or to what extraction writes
-  without bumping `assetindex.indexVersion` (`cache.go`, currently 26). *Check:* grep
+  without bumping `assetindex.indexVersion` (`cache.go`, currently 27). *Check:* grep
   `Fingerprint` and `\.ID` through `internal/tagstore/`, `browse/tags.go`,
   `browse/links.go`; confirm `indexVersion` is compared on cache load.
 - **The library is read-only.** The tag store is the only thing quarry may write inside
@@ -491,9 +491,11 @@ each package's doc comment restates its own share.
   renamed drive keeps its old name in the grid, in the vendor facet and in `path:` search
   until the file's own size or mtime happens to move. Tier 1.
 - Pruning removes only extractions the current index no longer references, plus trees
-  from another `indexVersion`, and never reaches outside `<cache>/roots/`, where it
-  clears only a sibling root's whole tree, by age, and only one that looks like one
-  quarry wrote. A prune
+  from another `indexVersion`. Inside `<cache>/roots/` it clears a sibling root's whole
+  tree, by age, and only one that looks like one quarry wrote; the one thing it reaches
+  outside that is the pre-per-root pair `<cache>/unpacked` + `<cache>/index.json`, held
+  to the same age bar and only when both halves are there, since either alone is not
+  evidence quarry wrote it. A prune
   that could delete a live extraction, or one another root or a concurrent instance is
   serving, is Tier 1. `PruneUnpacked`'s keep-set is the snapshot `refresh` took of what
   the walk reached (`Index.liveUnpacked`), not a re-derivation from `Assets` — which is

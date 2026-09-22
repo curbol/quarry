@@ -117,8 +117,17 @@ async function build(asset, current) {
 }
 
 async function buildSidekick(asset, current) {
-  const root = await loadSidekick(asset.source && asset.source.parts);
-  if (!root) return false;
+  const parts = (asset.source && asset.source.parts) || [];
+  const root = await loadSidekick(parts);
+  // A character always ships parts, so a null here means every one of them threw: a
+  // 500 from a lazy extraction, a full cache disk, quarry restarted mid-scroll. That
+  // is a failure to read, not a settled "nothing to draw", and returning false would
+  // memoize it — the card keeps its category icon for the life of the page, because
+  // settling also stops observing it. Throwing reaches the queue's catch instead.
+  if (!root) {
+    if (parts.length) throw new Error('no sidekick part loaded for ' + asset.id);
+    return false;
+  }
   const refBox = prepareClipRig(root, null);
   const ok = snap(root, refBox, current);
   dispose(root);

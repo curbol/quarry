@@ -401,6 +401,29 @@ func TestAtomicRefusesATempPatternThatCouldNeverBeSwept(t *testing.T) {
 	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
 		t.Error("the refused write still created the destination")
 	}
+	// The other end of the same range, which was open. The sweep splits on the last
+	// "*", so a pattern beginning with one leaves an empty prefix — and an empty
+	// prefix matches every name in the destination directory, which for the tag store
+	// is a user's project. What is supposed to clear this writer's own leavings would
+	// delete everything beside them older than StaleTempAge.
+	neighbour := filepath.Join(filepath.Dir(path), "notes.md")
+	if err := os.WriteFile(neighbour, []byte("mine"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-2 * StaleTempAge)
+	if err := os.Chtimes(neighbour, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := Atomic(path, "*.tmp", func(w io.Writer) error {
+		_, e := io.WriteString(w, "x")
+		return e
+	}); err == nil {
+		t.Error("Atomic accepted a pattern with no prefix; its sweep matches every file beside the destination")
+	}
+	if _, statErr := os.Stat(neighbour); statErr != nil {
+		t.Errorf("a file beside the destination was swept away: %v", statErr)
+	}
+
 	// And the ordinary pattern still works, so the guard is not refusing real callers.
 	if err := Atomic(path, ".quarry-tags-*", func(w io.Writer) error {
 		_, e := io.WriteString(w, "x")

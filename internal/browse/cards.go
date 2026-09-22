@@ -212,13 +212,47 @@ func sortItems(items []assetDTO, mode string) {
 			return items[i].RelPath < items[j].RelPath
 		})
 	default:
-		sort.Slice(items, func(i, j int) bool {
-			ni, nj := strings.ToLower(items[i].Name), strings.ToLower(items[j].Name)
-			if ni != nj {
-				return ni < nj
+		// The fold is computed once per item rather than inside the comparison.
+		// strings.ToLower returns its input unallocated only for an all-lowercase ASCII
+		// string, and asset names are not that, so comparing folded names in place
+		// allocated two throwaway strings per comparison — order n log n of them over a
+		// result set the size of a library, re-run on every memo miss, which is every
+		// tag edit. This is the argument containsFold already makes for itself, at the
+		// one place it had not been applied.
+		keys := make([]string, len(items))
+		for i := range items {
+			keys[i] = strings.ToLower(items[i].Name)
+		}
+		order := make([]int, len(items))
+		for i := range order {
+			order[i] = i
+		}
+		sort.Slice(order, func(a, b int) bool {
+			i, j := order[a], order[b]
+			if keys[i] != keys[j] {
+				return keys[i] < keys[j]
 			}
 			return items[i].RelPath < items[j].RelPath
 		})
+		permute(items, order)
+	}
+}
+
+// permute reorders items so items[i] ends up holding what order[i] named. In place,
+// via the inverse permutation's cycles: a result slice would be a second copy of every
+// DTO in the answer, which for a library-sized set is the same size again for the
+// duration of a sort that runs on every memo miss.
+func permute(items []assetDTO, order []int) {
+	pos := make([]int, len(order))
+	for i, j := range order {
+		pos[j] = i
+	}
+	for i := range pos {
+		for pos[i] != i {
+			j := pos[i]
+			items[i], items[j] = items[j], items[i]
+			pos[i], pos[j] = pos[j], pos[i]
+		}
 	}
 }
 

@@ -22,7 +22,7 @@ import (
 // also keys the unpacked-archive tree, so a change to what extraction writes belongs
 // here too: an archive whose bytes never changed keeps its fingerprint, and only the
 // version tells the old extraction apart from what the current code would produce.
-const indexVersion = 26
+const indexVersion = 27
 
 // SkippedFile records a library file the scan could not read. A damaged archive
 // costs its own contents, not the rest of the library, so the failure is carried
@@ -50,10 +50,13 @@ type Index struct {
 	LoosePrint   map[string]string `json:"loosePrint"`   // abs loose path -> stat fingerprint
 	Skipped      []SkippedFile     `json:"skipped,omitempty"`
 
-	// Suppressed holds the archive entries dedup dropped in favour of a loose twin.
-	// They are cached because reuse is keyed on the archive's stat print, which does
-	// not move when the twin outside it is deleted: without them a refresh would
-	// reuse only the survivors and the entry would never come back.
+	// Suppressed holds what dedup dropped: the archive entries a loose twin covers,
+	// and the loose Sidekick byproducts an assembled character supersedes. Both are
+	// cached because reuse is keyed on a file's stat print, which does not move when
+	// the thing that suppressed it goes away — delete the loose twin, or the pack
+	// holding the character, and a refresh reusing only the survivors would carry the
+	// suppression forward and the entry would never come back. So this slice is not
+	// all archive entries, and nothing reading it may assume a Kind.
 	Suppressed []Asset `json:"suppressed,omitempty"`
 
 	// FollowSymlinks is the setting this index was built under, kept because it

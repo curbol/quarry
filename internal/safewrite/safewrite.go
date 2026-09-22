@@ -39,11 +39,17 @@ const StaleTempAge = 24 * time.Hour
 // TOML store truncated that way still parses, so the loss reads as "your tags are
 // gone" with nothing reporting an error.
 func Atomic(path, tmpPattern string, encode func(io.Writer) error) error {
-	// Refused rather than documented. A pattern with no "*" writes correctly and sweeps
-	// nothing, for the life of the program, with no error anywhere — and where it
-	// matters the leftovers pile up in a user's source-controlled project directory.
-	if !strings.Contains(tmpPattern, "*") {
+	// Refused rather than documented, at both ends of the same range. A pattern with no
+	// "*" writes correctly and sweeps nothing, for the life of the program, with no
+	// error anywhere — and where it matters the leftovers pile up in a user's
+	// source-controlled project directory. A pattern whose "*" is first leaves the
+	// sweep no prefix to recognise its own leavings by, and every name in that same
+	// directory then matches: the sweep stops being a sweep and becomes a delete of
+	// whatever the user keeps beside their tag store.
+	if star := strings.LastIndex(tmpPattern, "*"); star < 0 {
 		return fmt.Errorf("safewrite: tmpPattern %q has no %q, so an abandoned temp file could never be swept", tmpPattern, "*")
+	} else if star == 0 {
+		return fmt.Errorf("safewrite: tmpPattern %q begins with %q, so the sweep would match every file beside the destination", tmpPattern, "*")
 	}
 	path = resolveLinks(path)
 	// Swept here rather than by the caller, which knows the path it asked for but not

@@ -1119,8 +1119,16 @@ func TestAwkwardLabelsAndFingerprintsRoundTrip(t *testing.T) {
 			t.Errorf("TagsFor(%q) = %#v, want %#v", fp, got, want)
 		}
 	}
-	if got := len(back.Groups()); got != 1 {
-		t.Errorf("groups = %d, want the one link group", got)
+	// The members, for the same reason as the labels above: the shape this test exists
+	// to guard against is a fingerprint moving into a key position, where the escaping
+	// rules differ, and a group whose four members all came back mangled has a length
+	// of one exactly as the intact one does. Caught here only incidentally today,
+	// because every fingerprint in this fixture is also assigned; one that appeared
+	// only in a group would not be caught at all.
+	wantFPs := append([]string(nil), fps...)
+	sort.Strings(wantFPs)
+	if got := back.Groups(); len(got) != 1 || !reflect.DeepEqual(got[0], wantFPs) {
+		t.Errorf("Groups() = %#v, want one group of %#v", got, wantFPs)
 	}
 	// And the file it wrote is the file it writes again: an escape that decoded to
 	// something else would show up here rather than as a silently altered tag.

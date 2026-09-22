@@ -52,6 +52,24 @@ jobs:
             GOOS=${p%/*} GOARCH=${p#*/} CGO_ENABLED=0 go build -o /dev/null .
           done
 
+      # release.yml stamps the version with `-X main.version`, and the linker ignores
+      # -X for a symbol that does not exist. Renaming or moving main.version keeps the
+      # build, vet and the whole suite green — main_test.go asserts against whatever
+      # the variable holds — so the failure surfaced at the release's own stamp check,
+      # after the tag was pushed, and the fix needed a new tag. Same reason the
+      # cross-compile loop above is here: move the contract onto the PR. release.yml
+      # keeps its check, which runs against the published artifact rather than a build
+      # of its own; this one only asserts the symbol is still there to stamp.
+      - name: The version symbol is still stampable
+        run: |
+          go build -ldflags "-X main.version=ci-probe" -o /tmp/quarry-stamp .
+          got=$(/tmp/quarry-stamp version | awk '{print $2}')
+          if [ "$got" != "ci-probe" ]; then
+            echo "quarry version reported '$got', not the stamped 'ci-probe';"
+            echo "main.version has moved and -ldflags -X is silently doing nothing"
+            exit 1
+          fi
+
       # install.sh is the only install path and the only recovery when `quarry update`
       # refuses a dev build, and nothing else here reads it: the guard tests in
       # selfupdate parse it as text for its platform labels, so a stray brace or a

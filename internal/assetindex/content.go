@@ -428,9 +428,15 @@ func (ix *Index) PruneUnpacked() error {
 	// "unpacked" is a plausible name for a directory a user keeps their own work in;
 	// finding one alone is not evidence quarry wrote it. Finding it beside an
 	// index.json is.
+	//
+	// Behind the same age bar every other root's removal is behind. An older quarry
+	// still serving from this tree is reachable rather than hypothetical — `--addr`
+	// leaves one running, and an update replaces the binary underneath it — and this
+	// was the one destructive branch that asked only what the tree is, never whether
+	// anything is still using it.
 	legacyUnpacked := filepath.Join(ix.cacheDir, "unpacked")
 	legacyIndex := filepath.Join(ix.cacheDir, "index.json")
-	if isIndexJSON(legacyIndex) {
+	if lfi, err := os.Stat(legacyIndex); err == nil && time.Since(lfi.ModTime()) > staleRootAge && isIndexJSON(legacyIndex) {
 		if fi, err := os.Stat(legacyUnpacked); err == nil && fi.IsDir() {
 			remove(legacyUnpacked)
 			remove(legacyIndex)
@@ -519,7 +525,7 @@ func (ix *Index) sweepAbandonedRoots(remove func(string)) {
 		if err != nil || !isIndexJSON(idx) {
 			continue
 		}
-		if time.Since(lastSeen(fi.ModTime(), filepath.Join(dir, heartbeatName))) <= staleRootAge {
+		if time.Since(lastSeen(fi.ModTime(), filepath.Join(dir, HeartbeatName))) <= staleRootAge {
 			continue
 		}
 		// Everything else this sweep removes is regenerable, and losing it costs a
@@ -567,11 +573,15 @@ func hasLiveStaging(staging string) bool {
 	return false
 }
 
-// heartbeatName is the file a serving quarry touches to say this library is still in
+// HeartbeatName is the file a serving quarry touches to say this library is still in
 // use. Only its mtime is ever read, so it stays empty. It lives beside index.json
 // rather than replacing it as the freshness mark, because a root last used by a quarry
 // that predates it has no heartbeat at all and must still read as recently seen.
-const heartbeatName = "alive"
+//
+// Exported because it is part of the on-disk layout rather than an implementation
+// detail: what marks a root as still in use is the one thing anything reading a cache
+// dir from outside this package has to be able to name.
+const HeartbeatName = "alive"
 
 // stagingName is the staging dir's name under a state dir, as sweepAbandonedRoots has
 // to compose it for a root that is not this one.
@@ -609,7 +619,7 @@ func (ix *Index) KeepAlive(ctx context.Context) {
 // to the index JSON's time and the sweep is as it was before this existed. There is
 // nothing a user would do about a report of one, and it would arrive hourly.
 func (ix *Index) markAlive() {
-	p := filepath.Join(ix.stateDir(), heartbeatName)
+	p := filepath.Join(ix.stateDir(), HeartbeatName)
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return
 	}
